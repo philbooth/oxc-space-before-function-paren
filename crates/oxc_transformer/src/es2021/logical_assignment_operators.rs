@@ -58,9 +58,14 @@ use oxc_allocator::TakeIn;
 use oxc_ast::ast::*;
 use oxc_semantic::ReferenceFlags;
 use oxc_span::SPAN;
-use oxc_traverse::Traverse;
+use oxc_traverse::{Ancestor, Traverse};
 
-use crate::{common::duplicate::duplicate_expression, context::TraverseCtx, state::TransformState};
+use crate::{
+    common::duplicate::{duplicate_expression, expression_needs_temp_var},
+    context::TraverseCtx,
+    state::TransformState,
+    utils::ast_builder::wrap_expression_in_arrow_function_iife,
+};
 
 pub struct LogicalAssignmentOperators;
 
@@ -81,11 +86,57 @@ impl<'a> Traverse<'a, TransformState<'a>> for LogicalAssignmentOperators {
         // `&&=` `||=` `??=`
         let Some(operator) = assignment_expr.operator.to_logical_operator() else { return };
 
-        self.transform_logical_assignment(expr, operator, ctx);
+        if Self::needs_parameter_scope(assignment_expr, ctx) {
+            // Parameter initializers run before entering the function body. Give temporaries
+            // their own statement list and lifetime, then lower the assignment on traversal.
+            *expr = wrap_expression_in_arrow_function_iife(expr.take_in(ctx), ctx);
+        } else {
+            self.transform_logical_assignment(expr, operator, ctx);
+        }
     }
 }
 
 impl<'a> LogicalAssignmentOperators {
+    fn needs_parameter_scope(assignment: &AssignmentExpression<'a>, ctx: &TraverseCtx<'a>) -> bool {
+        if !matches!(
+            assignment.left,
+            AssignmentTarget::StaticMemberExpression(_)
+                | AssignmentTarget::ComputedMemberExpression(_)
+        ) {
+            return false;
+        }
+
+        let in_parameters = ctx.ancestors().find_map(|ancestor| match ancestor {
+            Ancestor::FormalParametersItems(_) | Ancestor::FormalParametersRest(_) => Some(true),
+            Ancestor::FunctionBody(_)
+            | Ancestor::ArrowFunctionExpressionBody(_)
+            | Ancestor::BlockStatementBody(_)
+            | Ancestor::StaticBlockBody(_)
+            | Ancestor::ProgramBody(_) => Some(false),
+            _ => None,
+        }) == Some(true);
+        if !in_parameters {
+            return false;
+        }
+
+        // A new function scope would hide bindings introduced by sloppy direct eval
+        // from later parameters and the function body. Retain the existing lowering there.
+        if ctx.scoping().scope_flags(ctx.current_scope_id()).contains_direct_eval() {
+            return false;
+        }
+
+        match &assignment.left {
+            AssignmentTarget::StaticMemberExpression(member) => {
+                expression_needs_temp_var(&member.object, true, ctx)
+            }
+            AssignmentTarget::ComputedMemberExpression(member) => {
+                expression_needs_temp_var(&member.object, true, ctx)
+                    || expression_needs_temp_var(&member.expression, true, ctx)
+            }
+            _ => false,
+        }
+    }
+
     fn transform_logical_assignment(
         &self,
         expr: &mut Expression<'a>,
@@ -125,10 +176,12 @@ impl<'a> LogicalAssignmentOperators {
 
         let span = assignment_expr.span;
         let assign_op = AssignmentOperator::Assign;
-        let right = assignment_expr.right.take_in(ctx.ast);
-        let right = ctx.ast.expression_assignment(SPAN, assign_op, assign_target, right);
+        let right = assignment_expr.right.take_in(ctx);
+        let right =
+            Expression::new_assignment_expression(SPAN, assign_op, assign_target, right, ctx);
 
-        let logical_expr = ctx.ast.expression_logical(span, left_expr, operator, right);
+        let logical_expr =
+            Expression::new_logical_expression(span, left_expr, operator, right, ctx);
 
         *expr = logical_expr;
     }
@@ -137,10 +190,12 @@ impl<'a> LogicalAssignmentOperators {
         ident: &IdentifierReference<'a>,
         ctx: &mut TraverseCtx<'a>,
     ) -> (Expression<'a>, AssignmentTarget<'a>) {
-        let reference = ctx.scoping_mut().get_reference_mut(ident.reference_id());
+        let reference_id = ident.reference_id();
+        let reference = ctx.scoping_mut().get_reference_mut(reference_id);
         *reference.flags_mut() = ReferenceFlags::Read;
         let symbol_id = reference.symbol_id();
-        let left_expr = Expression::Identifier(ctx.alloc(ident.clone()));
+        let left_expr =
+            Expression::new_identifier_with_reference_id(ident.span, ident.name, reference_id, ctx);
 
         let ident = ctx.create_ident_reference(SPAN, ident.name, symbol_id, ReferenceFlags::Write);
         let assign_target = AssignmentTarget::AssignmentTargetIdentifier(ctx.alloc(ident));
@@ -153,21 +208,23 @@ impl<'a> LogicalAssignmentOperators {
         static_expr: &mut StaticMemberExpression<'a>,
         ctx: &mut TraverseCtx<'a>,
     ) -> (Expression<'a>, AssignmentTarget<'a>) {
-        let object = static_expr.object.take_in(ctx.ast);
+        let object = static_expr.object.take_in(ctx);
         let (object, object_ref) = duplicate_expression(object, true, ctx);
 
-        let left_expr = Expression::from(ctx.ast.member_expression_static(
+        let left_expr = Expression::new_static_member_expression(
             static_expr.span,
             object,
             static_expr.property.clone(),
             false,
-        ));
+            ctx,
+        );
 
-        let assign_expr = ctx.ast.member_expression_static(
+        let assign_expr = MemberExpression::new_static_member_expression(
             static_expr.span,
             object_ref,
             static_expr.property.clone(),
             false,
+            ctx,
         );
         let assign_target = AssignmentTarget::from(assign_expr);
 
@@ -180,25 +237,27 @@ impl<'a> LogicalAssignmentOperators {
         computed_expr: &mut ComputedMemberExpression<'a>,
         ctx: &mut TraverseCtx<'a>,
     ) -> (Expression<'a>, AssignmentTarget<'a>) {
-        let object = computed_expr.object.take_in(ctx.ast);
+        let object = computed_expr.object.take_in(ctx);
         let (object, object_ref) = duplicate_expression(object, true, ctx);
 
-        let expression = computed_expr.expression.take_in(ctx.ast);
+        let expression = computed_expr.expression.take_in(ctx);
         let (expression, expression_ref) = duplicate_expression(expression, true, ctx);
 
-        let left_expr = Expression::from(ctx.ast.member_expression_computed(
+        let left_expr = Expression::new_computed_member_expression(
             computed_expr.span,
             object,
             expression,
             false,
-        ));
+            ctx,
+        );
 
-        let assign_target = AssignmentTarget::from(ctx.ast.member_expression_computed(
+        let assign_target = AssignmentTarget::new_computed_member_expression(
             computed_expr.span,
             object_ref,
             expression_ref,
             false,
-        ));
+            ctx,
+        );
 
         (left_expr, assign_target)
     }

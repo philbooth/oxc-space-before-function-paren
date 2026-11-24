@@ -1,9 +1,8 @@
 //! Define additional methods, used only by raw transfer:
 //!
 //! * [`Allocator::from_raw_parts`]
-//! * [`Allocator::cursor_ptr`]
 //! * [`Allocator::set_cursor_ptr`]
-//! * [`Allocator::data_end_ptr`]
+//! * `Allocator::data_end_ptr` (private within crate)
 
 use std::{alloc::Layout, ptr::NonNull};
 
@@ -29,8 +28,14 @@ impl Allocator {
     /// `backing_alloc_ptr` and `layout`.
     ///
     /// The [`Allocator`] which is returned takes ownership of the backing allocation, and it will be freed
-    /// via the global allocator (using `backing_alloc_ptr` and `layout`) when the `Allocator` is dropped.
-    /// If caller wishes to prevent that happening, they must wrap the `Allocator` in `ManuallyDrop`.
+    /// when the `Allocator` is dropped, using `backing_alloc_ptr` and `layout`.
+    ///
+    /// The method used to free the backing allocation depends on platform and Cargo features:
+    /// * Linux/Mac: via [`System`] allocator
+    /// * Windows with `fixed_size` Cargo feature disabled: via [`System`] allocator
+    /// * Windows with `fixed_size` Cargo feature enabled: `VirtualFree`
+    ///
+    /// If caller wishes to prevent that happening, they must wrap the [`Allocator`] in [`ManuallyDrop`].
     ///
     /// The [`Allocator`] returned by this function cannot grow.
     ///
@@ -43,10 +48,12 @@ impl Allocator {
     ///   the allocation described by `backing_alloc_ptr` and `layout`
     ///   (i.e. `start_ptr >= backing_alloc_ptr` and `start_ptr + size <= backing_alloc_ptr + layout.size()`).
     /// * The allocation described by `backing_alloc_ptr` and `layout` must have been allocated from
-    ///   the global allocator with that same `layout` (or caller must wrap the `Allocator` in `ManuallyDrop`
-    ///   and ensure the backing memory is freed correctly themselves).
+    ///   the platform-specific allocator (see list above) with that same `layout` (or caller must wrap the `Allocator`
+    ///   in `ManuallyDrop` and ensure the backing memory is freed correctly themselves).
     /// * `start_ptr` and `backing_alloc_ptr` must have permission for writes.
     ///
+    /// [`System`]: std::alloc::System
+    /// [`ManuallyDrop`]: std::mem::ManuallyDrop
     /// [`RAW_MIN_ALIGN`]: Self::RAW_MIN_ALIGN
     /// [`RAW_MIN_SIZE`]: Self::RAW_MIN_SIZE
     pub unsafe fn from_raw_parts(
@@ -58,13 +65,6 @@ impl Allocator {
         // SAFETY: Safety requirements of `Arena::from_raw_parts` are the same as for this method
         let arena = unsafe { Arena::from_raw_parts(start_ptr, size, backing_alloc_ptr, layout) };
         Self::from_arena(arena)
-    }
-
-    /// Get the current cursor pointer for this [`Allocator`]'s current chunk.
-    ///
-    /// If the `Allocator` is empty (has no chunks), this returns a dangling pointer.
-    pub fn cursor_ptr(&self) -> NonNull<u8> {
-        self.arena().cursor_ptr()
     }
 
     /// Set cursor pointer for this [`Allocator`]'s current chunk.
@@ -92,7 +92,8 @@ impl Allocator {
     /// i.e to the start of the `ChunkFooter`.
     ///
     /// If the `Allocator` is empty (has no chunks), this returns a dangling pointer.
-    pub fn data_end_ptr(&self) -> NonNull<u8> {
+    #[cfg(all(feature = "fixed_size", target_pointer_width = "64", target_endian = "little"))]
+    pub(crate) fn data_end_ptr(&self) -> NonNull<u8> {
         self.arena().data_end_ptr()
     }
 }

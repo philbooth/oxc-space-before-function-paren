@@ -1,11 +1,13 @@
-pub use super::{Buffer as _, BufferExtensions, Format, Format as _};
 pub use super::{
+    JoinBuilderJsExt as _, JsFormatContext, JsFormatter, JsFormatterExt as _,
     builders::*,
+    trivia::{format_dangling_comments, format_hoisted_leading_comments, format_leading_comments},
+};
+pub use crate::source_text::SourceTextExt as _;
+pub use oxc_formatter_core::{
+    Format, FormatOptions as _, MemoizeFormat, Memoized,
     format_element::{
         tag::{LabelId, Tag, TagKind},
         *,
     },
-    format_extensions::{MemoizeFormat, Memoized},
-    formatter::Formatter,
-    trivia::{format_dangling_comments, format_leading_comments},
 };

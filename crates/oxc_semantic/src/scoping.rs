@@ -3,12 +3,13 @@ use std::{collections::hash_map::Entry, fmt, mem};
 use rustc_hash::{FxHashMap, FxHashSet};
 use self_cell::self_cell;
 
-use oxc_allocator::{Allocator, CloneIn, Vec as ArenaVec};
+use oxc_allocator::{Allocator, ArenaVec, BitSet, CloneIn, CloneInSemanticIds};
 use oxc_index::IndexVec;
 use oxc_span::Span;
-use oxc_str::{ArenaIdentHashMap, Ident};
+use oxc_str::{ArenaIdentHashMap, Ident, JSStr};
 use oxc_syntax::constant_value::ConstantValue;
 use oxc_syntax::{
+    label::LabelId,
     node::NodeId,
     reference::{Reference, ReferenceId},
     scope::{ScopeFlags, ScopeId},
@@ -20,6 +21,10 @@ use crate::multi_index_vec::multi_index_vec;
 pub type Bindings<'a> = ArenaIdentHashMap<'a, SymbolId>;
 pub type UnresolvedReferences<'a> = ArenaIdentHashMap<'a, ArenaVec<'a, ReferenceId>>;
 
+/// One declaration of a symbol that is declared more than once.
+///
+/// A `var` redeclaring a catch parameter also links that parameter to the separate
+/// enclosing var binding; see [`Scoping::catch_var_binding`].
 #[derive(Clone, Debug)]
 pub struct Redeclaration {
     pub span: Span,
@@ -31,13 +36,16 @@ impl CloneIn<'_> for Redeclaration {
     type Cloned = Self;
 
     #[inline]
-    fn clone_in(&self, _allocator: &Allocator) -> Self::Cloned {
-        Self { span: self.span, declaration: NodeId::DUMMY, flags: self.flags }
-    }
-
-    #[inline]
-    fn clone_in_with_semantic_ids(&self, _allocator: &Allocator) -> Self::Cloned {
-        self.clone()
+    fn clone_in_impl(
+        &self,
+        with_semantic_ids: CloneInSemanticIds,
+        allocator: &Allocator,
+    ) -> Self::Cloned {
+        Self {
+            span: self.span,
+            declaration: self.declaration.clone_in_impl(with_semantic_ids, allocator),
+            flags: self.flags,
+        }
     }
 }
 
@@ -115,18 +123,77 @@ impl fmt::Debug for Scoping {
 
 impl Default for Scoping {
     fn default() -> Self {
+        Self::new_with_allocator(Allocator::default())
+    }
+}
+
+impl Scoping {
+    /// Create an empty [`Scoping`] with capacity for the given number of symbols, references and scopes.
+    ///
+    /// For a small file, the arena which holds symbol names, bindings, and resolved references is created
+    /// with a size estimated from those counts, instead of [`Allocator`]'s default chunk size (16 KiB).
+    /// This matters to consumers which keep the `Scoping`s of many files alive at the same time:
+    /// the default chunk size is far more than most files need.
+    ///
+    /// Larger files are unaffected. Their arena starts with the default chunk size and grows from there.
+    pub(crate) fn with_capacity(symbols: usize, references: usize, scopes: usize) -> Self {
+        // Estimate of bytes the arena needs, fitted to arena usage across the 46k modules of
+        // a large application build.
+        //
+        // * Per symbol: Name (`Ident` + the string itself), `Vec` of resolved references,
+        //   entry in a bindings hash map (including the smaller tables which are discarded as the map grows).
+        // * Per reference: `ReferenceId` in a `Vec` of resolved references (including the smaller
+        //   buffers which are discarded as the `Vec` grows).
+        // * Per scope: Minimum size of a bindings hash table.
+        const BYTES_PER_SYMBOL: usize = 160;
+        const BYTES_PER_REFERENCE: usize = 16;
+        const BYTES_PER_SCOPE: usize = 64;
+
+        // Lower bound on the estimate. `Allocator` rounds this up to a 1 KiB chunk.
+        //
+        // Consumers add symbols and bindings after `SemanticBuilder` has finished
+        // (e.g. a bundler creating a namespace symbol for every module). If the arena has no room
+        // for them, it adds another chunk, which is 16 KiB at minimum. Without this lower bound,
+        // a few symbols added to a file which has next to none of its own would do that.
+        const MIN_ARENA_CAPACITY: usize = 512;
+
+        // `Allocator`'s default chunk size. Only use the estimate if it's smaller than this,
+        // so that the arena's first chunk is never larger than it would be by default.
+        const DEFAULT_ARENA_CAPACITY: usize = 16 * 1024;
+
+        let arena_capacity = symbols
+            .saturating_mul(BYTES_PER_SYMBOL)
+            .saturating_add(references.saturating_mul(BYTES_PER_REFERENCE))
+            .saturating_add(scopes.saturating_mul(BYTES_PER_SCOPE))
+            .max(MIN_ARENA_CAPACITY);
+
+        let allocator = if arena_capacity < DEFAULT_ARENA_CAPACITY {
+            Allocator::with_capacity(arena_capacity)
+        } else {
+            Allocator::default()
+        };
+
+        let mut scoping = Self::new_with_allocator(allocator);
+        scoping.reserve(symbols, references, scopes);
+        scoping
+    }
+
+    fn new_with_allocator(allocator: Allocator) -> Self {
         Self {
             symbol_table: SymbolTable::new(),
             references: IndexVec::new(),
             no_side_effects: FxHashSet::default(),
             enum_data: EnumData::default(),
             scope_table: ScopeTable::new(),
-            cell: ScopingCell::new(Allocator::default(), |allocator| ScopingInner {
-                symbol_names: ArenaVec::new_in(allocator),
-                resolved_references: ArenaVec::new_in(allocator),
+            cell: ScopingCell::new(allocator, |allocator| ScopingInner {
+                symbol_names: ArenaVec::new_in(&allocator),
+                resolved_references: ArenaVec::new_in(&allocator),
                 symbol_redeclarations: FxHashMap::default(),
                 bindings: IndexVec::new(),
                 root_unresolved_references: UnresolvedReferences::new_in(allocator),
+                label_names: ArenaVec::new_in(&allocator),
+                label_depths: ArenaVec::new_in(&allocator),
+                has_unresolved_labels: false,
             }),
         }
     }
@@ -257,8 +324,15 @@ mod scoping_cell {
         }
     }
 
-    /// SAFETY: `ScopingCell` can be `Send` because both the `Allocator` and `Vec`s / `HashMap`s
-    /// storing their data in that `Allocator` are moved to another thread together.
+    /// SAFETY: `ScopingCell` can be `Send` because both the `Allocator`, and the `Vec`s / `HashMap`s
+    /// storing their data in that `Allocator`, are moved to another thread together.
+    ///
+    /// One case doesn't fit that "moved together" picture: `ReplaceWith`'s panic path (in `oxc_allocator`)
+    /// writes a dummy backed by its own dedicated, global `'static` allocator, which does *not* travel
+    /// with this bundle. Sending is still sound, because each such dummy allocator is exclusively owned -
+    /// reachable only through the single value that holds it, and mutated only via `&mut` to that value -
+    /// so no two threads can ever touch one. The invariant this impl really rests on is single-ownership
+    /// of each referenced allocator, not co-location.
     unsafe impl Send for ScopingCell {}
 
     /// SAFETY: `ScopingCell` can be `Sync` if `ScopingInner` is `Sync`, because `ScopingCell` provides
@@ -278,6 +352,8 @@ pub struct ScopingInner<'cell> {
     /// Once a symbol is redeclared, there are at least two entries here. The first
     /// entry is the original symbol information, and the rest are redeclarations.
     /// i.e. `symbol_redeclarations[symbol_id].len() >= 2` always.
+    ///
+    /// This also encodes catch/var links: see [`Scoping::catch_var_binding`].
     symbol_redeclarations: FxHashMap<SymbolId, ArenaVec<'cell, Redeclaration>>,
     /* Scope Tree Fields */
     /// Symbol bindings in a scope.
@@ -286,6 +362,11 @@ pub struct ScopingInner<'cell> {
     pub(crate) bindings: IndexVec<ScopeId, Bindings<'cell>>,
 
     pub(crate) root_unresolved_references: UnresolvedReferences<'cell>,
+
+    /* Label Table Fields */
+    label_names: ArenaVec<'cell, Ident<'cell>>,
+    label_depths: ArenaVec<'cell, u32>,
+    has_unresolved_labels: bool,
 }
 
 // Symbol Table Methods
@@ -302,13 +383,21 @@ impl Scoping {
         self.symbol_table.is_empty()
     }
 
+    /// Returns the number of references in this table.
+    #[inline]
+    pub fn references_len(&self) -> usize {
+        self.references.len()
+    }
+
     /// Iterate all symbol names in insertion order.
-    pub fn symbol_names(&self) -> impl Iterator<Item = &str> + '_ {
+    pub fn symbol_names(&self) -> impl ExactSizeIterator<Item = &str> + '_ {
         self.cell.borrow_dependent().symbol_names.iter().map(Ident::as_str)
     }
 
     /// Iterate resolved reference ID lists for each symbol.
-    pub fn resolved_references(&self) -> impl Iterator<Item = &ArenaVec<'_, ReferenceId>> + '_ {
+    pub fn resolved_references(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &ArenaVec<'_, ReferenceId>> + '_ {
         self.cell.borrow_dependent().resolved_references.iter()
     }
 
@@ -318,7 +407,7 @@ impl Scoping {
     /// scope.
     ///
     /// [`ScopeTree::iter_bindings_in`]: crate::scoping::Scoping::iter_bindings_in
-    pub fn symbol_ids(&self) -> impl Iterator<Item = SymbolId> + '_ {
+    pub fn symbol_ids(&self) -> impl ExactSizeIterator<Item = SymbolId> + '_ {
         self.symbol_table.iter_ids()
     }
 
@@ -328,6 +417,12 @@ impl Scoping {
     #[inline]
     pub fn symbol_span(&self, symbol_id: SymbolId) -> Span {
         *self.symbol_table.symbol_spans(symbol_id)
+    }
+
+    /// Set the span of `symbol_id`.
+    #[inline]
+    pub fn set_symbol_span(&mut self, symbol_id: SymbolId, span: Span) {
+        *self.symbol_table.symbol_spans_mut(symbol_id) = span;
     }
 
     /// Get the identifier name a symbol is bound to.
@@ -343,12 +438,26 @@ impl Scoping {
     }
 
     /// Rename a symbol.
-    ///
-    /// Returns the old name.
     #[inline]
     pub fn set_symbol_name(&mut self, symbol_id: SymbolId, name: Ident<'_>) {
         self.cell.with_dependent_mut(|allocator, cell| {
             cell.symbol_names[symbol_id.index()] = name.clone_in(allocator);
+        });
+    }
+
+    /// Rename multiple symbols to the same name.
+    ///
+    /// The name is allocated once in the semantic arena and shared between all symbols.
+    #[inline]
+    pub fn set_symbol_names(&mut self, symbol_ids: &[SymbolId], name: Ident<'_>) {
+        if symbol_ids.is_empty() {
+            return;
+        }
+        self.cell.with_dependent_mut(|allocator, cell| {
+            let name = name.clone_in(allocator);
+            for &symbol_id in symbol_ids {
+                cell.symbol_names[symbol_id.index()] = name;
+            }
         });
     }
 
@@ -376,6 +485,67 @@ impl Scoping {
             },
             |v| v.as_slice(),
         )
+    }
+
+    /// Iterate redeclared symbols with their declarations, in unspecified order.
+    /// See [`Scoping::symbol_redeclarations`].
+    pub fn redeclared_symbols(&self) -> impl Iterator<Item = (SymbolId, &[Redeclaration])> + '_ {
+        self.cell
+            .borrow_dependent()
+            .symbol_redeclarations
+            .iter()
+            .map(|(&symbol_id, redeclarations)| (symbol_id, redeclarations.as_slice()))
+    }
+
+    /// Get the enclosing var binding declared by a `var` that redeclares this catch parameter.
+    ///
+    /// In `catch (e) { var e = 1 }`, the `var` declares a binding in the enclosing var scope,
+    /// but its initializer assigns to the catch parameter, so the declarator's identifier
+    /// carries the catch symbol. See <https://tc39.es/ecma262/#sec-variablestatements-in-catch-blocks>.
+    ///
+    /// The link is derived rather than stored: the catch parameter has a `var` redeclaration,
+    /// and the enclosing binding has the same name in the nearest var scope. Both symbols
+    /// print through one identifier, so they must be renamed together.
+    #[inline]
+    pub fn catch_var_binding(&self, symbol_id: SymbolId) -> Option<SymbolId> {
+        if !self.symbol_flags(symbol_id).is_catch_variable() {
+            return None;
+        }
+        self.catch_var_binding_of(symbol_id, self.symbol_redeclarations(symbol_id))
+    }
+
+    /// Iterate `(catch parameter, enclosing var binding)` pairs in unspecified order.
+    /// See [`Scoping::catch_var_binding`].
+    pub fn catch_var_bindings(&self) -> impl Iterator<Item = (SymbolId, SymbolId)> + '_ {
+        self.cell.borrow_dependent().symbol_redeclarations.iter().filter_map(
+            |(&symbol_id, declarations)| {
+                if !self.symbol_flags(symbol_id).is_catch_variable() {
+                    return None;
+                }
+                Some((symbol_id, self.catch_var_binding_of(symbol_id, declarations)?))
+            },
+        )
+    }
+
+    /// [`Scoping::catch_var_binding`], with the symbol's redeclarations already looked up.
+    fn catch_var_binding_of(
+        &self,
+        symbol_id: SymbolId,
+        declarations: &[Redeclaration],
+    ) -> Option<SymbolId> {
+        // Only a `var` can redeclare a catch parameter: a lexical or function declaration with the
+        // same name in the catch block is a syntax error. The parameter's own declaration is
+        // function-scoped too, so exclude it by its catch flag.
+        if !declarations.iter().any(|declaration| {
+            declaration.flags.contains(SymbolFlags::FunctionScopedVariable)
+                && !declaration.flags.is_catch_variable()
+        }) {
+            return None;
+        }
+        let var_scope_id = self
+            .scope_ancestors(self.symbol_scope_id(symbol_id))
+            .find(|&scope_id| self.scope_flags(scope_id).is_var())?;
+        self.get_binding(var_scope_id, self.symbol_ident(symbol_id))
     }
 
     #[inline]
@@ -435,9 +605,29 @@ impl Scoping {
     ) -> SymbolId {
         self.cell.with_dependent_mut(|allocator, cell| {
             cell.symbol_names.push(name.clone_in(allocator));
-            cell.resolved_references.push(ArenaVec::new_in(allocator));
+            cell.resolved_references.push(ArenaVec::new_in(&allocator));
         });
         self.symbol_table.push(span, flags, scope_id, node_id)
+    }
+
+    /// Create a new symbol, append symbol metadata to the symbol table, and bind it to a scope.
+    pub(crate) fn create_symbol_with_binding(
+        &mut self,
+        span: Span,
+        name: Ident<'_>,
+        flags: SymbolFlags,
+        symbol_scope_id: ScopeId,
+        binding_scope_id: ScopeId,
+        node_id: NodeId,
+    ) -> SymbolId {
+        let symbol_id = self.symbol_table.push(span, flags, symbol_scope_id, node_id);
+        self.cell.with_dependent_mut(|allocator, cell| {
+            let name = name.clone_in(allocator);
+            cell.symbol_names.push(name);
+            cell.resolved_references.push(ArenaVec::new_in(&allocator));
+            cell.bindings[binding_scope_id].insert(name, symbol_id);
+        });
+        symbol_id
     }
 
     /// Record a redeclaration for an existing symbol.
@@ -470,11 +660,43 @@ impl Scoping {
                             "The above step has already been checked, and it was first declared."
                         )
                     });
-                    let v = ArenaVec::from_array_in([first_declaration, redeclaration], allocator);
+                    let v = ArenaVec::from_array_in([first_declaration, redeclaration], &allocator);
                     vacant.insert(v);
                 }
             }
         });
+    }
+
+    /// Remove all redeclaration metadata for a symbol.
+    pub fn clear_symbol_redeclarations(&mut self, symbol_id: SymbolId) {
+        self.cell.with_dependent_mut(|_allocator, cell| {
+            cell.symbol_redeclarations.remove(&symbol_id);
+        });
+    }
+
+    /// Remove one declaration from a merged symbol and promote the first surviving declaration.
+    pub fn remove_symbol_declaration(&mut self, symbol_id: SymbolId, span: Span) {
+        let replacement = self.cell.with_dependent_mut(|_allocator, cell| {
+            let redeclarations = cell.symbol_redeclarations.get_mut(&symbol_id)?;
+            redeclarations.retain(|redeclaration| redeclaration.span != span);
+
+            let first = redeclarations.first()?.clone();
+            let flags = redeclarations
+                .iter()
+                .fold(SymbolFlags::None, |flags, redeclaration| flags | redeclaration.flags);
+            let has_redeclarations = redeclarations.len() > 1;
+            if !has_redeclarations {
+                cell.symbol_redeclarations.remove(&symbol_id);
+            }
+
+            Some((first, flags))
+        });
+
+        if let Some((replacement, flags)) = replacement {
+            *self.symbol_table.symbol_spans_mut(symbol_id) = replacement.span;
+            *self.symbol_table.symbol_declarations_mut(symbol_id) = replacement.declaration;
+            *self.symbol_table.symbol_flags_mut(symbol_id) = flags;
+        }
     }
 
     #[inline]
@@ -573,16 +795,21 @@ impl Scoping {
         });
     }
 
-    /// Retain only resolved references that are in the given set.
+    /// Remove every `ReferenceId` whose bit is set in `excluded` from each
+    /// symbol's resolved-references list. O(total_references) in the worst
+    /// case; short-circuits when `excluded` has no bits set.
     ///
-    /// This is an O(n) batch operation across all symbols, much more efficient than
-    /// calling `delete_resolved_reference` repeatedly when many references from the
-    /// same symbol need to be removed (which would be O(n²) due to the linear scan
-    /// in each deletion).
-    pub fn retain_resolved_references(&mut self, live_references: &FxHashSet<ReferenceId>) {
+    /// `excluded` should be sized to at least [`Self::references_len`] at the
+    /// time it was constructed. References created after the bitset was
+    /// constructed have indices beyond `excluded.capacity()` and are treated
+    /// as live (never excluded) — `BitSet::contains` is `false` past capacity.
+    pub fn retain_resolved_references_excluding(&mut self, excluded: &BitSet<'_>) {
+        if excluded.is_empty() {
+            return;
+        }
         self.cell.with_dependent_mut(|_allocator, cell| {
             for reference_ids in &mut cell.resolved_references {
-                reference_ids.retain(|id| live_references.contains(id));
+                reference_ids.retain(|id| !excluded.contains(id.index()));
             }
         });
     }
@@ -622,8 +849,25 @@ impl Scoping {
         self.enum_data.set_member_value(symbol_id, value);
     }
 
+    /// Whether an enum member has a string initializer, including non-UTF-8 names and values.
+    pub fn is_string_enum_member(&self, scope_id: ScopeId, name: JSStr<'_>) -> bool {
+        name.as_str()
+            .and_then(|name| self.get_binding(scope_id, name.into()))
+            .and_then(|symbol_id| self.get_enum_member_value(symbol_id))
+            .is_some_and(|value| matches!(value, ConstantValue::String(_)))
+            || self.enum_data.is_string_member(scope_id, name)
+    }
+
+    pub(crate) fn add_string_enum_member(&mut self, scope_id: ScopeId, name: JSStr<'_>) {
+        self.enum_data.add_string_member(scope_id, name);
+    }
+
     /// Get the body scopes for an enum declaration symbol.
     /// Returns multiple scopes for merged enum declarations.
+    ///
+    /// Unlike the enum bits in `SymbolFlags`, this stays valid after the transformer
+    /// lowers the enum to a `var`/`let` binding, so it identifies enums at any point
+    /// during a transform.
     pub fn get_enum_body_scopes(&self, symbol_id: SymbolId) -> Option<&[ScopeId]> {
         self.enum_data.get_body_scopes(symbol_id)
     }
@@ -632,6 +876,19 @@ impl Scoping {
     /// Appends to the list (supports merged enum declarations).
     pub(crate) fn add_enum_body_scope(&mut self, symbol_id: SymbolId, scope_id: ScopeId) {
         self.enum_data.add_body_scope(symbol_id, scope_id);
+    }
+
+    /// Whether the symbol is a `const enum` declaration.
+    ///
+    /// Returns `false` for regular enums and non-enum symbols alike — gate on
+    /// [`Self::get_enum_body_scopes`] to identify enums.
+    pub fn is_const_enum(&self, symbol_id: SymbolId) -> bool {
+        self.enum_data.is_const_enum(symbol_id)
+    }
+
+    /// Mark a symbol as a `const enum` declaration.
+    pub(crate) fn add_const_enum(&mut self, symbol_id: SymbolId) {
+        self.enum_data.add_const_enum(symbol_id);
     }
 }
 
@@ -663,8 +920,15 @@ impl Scoping {
         std::iter::successors(Some(scope_id), |&scope_id| *self.scope_table.parent_ids(scope_id))
     }
 
+    /// Returns `true` if `scope_id` is a descendant of `ancestor_scope_id`.
+    ///
+    /// A scope is not considered a descendant of itself.
+    pub fn scope_is_descendant_of(&self, scope_id: ScopeId, ancestor_scope_id: ScopeId) -> bool {
+        self.scope_ancestors(scope_id).skip(1).any(|scope_id| scope_id == ancestor_scope_id)
+    }
+
     /// Iterate all scope IDs from the root scope through all descendants.
-    pub fn scope_descendants_from_root(&self) -> impl Iterator<Item = ScopeId> + '_ {
+    pub fn scope_descendants_from_root(&self) -> impl ExactSizeIterator<Item = ScopeId> + '_ {
         self.scope_table.iter_ids()
     }
 
@@ -767,7 +1031,7 @@ impl Scoping {
             let name = name.clone_in(allocator);
             cell.root_unresolved_references
                 .entry(name)
-                .or_insert_with(|| ArenaVec::new_in(allocator))
+                .or_insert_with(|| ArenaVec::new_in(&allocator))
                 .push(reference_id);
         });
     }
@@ -785,6 +1049,7 @@ impl Scoping {
     /// binding that might be declared in a parent scope, use [`find_binding`].
     ///
     /// [`find_binding`]: Scoping::find_binding
+    #[inline]
     pub fn get_binding(&self, scope_id: ScopeId, name: Ident<'_>) -> Option<SymbolId> {
         self.cell.borrow_dependent().bindings[scope_id].get(&name).copied()
     }
@@ -793,6 +1058,11 @@ impl Scoping {
     ///
     /// Bindings are resolved by walking up the scope tree until a binding is
     /// found. If no binding is found, [`None`] is returned.
+    ///
+    /// This lookup does not model the implicit `arguments` object. It walks past
+    /// function boundaries, so `arguments` can resolve to a binding in an outer
+    /// scope. A transform that needs a function's own `arguments` must create an
+    /// unbound reference instead of looking the name up.
     pub fn find_binding(&self, mut scope_id: ScopeId, name: Ident<'_>) -> Option<SymbolId> {
         let cell = self.cell.borrow_dependent();
         loop {
@@ -823,27 +1093,17 @@ impl Scoping {
     /// If you only want bindings in a specific scope, use [`iter_bindings_in`].
     ///
     /// [`iter_bindings_in`]: Scoping::iter_bindings_in
-    pub fn iter_bindings(&self) -> impl Iterator<Item = (ScopeId, &Bindings<'_>)> + '_ {
+    pub fn iter_bindings(&self) -> impl ExactSizeIterator<Item = (ScopeId, &Bindings<'_>)> + '_ {
         self.cell.borrow_dependent().bindings.iter_enumerated()
     }
 
     /// Iterate over bindings declared inside a scope.
     #[inline]
-    pub fn iter_bindings_in(&self, scope_id: ScopeId) -> impl Iterator<Item = SymbolId> + '_ {
-        self.cell.borrow_dependent().bindings[scope_id].values().copied()
-    }
-
-    #[inline]
-    pub(crate) fn insert_binding(
-        &mut self,
+    pub fn iter_bindings_in(
+        &self,
         scope_id: ScopeId,
-        name: Ident<'_>,
-        symbol_id: SymbolId,
-    ) {
-        self.cell.with_dependent_mut(|allocator, cell| {
-            let name = name.clone_in(allocator);
-            cell.bindings[scope_id].insert(name, symbol_id);
-        });
+    ) -> impl ExactSizeIterator<Item = SymbolId> + '_ {
+        self.cell.borrow_dependent().bindings[scope_id].values().copied()
     }
 
     /// Create a scope.
@@ -884,6 +1144,29 @@ impl Scoping {
                 cell.bindings[to].insert(name, symbol_id);
             }
         });
+    }
+
+    /// Move a binding from one scope to another by its [`SymbolId`].
+    ///
+    /// Looks up the symbol's name internally, moves the entry from `from`'s binding map to `to`'s
+    /// (a no-op if no binding for the symbol exists in `from`), and always updates the symbol's
+    /// recorded scope id to `to`.
+    ///
+    /// Prefer this over the [`move_binding`] + [`set_symbol_scope_id`] pair when a `SymbolId` is
+    /// available, and use it when the name isn't otherwise accessible with the arena lifetime
+    /// (e.g. when iterating `from`'s binding map).
+    ///
+    /// [`move_binding`]: Scoping::move_binding
+    /// [`set_symbol_scope_id`]: Scoping::set_symbol_scope_id
+    pub fn move_binding_by_symbol_id(&mut self, from: ScopeId, to: ScopeId, symbol_id: SymbolId) {
+        debug_assert_ne!(from, to);
+        self.cell.with_dependent_mut(|_allocator, cell| {
+            let name = cell.symbol_names[symbol_id.index()];
+            if let Some((name, sid)) = cell.bindings[from].remove_entry(&name) {
+                cell.bindings[to].insert(name, sid);
+            }
+        });
+        self.set_symbol_scope_id(symbol_id, to);
     }
 
     /// Rename a binding to a new name.
@@ -934,20 +1217,104 @@ impl Scoping {
         });
     }
 
-    /// Remove bindings that exist only in TypeScript type space.
+    /// Remove bindings that exist only in TypeScript syntax.
     pub fn delete_typescript_bindings(&mut self) {
+        #[expect(
+            clippy::inline_always,
+            reason = "Hot predicate called for every semantic reference"
+        )]
+        #[inline(always)]
+        fn is_typescript_reference(reference: &Reference) -> bool {
+            let flags = reference.flags();
+            (flags.is_type() && !flags.is_value()) || flags.is_value_as_type()
+        }
+
+        let references = &self.references;
+
         self.cell.with_dependent_mut(|_allocator, cell| {
+            for reference_ids in &mut cell.resolved_references {
+                reference_ids
+                    .retain(|reference_id| !is_typescript_reference(&references[*reference_id]));
+            }
+
+            cell.root_unresolved_references.retain(|_name, reference_ids| {
+                reference_ids
+                    .retain(|reference_id| !is_typescript_reference(&references[*reference_id]));
+                !reference_ids.is_empty()
+            });
+
             for bindings in &mut cell.bindings {
                 bindings.retain(|_name, symbol_id| {
                     let flags = *self.symbol_table.symbol_flags(*symbol_id);
                     !flags.intersects(
                         SymbolFlags::TypeAlias
                             | SymbolFlags::Interface
-                            | SymbolFlags::TypeParameter,
+                            | SymbolFlags::TypeParameter
+                            | SymbolFlags::EnumMember,
                     )
                 });
             }
         });
+    }
+}
+
+// Label Table Methods
+impl Scoping {
+    /// Returns the number of labels in this table.
+    #[inline]
+    pub fn labels_len(&self) -> usize {
+        self.cell.borrow_dependent().label_names.len()
+    }
+
+    /// Iterate over all label IDs in creation order.
+    pub fn label_ids(&self) -> impl ExactSizeIterator<Item = LabelId> + '_ {
+        (0..self.labels_len()).map(LabelId::from_usize)
+    }
+
+    /// Get the name of a label.
+    #[inline]
+    pub fn label_name(&self, label_id: LabelId) -> &str {
+        self.cell.borrow_dependent().label_names[label_id.index()].as_str()
+    }
+
+    /// Get the number of labels enclosing a label.
+    ///
+    /// Labels are nested across function boundaries, so this also counts enclosing labels
+    /// outside the function containing `label_id`.
+    #[inline]
+    pub fn label_depth(&self, label_id: LabelId) -> u32 {
+        self.cell.borrow_dependent().label_depths[label_id.index()]
+    }
+
+    /// Create a new label enclosed by `depth` other labels.
+    pub fn create_label(&mut self, name: Ident<'_>, depth: u32) -> LabelId {
+        self.cell.with_dependent_mut(|allocator, cell| {
+            let label_id = LabelId::from_usize(cell.label_names.len());
+            cell.label_names.push(name.clone_in(allocator));
+            cell.label_depths.push(depth);
+            label_id
+        })
+    }
+
+    /// Rename a label.
+    #[inline]
+    pub fn set_label_name(&mut self, label_id: LabelId, name: Ident<'_>) {
+        self.cell.with_dependent_mut(|allocator, cell| {
+            cell.label_names[label_id.index()] = name.clone_in(allocator);
+        });
+    }
+
+    /// Whether a `break` or `continue` label does not resolve to an enclosing label.
+    ///
+    /// This only happens in invalid code. Codegen prints such labels unchanged.
+    #[inline]
+    pub fn has_unresolved_labels(&self) -> bool {
+        self.cell.borrow_dependent().has_unresolved_labels
+    }
+
+    /// Record that a `break` or `continue` label does not resolve to an enclosing label.
+    pub fn set_has_unresolved_labels(&mut self) {
+        self.cell.with_dependent_mut(|_, cell| cell.has_unresolved_labels = true);
     }
 }
 
@@ -984,6 +1351,9 @@ impl Scoping {
                     root_unresolved_references: cell
                         .root_unresolved_references
                         .clone_in_with_semantic_ids(allocator),
+                    label_names: cell.label_names.clone_in_with_semantic_ids(allocator),
+                    label_depths: cell.label_depths.clone_in_with_semantic_ids(allocator),
+                    has_unresolved_labels: cell.has_unresolved_labels,
                 })
             },
         }

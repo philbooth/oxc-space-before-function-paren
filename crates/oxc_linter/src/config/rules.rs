@@ -1,5 +1,6 @@
-use std::{borrow::Cow, fmt};
+use std::{borrow::Cow, fmt, sync::Arc};
 
+use cow_utils::CowUtils;
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
 use schemars::{
@@ -7,20 +8,26 @@ use schemars::{
     r#gen::SchemaGenerator,
     schema::{ArrayValidation, InstanceType, Schema, SchemaObject},
 };
+
+#[cfg(feature = "ruledocs")]
+use schemars::schema::SingleOrVec;
+
 use serde::{
     Deserialize, Serialize, Serializer,
     de::{self, Deserializer, Visitor},
-    ser::SerializeMap,
+    ser::{SerializeMap, SerializeSeq},
 };
 use smallvec::SmallVec;
 
 use oxc_diagnostics::{Error, OxcDiagnostic};
 
+#[cfg(feature = "ruledocs")]
+use crate::utils::should_skip_config_schema;
 use crate::{
     AllowWarnDeny, ExternalPluginStore, LintPlugins,
     external_plugin_store::{ExternalOptionsId, ExternalRuleId, ExternalRuleLookupError},
     rules::{RULES, RuleEnum},
-    utils::{is_eslint_rule_adapted_to_typescript, is_jest_rule_adapted_to_vitest},
+    utils::is_eslint_rule_adapted_to_typescript,
 };
 
 /// Errors that can occur when overriding rules
@@ -66,7 +73,20 @@ impl From<ExternalRuleLookupError> for OverrideRulesError {
     }
 }
 
-type RuleSet = FxHashMap<RuleEnum, AllowWarnDeny>;
+pub(super) type RuleSet = FxHashMap<RuleEnum, RuleConfig>;
+
+/// Keeps original JSON options with the compiled rule's severity for config printing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleConfig {
+    pub severity: AllowWarnDeny,
+    pub options: Option<Arc<[serde_json::Value]>>,
+}
+
+impl RuleConfig {
+    pub fn new(severity: AllowWarnDeny) -> Self {
+        Self { severity, options: None }
+    }
+}
 
 // TS type is `Record<string, RuleConf>`
 //   - type SeverityConf = 0 | 1 | 2 | "off" | "warn" | "error";
@@ -82,6 +102,38 @@ pub struct OxlintRules {
 impl OxlintRules {
     pub fn new(rules: Vec<ESLintRule>) -> Self {
         Self { rules }
+    }
+
+    pub(super) fn from_resolved(
+        builtin_rules: &[(RuleEnum, RuleConfig)],
+        external_rules: &[(ExternalRuleId, ExternalOptionsId, AllowWarnDeny)],
+        external_plugin_store: &ExternalPluginStore,
+    ) -> Self {
+        let builtin_rules = builtin_rules.iter().map(|(rule, config)| ESLintRule {
+            plugin_name: rule.plugin_name().to_string(),
+            rule_name: rule.name().to_string(),
+            severity: config.severity,
+            config: config.options.as_deref().unwrap_or_default().iter().cloned().collect(),
+        });
+        let external_rules = external_rules.iter().map(|(rule_id, options_id, severity)| {
+            let (plugin_name, rule_name) =
+                external_plugin_store.resolve_plugin_rule_names(*rule_id);
+            ESLintRule {
+                plugin_name: plugin_name.to_string(),
+                rule_name: rule_name.to_string(),
+                severity: *severity,
+                config: external_plugin_store
+                    .resolve_rule_options(*options_id)
+                    .iter()
+                    .cloned()
+                    .collect(),
+            }
+        });
+        let mut rules: Vec<_> = builtin_rules.chain(external_rules).collect();
+        rules.sort_unstable_by(|a, b| {
+            (&a.plugin_name, &a.rule_name).cmp(&(&b.plugin_name, &b.rule_name))
+        });
+        Self::new(rules)
     }
 
     /// Returns `true` if there are no rules.
@@ -166,7 +218,14 @@ impl OxlintRules {
                         };
                         match rule.from_configuration(config) {
                             Ok(configured_rule) => {
-                                rules_to_replace.push((configured_rule, severity));
+                                rules_to_replace.push((
+                                    configured_rule,
+                                    RuleConfig {
+                                        severity,
+                                        options: (!rule_config.config.is_empty())
+                                            .then(|| Arc::from(rule_config.config.as_slice())),
+                                    },
+                                ));
                             }
                             Err(e) => {
                                 errors.push(OverrideRulesError::RuleConfiguration {
@@ -194,7 +253,6 @@ impl OxlintRules {
                     if external_plugin_store.is_enabled() {
                         match external_plugin_store.lookup_rule_id(plugin_name, rule_name) {
                             Ok(external_rule_id) => {
-                                // Add options to store and get options ID
                                 let options_id = external_plugin_store
                                     .add_options(external_rule_id, &rule_config.config);
 
@@ -207,7 +265,10 @@ impl OxlintRules {
                                     .or_insert((options_id, severity));
                             }
                             Err(e) => {
-                                errors.push(OverrideRulesError::ExternalRuleLookup(e));
+                                let error = OverrideRulesError::ExternalRuleLookup(e);
+                                if !errors.contains(&error) {
+                                    errors.push(error);
+                                }
                             }
                         }
                     }
@@ -216,14 +277,15 @@ impl OxlintRules {
         }
 
         if !errors.is_empty() {
-            // Sort by the error message so output is stable
-            errors.sort_by_key(std::string::ToString::to_string);
+            // Sort by the error message so output is stable. The key is computed once per error
+            // rather than once per comparison, which also keeps the `Display` impl out of the sort.
+            errors.sort_by_cached_key(std::string::ToString::to_string);
             return Err(errors);
         }
 
-        for (rule, severity) in rules_to_replace {
+        for (rule, config) in rules_to_replace {
             let _ = rules_for_override.remove(&rule);
-            rules_for_override.insert(rule, severity);
+            rules_for_override.insert(rule, config);
         }
 
         Ok(())
@@ -235,8 +297,6 @@ fn transform_rule_and_plugin_name<'a>(
     plugin_name: &'a str,
 ) -> (&'a str, &'a str) {
     let plugin_name = match plugin_name {
-        "vitest" if is_jest_rule_adapted_to_vitest(rule_name) => "jest",
-        "unicorn" if rule_name == "no-negated-condition" => "eslint",
         "typescript" if is_eslint_rule_adapted_to_typescript(rule_name) => "eslint",
         _ => plugin_name,
     };
@@ -260,6 +320,14 @@ impl JsonSchema for OxlintRules {
         enum DummyRule {
             Toggle(AllowWarnDeny),
             ToggleAndConfig(ToggleAndConfig),
+        }
+
+        #[expect(unused)]
+        #[derive(Debug, Clone, JsonSchema)]
+        #[serde(untagged)]
+        enum RuleNoConfig {
+            Toggle(AllowWarnDeny),
+            ToggleOnly(ToggleOnly),
         }
 
         #[derive(Debug, Clone)]
@@ -293,12 +361,264 @@ impl JsonSchema for OxlintRules {
             }
         }
 
+        #[derive(Debug, Clone)]
+        struct ToggleOnly;
+
+        impl JsonSchema for ToggleOnly {
+            fn is_referenceable() -> bool {
+                false
+            }
+
+            fn schema_name() -> String {
+                "ToggleOnly".to_string()
+            }
+
+            fn schema_id() -> Cow<'static, str> {
+                "ToggleOnly".into()
+            }
+
+            fn json_schema(r#gen: &mut SchemaGenerator) -> Schema {
+                SchemaObject {
+                    instance_type: Some(InstanceType::Array.into()),
+                    array: Some(Box::new(ArrayValidation {
+                        items: Some(vec![r#gen.subschema_for::<AllowWarnDeny>()].into()),
+                        min_items: Some(1),
+                        max_items: Some(1),
+                        additional_items: Some(Box::new(Schema::Bool(false))),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }
+                .into()
+            }
+        }
+
         #[expect(unused)]
-        #[derive(Debug, JsonSchema)]
-        #[schemars(
-            description = "See [Oxlint Rules](https://oxc.rs/docs/guide/usage/linter/rules.html)"
-        )]
+        #[derive(Debug)]
         struct DummyRuleMap(pub FxHashMap<String, DummyRule>);
+
+        impl JsonSchema for DummyRuleMap {
+            fn schema_name() -> String {
+                "DummyRuleMap".to_string()
+            }
+
+            fn schema_id() -> Cow<'static, str> {
+                "DummyRuleMap".into()
+            }
+
+            fn json_schema(r#gen: &mut SchemaGenerator) -> Schema {
+                #[cfg(feature = "ruledocs")]
+                fn resolve_references_in_schema<'a>(
+                    schema: &'a Schema,
+                    r#gen: &'a SchemaGenerator,
+                ) -> &'a Schema {
+                    let Some(current) = r#gen.dereference(schema) else {
+                        return schema;
+                    };
+
+                    let Schema::Object(obj) = current else {
+                        return schema;
+                    };
+
+                    // We only need to dereference array schemas for rule config.
+                    // Reuse the schema for other cases.
+                    if obj.array.as_ref().is_none_or(|array| {
+                        // We need to dereference array schemas with at least 2 entries. A single entry array schema is used for configs which accepts an array.
+                        // 2 entries means that it is a tuple config, and `AllowWarnDeny` needs to be appended for each entry in the tuple.
+                        array
+                            .items
+                            .as_ref()
+                            .is_none_or(|items| !matches!(items, SingleOrVec::Vec(_)))
+                            &&
+                            // We need to dereference array schemas with additional items. These should be handled as spread elements inside the config.
+                            // So rule configurations like `[AllowWarnDeny, ...Config]` can be supported.
+                            array.additional_items.is_none()
+                    }) {
+                        return schema;
+                    }
+
+                    // TODO: the reference should be removed from the generator.
+                    current
+                }
+
+                // we expect that rules config items does not extend 4,294,967,295 entries.
+                #[expect(clippy::cast_possible_truncation)]
+                #[cfg(feature = "ruledocs")]
+                fn rule_config_schema(r: &RuleEnum, r#gen: &mut SchemaGenerator) -> Schema {
+                    fn with_default_rule_schema(
+                        config_schema: Schema,
+                        r#gen: &mut SchemaGenerator,
+                    ) -> Schema {
+                        SchemaObject {
+                            subschemas: Some(Box::new(schemars::schema::SubschemaValidation {
+                                any_of: Some(vec![
+                                    r#gen.subschema_for::<RuleNoConfig>(),
+                                    config_schema,
+                                ]),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }
+                        .into()
+                    }
+
+                    fn append_allow_warn_deny_to_schema(
+                        config_schema: Schema,
+                        r#gen: &mut SchemaGenerator,
+                    ) -> Schema {
+                        let Schema::Object(mut obj) = config_schema.clone() else {
+                            return SchemaObject {
+                                instance_type: Some(InstanceType::Array.into()),
+                                array: Some(Box::new(ArrayValidation {
+                                    items: Some(SingleOrVec::Vec(vec![
+                                        r#gen.subschema_for::<AllowWarnDeny>(),
+                                        config_schema,
+                                    ])),
+                                    min_items: Some(2),
+                                    max_items: Some(2),
+                                    ..Default::default()
+                                })),
+                                ..Default::default()
+                            }
+                            .into();
+                        };
+
+                        debug_assert!(
+                            (u8::from(obj.array.is_some())
+                                + u8::from(obj.object.is_some())
+                                + u8::from(obj.reference.is_some()))
+                                <= 1,
+                            "Expected rule schema to be either an object, an array, or a reference, but not multiple"
+                        );
+
+                        if let Some(ref mut array) = obj.array {
+                            debug_assert!(
+                                array.items.is_none() || array.additional_items.is_none(),
+                                "Expected rule to not contain items and additionalItems at the same time"
+                            );
+                            if array.additional_items.is_some() {
+                                array.items = Some(SingleOrVec::Vec(vec![
+                                    r#gen.subschema_for::<AllowWarnDeny>(),
+                                ]));
+                                array.min_items = Some(1);
+                                array.max_items = None;
+                                return Schema::Object(obj);
+                            }
+                            // We only need to handle the cases where multiple items exists,
+                            // because single item array schema is used for rules which accepts an array as config,
+                            // and we just need to append `AllowWarnDeny` for that case.
+                            let Some(SingleOrVec::Vec(configs)) = array.items.clone() else {
+                                return SchemaObject {
+                                    instance_type: Some(InstanceType::Array.into()),
+                                    array: Some(Box::new(ArrayValidation {
+                                        items: Some(SingleOrVec::Vec(vec![
+                                            r#gen.subschema_for::<AllowWarnDeny>(),
+                                            config_schema,
+                                        ])),
+                                        min_items: Some(2),
+                                        max_items: Some(2),
+                                        ..Default::default()
+                                    })),
+                                    ..Default::default()
+                                }
+                                .into();
+                            };
+
+                            let mut items = Vec::with_capacity(configs.len().saturating_add(1));
+                            items.push(r#gen.subschema_for::<AllowWarnDeny>());
+                            items.extend(configs);
+
+                            let config_length = items.len() as u32;
+
+                            return SchemaObject {
+                                instance_type: Some(InstanceType::Array.into()),
+                                array: Some(Box::new(ArrayValidation {
+                                    items: Some(SingleOrVec::Vec(items)),
+                                    min_items: Some(2),
+                                    max_items: Some(config_length),
+                                    ..Default::default()
+                                })),
+                                ..Default::default()
+                            }
+                            .into();
+                        }
+
+                        if let Some(subschemas) = &mut obj.subschemas
+                            && let Some(any_of) = &subschemas.any_of
+                        {
+                            subschemas.any_of = Some(
+                                any_of
+                                    .iter()
+                                    .map(|schema| {
+                                        append_allow_warn_deny_to_schema(schema.clone(), r#gen)
+                                    })
+                                    .collect(),
+                            );
+
+                            return obj.into();
+                        }
+
+                        SchemaObject {
+                            instance_type: Some(InstanceType::Array.into()),
+                            array: Some(Box::new(ArrayValidation {
+                                items: Some(SingleOrVec::Vec(vec![
+                                    r#gen.subschema_for::<AllowWarnDeny>(),
+                                    config_schema,
+                                ])),
+                                min_items: Some(2),
+                                max_items: Some(2),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }
+                        .into()
+                    }
+
+                    let Some(schema) = r.schema(r#gen) else {
+                        return r#gen.subschema_for::<RuleNoConfig>();
+                    };
+                    let schema = resolve_references_in_schema(&schema, r#gen).clone();
+                    let schema = append_allow_warn_deny_to_schema(schema, r#gen);
+                    with_default_rule_schema(schema, r#gen)
+                }
+
+                let dummy_schema = r#gen.subschema_for::<DummyRule>();
+
+                let rules_enum = RULES.iter().map(|r| {
+                    #[cfg(feature = "ruledocs")]
+                    let schema = if should_skip_config_schema(r) {
+                        r#gen.subschema_for::<DummyRule>()
+                    } else {
+                        rule_config_schema(r, r#gen)
+                    };
+                    #[cfg(not(feature = "ruledocs"))]
+                    let schema = r#gen.subschema_for::<DummyRule>();
+                    if r.plugin_name() == "eslint" {
+                        (r.name().to_string(), schema)
+                    } else {
+                        (format!("{}/{}", r.plugin_name().cow_replace('_', "-"), r.name()), schema)
+                    }
+                });
+
+                SchemaObject {
+                    metadata: Some(Box::new(schemars::schema::Metadata {
+                        description: Some(
+                            "See [Oxlint Rules](https://oxc.rs/docs/guide/usage/linter/rules.html)"
+                                .to_string(),
+                        ),
+                        ..Default::default()
+                    })),
+                    instance_type: Some(InstanceType::Object.into()),
+                    object: Some(Box::new(schemars::schema::ObjectValidation {
+                        additional_properties: Some(Box::new(dummy_schema)),
+                        properties: rules_enum.collect(),
+                        ..Default::default()
+                    })),
+                    ..Default::default()
+                }
+                .into()
+            }
+        }
 
         r#gen.subschema_for::<DummyRuleMap>()
     }
@@ -310,17 +630,30 @@ impl Serialize for OxlintRules {
 
         for rule in &self.rules {
             let key = rule.full_name();
-            if rule.config.is_empty() {
-                // e.g. unicorn/some-rule: "warn"
-                rules.serialize_entry(&key, rule.severity.as_str())?;
-            } else {
-                // e.g. unicorn/some-rule: ["warn", { foo: "bar" }]
-                let value = (rule.severity.as_str(), &rule.config);
-                rules.serialize_entry(&key, &value)?;
-            }
+            rules.serialize_entry(&key, &RuleValueSer(rule))?;
         }
 
         rules.end()
+    }
+}
+
+struct RuleValueSer<'a>(&'a ESLintRule);
+
+impl Serialize for RuleValueSer<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let rule = self.0;
+        if rule.config.is_empty() {
+            // Serialize a rule with no options as a single severity string.
+            return serializer.serialize_str(rule.severity.as_str());
+        }
+
+        // Otherwise: serialize an array with severity and options.
+        let mut seq = serializer.serialize_seq(Some(1 + rule.config.len()))?;
+        seq.serialize_element(rule.severity.as_str())?;
+        for option in &rule.config {
+            seq.serialize_element(option)?;
+        }
+        seq.end()
     }
 }
 
@@ -382,27 +715,32 @@ fn parse_rule_key(name: &str) -> (String, String) {
     unalias_plugin_name(plugin_name, rule_name)
 }
 
-pub(super) fn unalias_plugin_name(plugin_name: &str, rule_name: &str) -> (String, String) {
-    // First normalize the plugin name by stripping eslint-plugin- prefix/suffix
-    let normalized = super::plugins::normalize_plugin_name(plugin_name);
-    let plugin_name = normalized.as_ref();
+/// Normalize a rule name to the canonical name used by diagnostics.
+///
+/// This removes the plugin prefix from ESLint rules and resolves plugin aliases such as
+/// `@typescript-eslint` to `typescript`.
+pub fn normalize_rule_name(name: &str) -> String {
+    let (plugin_name, rule_name) = parse_rule_key(name);
+    let plugin_name = super::plugins::plugin_display_name(&plugin_name);
+    if plugin_name == "eslint" { rule_name } else { format!("{plugin_name}/{rule_name}") }
+}
 
-    let (oxlint_plugin_name, rule_name) = match plugin_name {
-        "@typescript-eslint" => ("typescript", rule_name),
-        // import-x has the same rules but better performance
-        "import-x" => ("import", rule_name),
-        "jsx-a11y" => ("jsx_a11y", rule_name),
-        "react-perf" => ("react_perf", rule_name),
+pub(super) fn unalias_plugin_name(plugin_name: &str, rule_name: &str) -> (String, String) {
+    let normalized = super::plugins::normalize_plugin_name(plugin_name);
+    let plugin_name = match normalized.as_ref() {
         // e.g. "@next/google-font-display", "@next/next/google-font-display"
-        "@next" | "@next/next" => ("nextjs", rule_name),
-        // For backwards compatibility, react hook rules reside in the react plugin.
-        "react-hooks" => ("react", rule_name),
-        // For backwards compatibility, deepscan rules reside in the oxc plugin.
-        "deepscan" => ("oxc", rule_name),
-        _ => (plugin_name, rule_name),
+        "@next" | "@next/next" => "nextjs".to_string(),
+        plugin_name => match LintPlugins::try_from(plugin_name) {
+            Ok(LintPlugins::ESLINT) => "eslint".to_string(),
+            Ok(plugin) => {
+                let plugin_name: &str = plugin.into();
+                plugin_name.cow_replace('-', "_").into_owned()
+            }
+            Err(()) => normalized.into_owned(),
+        },
     };
 
-    (oxlint_plugin_name.to_string(), rule_name.to_string())
+    (plugin_name, rule_name.to_string())
 }
 
 fn parse_rule_value(
@@ -415,24 +753,22 @@ fn parse_rule_value(
         }
 
         serde_json::Value::Array(mut v) => {
-            if v.is_empty() {
+            let Some((severity, config)) = v.split_first_mut() else {
                 return Err(failed_to_parse_rule_value(
                     &serde_json::Value::Array(v).to_string(),
                     "Type should be `[SeverityConf, ...any[]`",
                 )
                 .into());
-            }
+            };
 
-            // The first item should be SeverityConf
-            let severity = AllowWarnDeny::try_from(v.first().unwrap())?;
-            let config = match v.len() {
-                0 => unreachable!(),
+            let severity = AllowWarnDeny::try_from(&*severity)?;
+            let config = match config {
                 // e.g. ["warn"], [0]
-                1 => SmallVec::new(),
+                [] => SmallVec::new(),
                 // e.g. ["error", { type: "whatever" }]
                 // Separate branch for this common case which uses the faster `SmallVec::from_buf`,
                 // and avoids shifting the first element off the vector.
-                2 => SmallVec::from_buf([v.pop().unwrap()]),
+                [config] => SmallVec::from_buf([config.take()]),
                 // e.g. ["error", { type: "whatever" }, ["len", "also"]]
                 _ => {
                     v.remove(0);
@@ -483,7 +819,31 @@ mod test {
         rules::{RULES, RuleEnum},
     };
 
-    use super::{OxlintRules, RuleSet};
+    use super::{OxlintRules, RuleConfig, RuleSet};
+
+    #[test]
+    fn test_serialize_rule_options_round_trip() {
+        let rules: OxlintRules = serde_json::from_value(json!({
+            "no-debugger": "off",
+            "no-console": ["warn", { "allow": ["warn"] }],
+            "eqeqeq": ["error", "always", { "null": "ignore" }],
+            "custom/no-options": ["error"],
+            "@scope/custom/options": ["warn", ["first", "second"], null, true, 42]
+        }))
+        .unwrap();
+        let serialized = serde_json::to_value(&rules).unwrap();
+        assert_eq!(
+            serialized,
+            json!({
+                "no-debugger": "allow",
+                "no-console": ["warn", { "allow": ["warn"] }],
+                "eqeqeq": ["deny", "always", { "null": "ignore" }],
+                "custom/no-options": "deny",
+                "@scope/custom/options": ["warn", ["first", "second"], null, true, 42]
+            })
+        );
+        assert_eq!(serde_json::from_value::<OxlintRules>(serialized).unwrap(), rules);
+    }
 
     #[test]
     fn test_parse_rules() {
@@ -575,19 +935,22 @@ mod test {
             r#override(&mut rules, &config);
 
             assert_eq!(rules.len(), 1, "{config:?}");
-            let (rule, severity) = rules.iter().next().unwrap();
+            let (rule, config) = rules.iter().next().unwrap();
             assert_eq!(rule.name(), "no-console", "{config:?}");
-            assert_eq!(severity, &AllowWarnDeny::Deny, "{config:?}");
+            assert_eq!(config.severity, AllowWarnDeny::Deny, "{config:?}");
         }
     }
 
     #[test]
     fn test_override_allow() {
         let mut rules = RuleSet::default();
-        rules.insert(RuleEnum::EslintNoConsole(Default::default()), AllowWarnDeny::Deny);
+        rules.insert(
+            RuleEnum::EslintNoConsole(Default::default()),
+            RuleConfig::new(AllowWarnDeny::Deny),
+        );
         r#override(&mut rules, &json!({ "eslint/no-console": "off" }));
 
-        assert!(!rules.iter().any(|(_, severity)| severity.is_warn_deny()));
+        assert!(!rules.values().any(|config| config.severity.is_warn_deny()));
     }
 
     #[test]
@@ -603,20 +966,23 @@ mod test {
             r#override(&mut rules, config);
 
             assert_eq!(rules.len(), 1, "{config:?}");
-            let (rule, severity) = rules.iter().next().unwrap();
+            let (rule, config) = rules.iter().next().unwrap();
             assert_eq!(rule.name(), "no-unused-vars", "{config:?}");
-            assert_eq!(severity, &AllowWarnDeny::Deny, "{config:?}");
+            assert_eq!(config.severity, AllowWarnDeny::Deny, "{config:?}");
         }
 
         for config in &configs {
             let mut rules = RuleSet::default();
-            rules.insert(RuleEnum::EslintNoUnusedVars(Default::default()), AllowWarnDeny::Warn);
+            rules.insert(
+                RuleEnum::EslintNoUnusedVars(Default::default()),
+                RuleConfig::new(AllowWarnDeny::Warn),
+            );
             r#override(&mut rules, config);
 
             assert_eq!(rules.len(), 1, "{config:?}");
-            let (rule, severity) = rules.iter().next().unwrap();
+            let (rule, config) = rules.iter().next().unwrap();
             assert_eq!(rule.name(), "no-unused-vars", "{config:?}");
-            assert_eq!(severity, &AllowWarnDeny::Deny, "{config:?}");
+            assert_eq!(config.severity, AllowWarnDeny::Deny, "{config:?}");
         }
     }
 
@@ -673,18 +1039,25 @@ mod test {
     fn test_normalize_plugin_name_in_rules() {
         use super::super::plugins::normalize_plugin_name;
 
-        // Test eslint-plugin- prefix stripping
+        // Test eslint-plugin- and oxlint-plugin- prefix stripping
         assert_eq!(normalize_plugin_name("eslint-plugin-foo"), "foo");
         assert_eq!(normalize_plugin_name("eslint-plugin-react"), "react");
         assert_eq!(normalize_plugin_name("eslint-plugin-import"), "import");
+        assert_eq!(normalize_plugin_name("oxlint-plugin-foo"), "foo");
+        assert_eq!(normalize_plugin_name("oxlint-plugin-react"), "react");
+        assert_eq!(normalize_plugin_name("oxlint-plugin-import"), "import");
 
-        // Test @scope/eslint-plugin suffix stripping
+        // Test @scope/eslint-plugin and @scope/oxlint-plugin suffix stripping
         assert_eq!(normalize_plugin_name("@foo/eslint-plugin"), "@foo");
         assert_eq!(normalize_plugin_name("@bar/eslint-plugin"), "@bar");
+        assert_eq!(normalize_plugin_name("@foo/oxlint-plugin"), "@foo");
+        assert_eq!(normalize_plugin_name("@bar/oxlint-plugin"), "@bar");
 
-        // Test @scope/eslint-plugin-name normalization
+        // Test @scope/eslint-plugin-name and @scope/oxlint-plugin-name normalization
         assert_eq!(normalize_plugin_name("@foo/eslint-plugin-bar"), "@foo/bar");
         assert_eq!(normalize_plugin_name("@typescript-eslint/eslint-plugin"), "@typescript-eslint");
+        assert_eq!(normalize_plugin_name("@foo/oxlint-plugin-bar"), "@foo/bar");
+        assert_eq!(normalize_plugin_name("@typescript-eslint/oxlint-plugin"), "@typescript-eslint");
 
         // Test no change for already normalized names
         assert_eq!(normalize_plugin_name("react"), "react");
@@ -695,10 +1068,11 @@ mod test {
 
     #[test]
     fn test_parse_rules_with_eslint_plugin_prefix() {
-        // Test that eslint-plugin- prefix is properly normalized in various formats
+        // Test that plugin package prefixes are properly normalized in various formats
         let rules = OxlintRules::deserialize(&json!({
             "eslint-plugin-react/jsx-uses-vars": "error",
             "eslint-plugin-unicorn/no-null": "warn",
+            "oxlint-plugin-import/no-cycle": "error",
         }))
         .unwrap();
 
@@ -713,6 +1087,30 @@ mod test {
         assert_eq!(r2.rule_name, "no-null");
         assert_eq!(r2.plugin_name, "unicorn");
         assert!(r2.severity.is_warn_deny());
+
+        let r3 = rules_iter.next().unwrap();
+        assert_eq!(r3.rule_name, "no-cycle");
+        assert_eq!(r3.plugin_name, "import");
+        assert!(r3.severity.is_warn_deny());
+    }
+
+    #[test]
+    fn test_normalize_rule_name() {
+        assert_eq!(super::normalize_rule_name("eslint/curly"), "curly");
+        assert_eq!(
+            super::normalize_rule_name("@typescript-eslint/no-unused-vars"),
+            "typescript/no-unused-vars"
+        );
+        assert_eq!(
+            super::normalize_rule_name("eslint-plugin-react/jsx-uses-vars"),
+            "react/jsx-uses-vars"
+        );
+        assert_eq!(super::normalize_rule_name("jsx-a11y/alt-text"), "jsx-a11y/alt-text");
+        assert_eq!(
+            super::normalize_rule_name("react-perf/jsx-no-new-object-as-prop"),
+            "react-perf/jsx-no-new-object-as-prop"
+        );
+        assert_eq!(super::normalize_rule_name("@next/next/no-img-element"), "next/no-img-element");
     }
 
     #[test]

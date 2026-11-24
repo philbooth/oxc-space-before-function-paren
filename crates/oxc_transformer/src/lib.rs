@@ -7,11 +7,11 @@
 
 use std::path::Path;
 
-use oxc_allocator::{Allocator, TakeIn, Vec as ArenaVec};
-use oxc_ast::{AstBuilder, ast::*};
-use oxc_diagnostics::OxcDiagnostic;
+use oxc_allocator::{Allocator, ArenaVec};
+use oxc_ast::{ast::*, builder::AstBuilder};
+use oxc_diagnostics::Diagnostics;
 use oxc_semantic::Scoping;
-use oxc_span::{GetSpan, SPAN};
+use oxc_span::GetSpan;
 use oxc_traverse::{ReusableTraverseCtx, Traverse, traverse_mut_with_ctx};
 
 // Core
@@ -40,7 +40,7 @@ mod typescript;
 mod decorator;
 mod plugins;
 
-use common::Common;
+use common::{Common, class_transform::ClassTransform};
 use context::TraverseCtx;
 use decorator::Decorator;
 use es2015::ES2015;
@@ -87,7 +87,7 @@ pub use crate::{
 #[non_exhaustive]
 pub struct TransformerReturn {
     /// Diagnostics produced during transformation.
-    pub errors: std::vec::Vec<OxcDiagnostic>,
+    pub diagnostics: Diagnostics,
     /// Updated semantic scoping after all transforms have run.
     pub scoping: Scoping,
     /// Helpers used by this transform.
@@ -102,6 +102,7 @@ pub struct Transformer<'a> {
     state: TransformState<'a>,
     allocator: &'a Allocator,
 
+    // Options, in evaluation order.
     typescript: TypeScriptOptions,
     decorator: DecoratorOptions,
     plugins: PluginsOptions,
@@ -134,6 +135,8 @@ impl<'a> Transformer<'a> {
         program: &mut Program<'a>,
     ) -> TransformerReturn {
         let allocator = self.allocator;
+        let decorator_mode = self.decorator.mode();
+
         let ast_builder = AstBuilder::new(allocator);
 
         self.state.source_type = program.source_type;
@@ -156,7 +159,7 @@ impl<'a> Transformer<'a> {
 
         let mut transformer = TransformerImpl {
             common: Common::new(&self.env),
-            decorator: Decorator::new(self.decorator),
+            decorator: Decorator::new(self.decorator, decorator_mode),
             plugins: Plugins::new(self.plugins),
             x0_typescript: program
                 .source_type
@@ -165,12 +168,13 @@ impl<'a> Transformer<'a> {
             x1_jsx: Jsx::new(
                 self.jsx,
                 self.env.es2018.object_rest_spread,
-                ast_builder,
+                &ast_builder,
                 program.source_type,
             ),
             x2_es2026: ES2026::new(self.env.es2026),
             x2_es2022: ES2022::new(
-                self.env.es2022,
+                self.env.es2022.top_level_await,
+                self.state.class_transform,
                 !self.typescript.allow_declare_fields
                     || self.typescript.remove_class_fields_without_initializer,
             ),
@@ -187,14 +191,16 @@ impl<'a> Transformer<'a> {
         let mut reusable_ctx = ReusableTraverseCtx::new(self.state, scoping, allocator);
         traverse_mut_with_ctx(&mut transformer, program, &mut reusable_ctx);
         let (mut state, scoping) = reusable_ctx.into_state_and_scoping();
-        let helpers_used = state.helper_loader.used_helpers.drain().collect();
+        let helpers_used = std::mem::take(&mut state.helper_loader.used_helpers);
+        let diagnostics = state.take_errors().into();
         #[expect(deprecated)]
-        TransformerReturn { errors: state.take_errors(), scoping, helpers_used }
+        TransformerReturn { diagnostics, scoping, helpers_used }
     }
 }
 
 struct TransformerImpl<'a> {
     // NOTE: all callbacks must run in order.
+    // Keep `TransformOptions` field order and docs in sync with this order.
     x0_typescript: Option<TypeScript<'a>>,
     decorator: Decorator<'a>,
     plugins: Plugins<'a>,
@@ -332,6 +338,12 @@ impl<'a> Traverse<'a, TransformState<'a>> for TransformerImpl<'a> {
     }
 
     fn enter_class(&mut self, class: &mut Class<'a>, ctx: &mut TraverseCtx<'a>) {
+        // Record ownership before decorators or TypeScript rewrite the class.
+        if self.x0_typescript.is_some()
+            || matches!(ctx.state.class_transform, ClassTransform::ClassProperties { .. })
+        {
+            ctx.state.record_class_lowering(class);
+        }
         self.decorator.enter_class(class, ctx);
         if let Some(typescript) = self.x0_typescript.as_mut() {
             typescript.enter_class(class, ctx);
@@ -340,6 +352,8 @@ impl<'a> Traverse<'a, TransformState<'a>> for TransformerImpl<'a> {
 
     fn exit_class(&mut self, class: &mut Class<'a>, ctx: &mut TraverseCtx<'a>) {
         self.decorator.exit_class(class, ctx);
+        // Legacy decorators have taken the decorators off the fields they lowered, so TypeScript
+        // can now remove those fields if they have no initializer.
         if let Some(typescript) = self.x0_typescript.as_mut() {
             typescript.exit_class(class, ctx);
         }
@@ -378,12 +392,22 @@ impl<'a> Traverse<'a, TransformState<'a>> for TransformerImpl<'a> {
         self.x4_regexp.enter_expression(expr, ctx);
     }
 
+    #[inline]
     fn exit_expression(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a>) {
-        self.common.exit_expression(expr, ctx);
-        self.x1_jsx.exit_expression(expr, ctx);
-        self.x2_es2022.exit_expression(expr, ctx);
-        self.x2_es2018.exit_expression(expr, ctx);
-        self.x2_es2017.exit_expression(expr, ctx);
+        // The exit plugins only act on these expression kinds. Keep the no-op path in the walker.
+        if matches!(
+            expr,
+            Expression::ArrowFunctionExpression(_)
+                | Expression::AwaitExpression(_)
+                | Expression::CallExpression(_)
+                | Expression::ClassExpression(_)
+                | Expression::FunctionExpression(_)
+                | Expression::JSXElement(_)
+                | Expression::JSXFragment(_)
+                | Expression::YieldExpression(_)
+        ) {
+            self.exit_expression_impl(expr, ctx);
+        }
     }
 
     fn enter_simple_assignment_target(
@@ -455,6 +479,22 @@ impl<'a> Traverse<'a, TransformState<'a>> for TransformerImpl<'a> {
 
     fn exit_function_body(&mut self, body: &mut FunctionBody<'a>, ctx: &mut TraverseCtx<'a>) {
         self.common.exit_function_body(body, ctx);
+    }
+
+    fn enter_arrow_function_body(
+        &mut self,
+        body: &mut ArrowFunctionBody<'a>,
+        ctx: &mut TraverseCtx<'a>,
+    ) {
+        self.common.enter_arrow_function_body(body, ctx);
+    }
+
+    fn exit_arrow_function_body(
+        &mut self,
+        body: &mut ArrowFunctionBody<'a>,
+        ctx: &mut TraverseCtx<'a>,
+    ) {
+        self.common.exit_arrow_function_body(body, ctx);
     }
 
     fn enter_jsx_element(&mut self, node: &mut JSXElement<'a>, ctx: &mut TraverseCtx<'a>) {
@@ -566,6 +606,7 @@ impl<'a> Traverse<'a, TransformState<'a>> for TransformerImpl<'a> {
         if let Some(typescript) = self.x0_typescript.as_mut() {
             typescript.enter_statements(stmts, ctx);
         }
+        self.decorator.enter_statements(stmts, ctx);
     }
 
     fn exit_arrow_function_expression(
@@ -574,36 +615,6 @@ impl<'a> Traverse<'a, TransformState<'a>> for TransformerImpl<'a> {
         ctx: &mut TraverseCtx<'a>,
     ) {
         self.common.exit_arrow_function_expression(arrow, ctx);
-
-        // Some plugins may add new statements to the ArrowFunctionExpression's body,
-        // which can cause issues with the `() => x;` case, as it only allows a single statement.
-        // To address this, we wrap the last statement in a return statement and set the expression to false.
-        // This transforms the arrow function into the form `() => { return x; };`.
-        let statements = &mut arrow.body.statements;
-        if arrow.expression && statements.len() > 1 {
-            arrow.expression = false;
-
-            // Reverse looping to find the expression statement, because other plugins could
-            // insert new statements after the expression statement.
-            // `() => x;`
-            // ->
-            // ```
-            // () => {
-            //    var new_insert_variable;
-            //    return x;
-            //    function new_insert_function() {}
-            // };
-            // ```
-            for stmt in statements.iter_mut().rev() {
-                let Statement::ExpressionStatement(expr_stmt) = stmt else {
-                    continue;
-                };
-                let expression = Some(expr_stmt.expression.take_in(ctx.ast));
-                *stmt = ctx.ast.statement_return(SPAN, expression);
-                return;
-            }
-            unreachable!("At least one statement should be expression statement")
-        }
     }
 
     fn exit_statements(
@@ -637,12 +648,12 @@ impl<'a> Traverse<'a, TransformState<'a>> for TransformerImpl<'a> {
     }
 
     fn enter_statement(&mut self, stmt: &mut Statement<'a>, ctx: &mut TraverseCtx<'a>) {
-        self.decorator.enter_statement(stmt, ctx);
         if let Some(typescript) = self.x0_typescript.as_mut() {
             typescript.enter_statement(stmt, ctx);
         }
         self.x2_es2018.enter_statement(stmt, ctx);
         self.x2_es2026.enter_statement(stmt, ctx);
+        self.x2_es2022.enter_statement(stmt, ctx);
     }
 
     fn enter_declaration(&mut self, decl: &mut Declaration<'a>, ctx: &mut TraverseCtx<'a>) {
@@ -734,6 +745,16 @@ impl<'a> Traverse<'a, TransformState<'a>> for TransformerImpl<'a> {
         self.x2_es2020.enter_export_all_declaration(node, ctx);
     }
 
+    fn enter_export_from_declaration(
+        &mut self,
+        node: &mut ExportFromDeclaration<'a>,
+        ctx: &mut oxc_traverse::TraverseCtx<'a, TransformState<'a>>,
+    ) {
+        if let Some(typescript) = self.x0_typescript.as_mut() {
+            typescript.enter_export_from_declaration(node, ctx);
+        }
+    }
+
     fn enter_export_named_declaration(
         &mut self,
         node: &mut ExportNamedDeclaration<'a>,
@@ -776,5 +797,16 @@ impl<'a> Traverse<'a, TransformState<'a>> for TransformerImpl<'a> {
         if let Some(typescript) = self.x0_typescript.as_mut() {
             typescript.enter_catch_parameter(node, ctx);
         }
+    }
+}
+
+impl<'a> TransformerImpl<'a> {
+    #[inline(never)]
+    fn exit_expression_impl(&mut self, expr: &mut Expression<'a>, ctx: &mut TraverseCtx<'a>) {
+        self.common.exit_expression(expr, ctx);
+        self.x1_jsx.exit_expression(expr, ctx);
+        self.x2_es2022.exit_expression(expr, ctx);
+        self.x2_es2018.exit_expression(expr, ctx);
+        self.x2_es2017.exit_expression(expr, ctx);
     }
 }

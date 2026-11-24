@@ -17,7 +17,7 @@
 //! - CFG blocks (`test.cfg.txt`)
 //! - CFG graph in DOT format (`test.dot`)
 
-use std::{env, path::Path, sync::Arc};
+use std::{env, path::Path};
 
 use itertools::Itertools;
 use rustc_hash::FxHashMap;
@@ -55,16 +55,16 @@ fn main() -> std::io::Result<()> {
     let cfg_file_path = Path::new(&cfg_file_name);
     let dot_file_path = Path::new(&dot_file_name);
 
-    let source_text = Arc::new(std::fs::read_to_string(test_file_path)?);
+    let source_text = std::fs::read_to_string(test_file_path)?;
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(test_file_path).unwrap();
     let parser_ret = Parser::new(&allocator, &source_text, source_type).parse();
 
-    if !parser_ret.errors.is_empty() {
+    if !parser_ret.diagnostics.is_empty() {
         let error_message: String = parser_ret
-            .errors
+            .diagnostics
             .into_iter()
-            .map(|error| error.with_source_code(Arc::clone(&source_text)).to_string())
+            .map(|error| error.with_source_code(source_text.as_str()).to_string())
             .join("\n\n");
 
         println!("Parsing failed:\n\n{error_message}");
@@ -72,17 +72,17 @@ fn main() -> std::io::Result<()> {
     }
 
     let program = parser_ret.program;
-    std::fs::write(ast_file_path, format!("{:#?}", &program))?;
-    println!("Wrote AST to: {}", &ast_file_name);
+    std::fs::write(ast_file_path, format!("{program:#?}"))?;
+    println!("Wrote AST to: {ast_file_name}");
 
     let semantic =
-        SemanticBuilder::new().with_check_syntax_error(true).with_cfg(true).build(&program);
+        SemanticBuilder::new_compiler().with_build_nodes(true).with_cfg(true).build(&program);
 
-    if !semantic.errors.is_empty() {
+    if !semantic.diagnostics.is_empty() {
         let error_message: String = semantic
-            .errors
+            .diagnostics
             .into_iter()
-            .map(|error| error.with_source_code(Arc::clone(&source_text)).to_string())
+            .map(|error| error.with_source_code(source_text.as_str()).to_string())
             .join("\n\n");
 
         println!("Semantic analysis failed:\n\n{error_message}");
@@ -109,18 +109,15 @@ fn main() -> std::io::Result<()> {
             format!(
                 "bb{i}: {{\n{}\n---\n{}\n}}",
                 it.lines().map(|x| format!("\t{}", x.trim())).join("\n"),
-                ast_nodes_by_block
-                    .get(&i)
-                    .map(|nodes| {
-                        nodes.iter().map(|node| format!("{}", node.kind().debug_name())).join("\n")
-                    })
-                    .unwrap_or_default()
+                ast_nodes_by_block.get(&i).map_or_default(|nodes| {
+                    nodes.iter().map(|node| format!("{}", node.kind().debug_name())).join("\n")
+                })
             )
         })
         .join("\n\n");
 
     std::fs::write(cfg_file_path, basic_blocks_printed)?;
-    println!("Wrote CFG blocks to: {}", &cfg_file_name);
+    println!("Wrote CFG blocks to: {cfg_file_name}");
 
     let cfg_dot_diagram = format!(
         "{:?}",
@@ -163,7 +160,7 @@ fn main() -> std::io::Result<()> {
         )
     );
     std::fs::write(dot_file_path, cfg_dot_diagram)?;
-    println!("Wrote CFG dot diagram to: {}", &dot_file_name);
+    println!("Wrote CFG dot diagram to: {dot_file_name}");
 
     Ok(())
 }

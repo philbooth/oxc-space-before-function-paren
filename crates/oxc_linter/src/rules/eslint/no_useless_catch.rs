@@ -53,7 +53,9 @@ declare_oxc_lint!(
     NoUselessCatch,
     eslint,
     correctness,
+    recommended,
     version = "0.0.5",
+    short_description = "Disallow unnecessary catch clauses.",
 );
 
 impl Rule for NoUselessCatch {

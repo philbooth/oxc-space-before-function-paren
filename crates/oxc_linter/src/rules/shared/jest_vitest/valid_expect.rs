@@ -4,6 +4,7 @@ use oxc_ast::{AstKind, ast::Expression};
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_semantic::ScopeId;
 use oxc_span::{GetSpan, Span};
+use oxc_str::JSStr;
 use rustc_hash::FxHashSet;
 use schemars::JsonSchema;
 
@@ -11,7 +12,8 @@ use crate::{
     AstNode,
     context::LintContext,
     utils::{
-        ExpectError, PossibleJestNode, collect_possible_jest_call_node, parse_expect_jest_fn_call,
+        ExpectError, PossibleJestNode, iter_possible_jest_call_node_with_wrappers,
+        parse_expect_jest_fn_call, type_assertion_wrapper_expression, validate_expect_type_of_call,
     },
 };
 
@@ -23,9 +25,24 @@ fn valid_expect_diagnostic<S: Into<Cow<'static, str>>>(
     OxcDiagnostic::warn(x1).with_help(x2).with_label(span3)
 }
 
+fn report_matcher_error<'a>(error: ExpectError, node: &AstNode<'a>, ctx: &LintContext<'a>) {
+    let message = match error {
+        ExpectError::MatcherNotFound => Message::MatcherNotFound,
+        ExpectError::MatcherNotCalled => Message::MatcherNotCalled,
+        ExpectError::ModifierUnknown => Message::ModifierUnknown,
+    };
+    let span = find_top_most_member_expression(node, ctx)
+        .map_or_else(|| node.span(), |member| member.span());
+    let (diagnostic, help) = message.details();
+    ctx.diagnostic(valid_expect_diagnostic(diagnostic, help, span));
+}
+
+pub const SHORT_DESCRIPTION: &str = "Enforce valid `expect()` usage.";
+
 pub const DOCUMENTATION: &str = r"### What it does
 
 Checks that `expect()` is called correctly.
+`vitest/valid-expect` also checks that `expectTypeOf()` calls use valid modifiers and invoke a matcher.
 
 ### Why is this bad?
 
@@ -47,22 +64,22 @@ Examples of **correct** code for this rule:
 ```javascript
 expect('something').toEqual('something');
 expect(true).toBeDefined();
-expect(Promise.resolve('Hi!')).resolves.toBe('Hi!');
+await expect(Promise.resolve('Hi!')).resolves.toBe('Hi!');
 ```
 ";
 
 #[derive(Debug, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct ValidExpectConfig {
     /// List of matchers that are considered async and therefore require awaiting (e.g. `toResolve`, `toReject`).
     async_matchers: Vec<String>,
     /// Minimum number of arguments `expect` should be called with.
-    min_args: usize,
+    min_args: u32,
     /// Maximum number of arguments `expect` should be called with.
-    max_args: usize,
-    /// When `true`, allow a string or template literal second argument as a custom message.
+    max_args: u32,
+    /// Whether to apply `vitest/valid-expect` behavior.
     #[serde(skip)]
-    allow_string_message_arg: bool,
+    supports_vitest_syntax: bool,
     /// When `true`, async assertions must be awaited in all contexts (not just return statements).
     always_await: bool,
 }
@@ -73,7 +90,7 @@ impl Default for ValidExpectConfig {
             async_matchers: vec![String::from("toResolve"), String::from("toReject")],
             min_args: 1,
             max_args: 1,
-            allow_string_message_arg: false,
+            supports_vitest_syntax: false,
             always_await: false,
         }
     }
@@ -94,29 +111,30 @@ impl ValidExpectConfig {
             .and_then(|config| config.get("minArgs"))
             .and_then(serde_json::Value::as_number)
             .and_then(serde_json::Number::as_u64)
-            .map_or(1, |v| usize::try_from(v).unwrap_or(1));
+            .map_or(1, |v| u32::try_from(v).unwrap_or(1));
 
         let max_args = config
             .and_then(|config| config.get("maxArgs"))
             .and_then(serde_json::Value::as_number)
             .and_then(serde_json::Number::as_u64)
-            .map_or(1, |v| usize::try_from(v).unwrap_or(1));
+            .map_or(1, |v| u32::try_from(v).unwrap_or(1));
 
         let always_await = config
             .and_then(|config| config.get("alwaysAwait"))
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
 
-        Self { async_matchers, min_args, max_args, allow_string_message_arg: false, always_await }
+        Self { async_matchers, min_args, max_args, supports_vitest_syntax: false, always_await }
     }
 
-    pub fn allow_string_message_arg(mut self) -> Self {
-        self.allow_string_message_arg = true;
+    pub fn for_vitest(mut self) -> Self {
+        self.supports_vitest_syntax = true;
         self
     }
 
     pub fn run_once(&self, ctx: &LintContext) {
-        let mut possible_jest_nodes = collect_possible_jest_call_node(ctx);
+        let mut possible_jest_nodes: Vec<_> =
+            iter_possible_jest_call_node_with_wrappers(ctx, self.supports_vitest_syntax).collect();
         possible_jest_nodes.sort_unstable_by_key(|node| node.node.id());
         let mut fixed_function_expression: FxHashSet<ScopeId> = FxHashSet::default();
 
@@ -125,6 +143,7 @@ impl ValidExpectConfig {
         }
     }
 
+    #[expect(clippy::cast_possible_truncation)] // the length of arguments can't be over u32::MAX, because the source code is already limited by u32::MAX.
     fn run<'a>(
         &self,
         possible_jest_node: &PossibleJestNode<'a, '_>,
@@ -135,45 +154,35 @@ impl ValidExpectConfig {
         let AstKind::CallExpression(call_expr) = node.kind() else {
             return;
         };
+        if self.supports_vitest_syntax
+            && let Some(result) = validate_expect_type_of_call(call_expr, possible_jest_node, ctx)
+        {
+            if let Err(error) = result {
+                report_matcher_error(error, node, ctx);
+            }
+            return;
+        }
+
         let Some(jest_fn_call) = parse_expect_jest_fn_call(call_expr, possible_jest_node, ctx)
         else {
             return;
         };
-        let reporting_span = jest_fn_call.expect_error.map_or(call_expr.span, |_| {
-            find_top_most_member_expression(node, ctx)
-                .map_or(call_expr.span, |top_most_member_expr| top_most_member_expr.span())
-        });
-
-        match jest_fn_call.expect_error {
-            Some(ExpectError::MatcherNotFound) => {
-                let (error, help) = Message::MatcherNotFound.details();
-                ctx.diagnostic(valid_expect_diagnostic(error, help, reporting_span));
-                return;
-            }
-            Some(ExpectError::MatcherNotCalled) => {
-                let (error, help) = Message::MatcherNotCalled.details();
-                ctx.diagnostic(valid_expect_diagnostic(error, help, reporting_span));
-                return;
-            }
-            Some(ExpectError::ModifierUnknown) => {
-                let (error, help) = Message::ModifierUnknown.details();
-                ctx.diagnostic(valid_expect_diagnostic(error, help, reporting_span));
-                return;
-            }
-            None => {}
+        if let Some(error) = jest_fn_call.expect_error {
+            report_matcher_error(error, node, ctx);
+            return;
         }
 
         let Some(Expression::CallExpression(call_expr)) = jest_fn_call.head.parent else {
             return;
         };
 
-        let allow_message_arg = self.allow_string_message_arg
+        let allow_message_arg = self.supports_vitest_syntax
             && call_expr.arguments.len() == 2
             && call_expr.arguments.get(1).and_then(|arg| arg.as_expression()).is_some_and(|expr| {
                 matches!(expr, Expression::StringLiteral(_) | Expression::TemplateLiteral(_))
             });
 
-        if call_expr.arguments.len() > self.max_args && !allow_message_arg {
+        if (call_expr.arguments.len() as u32) > self.max_args && !allow_message_arg {
             let error = format!(
                 "Expect takes at most {} argument{} ",
                 self.max_args,
@@ -183,7 +192,7 @@ impl ValidExpectConfig {
             ctx.diagnostic(valid_expect_diagnostic(error, help, call_expr.span));
             return;
         }
-        if call_expr.arguments.len() < self.min_args {
+        if (call_expr.arguments.len() as u32) < self.min_args {
             let error = format!(
                 "Expect requires at least {} argument{} ",
                 self.min_args,
@@ -204,7 +213,7 @@ impl ValidExpectConfig {
         let parent = ctx.nodes().parent_node(node.id());
 
         let should_be_awaited =
-            jest_fn_call.modifiers().iter().any(|modifier| modifier.is_name_unequal("not"))
+            jest_fn_call.modifiers().any(|modifier| modifier.is_name_unequal("not"))
                 || self.async_matchers.contains(&matcher_name.to_string());
 
         if matches!(parent.kind(), AstKind::Program(_)) || !should_be_awaited {
@@ -327,7 +336,9 @@ fn find_top_most_member_expression<'a, 'b>(
                 top_most_member_expression = Some(member_expr);
             }
             _ => {
-                if !parent.kind().is_member_expression_kind() {
+                if !parent.kind().is_member_expression_kind()
+                    && type_assertion_wrapper_expression(parent.kind()).is_none()
+                {
                     break;
                 }
             }
@@ -355,7 +366,7 @@ fn is_acceptable_return_node<'a, 'b>(
             | AstKind::FunctionBody(_) => {
                 node = ctx.nodes().parent_node(node.id());
             }
-            AstKind::ArrowFunctionExpression(arrow_expr) => return arrow_expr.expression,
+            AstKind::ArrowFunctionExpression(arrow_expr) => return arrow_expr.is_expression(),
             AstKind::AwaitExpression(_) => return true,
             _ => return false,
         }
@@ -460,7 +471,7 @@ fn get_parent_if_thenable<'a, 'b>(
     let Some(member_expr) = call_expr.callee.as_member_expression() else {
         return node;
     };
-    let Some(name) = member_expr.static_property_name() else {
+    let Some(name) = member_expr.static_property_name().and_then(JSStr::as_str) else {
         return node;
     };
 

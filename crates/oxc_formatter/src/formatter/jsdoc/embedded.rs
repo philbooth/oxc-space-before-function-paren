@@ -1,15 +1,51 @@
-use oxc_allocator::Allocator;
-use oxc_parser::Parser;
+use oxc_formatter_core::{FormatSession, LineEnding, LineWidth};
 use oxc_span::SourceType;
 
 use crate::options::TrailingCommas;
-use crate::{FormatOptions, Formatter, LineWidth, get_parse_options};
+use crate::{JsFormatOptions, format_with_session};
 
-use super::serialize::truncate_trim_end;
+/// Helper for:
+/// - Parse a snippet ([`format_with_session`]'s gate: any parse diagnostic rejects)
+/// - and format it to a string with trailing whitespace trimmed
+///
+/// Formats on the parent session (same arena; embeds inside the snippet
+/// dispatch through the parent's services).
+///
+/// # Panics
+/// Panics if the formatted IR is invalid or unbalanced, indicating a formatter bug.
+fn parse_and_build<'a>(
+    session: &FormatSession<'a>,
+    source_text: &'a str,
+    source_type: SourceType,
+    options: JsFormatOptions,
+) -> Option<String> {
+    let formatted = format_with_session(session, source_text, source_type, options).ok()?;
+    let mut code = formatted.print().unwrap().into_code();
+    code.truncate(code.trim_end().len());
+    Some(code)
+}
 
-/// Returns `true` if the fenced code block language is JS/TS/JSX/TSX.
+/// Options for a JS/TS snippet formatted to a string and re-embedded into the comment text.
+///
+/// - `line_ending` is `Lf`: the comment is IR text which only takes `\n`, the host converts once at the end
+/// - `jsdoc` / `sort_imports` / `sort_tailwindcss` are disabled (top-level concerns)
+pub(super) fn snippet_options(format_options: &JsFormatOptions, width: usize) -> JsFormatOptions {
+    let width = u16::try_from(width).unwrap_or(80).clamp(1, LineWidth::MAX);
+    JsFormatOptions {
+        line_ending: LineEnding::Lf,
+        line_width: LineWidth::try_from(width).unwrap(),
+        jsdoc: None,
+        sort_imports: None,
+        sort_tailwindcss: None,
+        ..format_options.clone()
+    }
+}
+
+/// Returns `true` if the fenced code block language is JS/TS/JSX/TSX (case-insensitive).
 pub(super) fn is_js_ts_lang(lang: &str) -> bool {
-    matches!(lang, "js" | "javascript" | "jsx" | "ts" | "typescript" | "tsx")
+    ["js", "javascript", "jsx", "ts", "typescript", "tsx"]
+        .iter()
+        .any(|name| lang.eq_ignore_ascii_case(name))
 }
 
 /// Count unescaped backticks on a line and update template literal depth.
@@ -67,41 +103,35 @@ pub(super) fn update_template_depth(line: &str, mut depth: u32) -> u32 {
     depth
 }
 
-/// Try to format JS/TS/JSX code using the formatter.
-/// Returns `Some(formatted)` on success, `None` if parsing fails.
-/// The `print_width` is the available width for the formatted code.
-/// Uses the parent `format_options` to ensure consistent formatting behavior.
-pub(super) fn format_embedded_js(
+/// Format a JS/TS/JSX snippet extracted from a JSDoc comment.
+///
+/// This is a JSDoc-specific helper, NOT a generic embedded-language formatter.
+/// JSDoc snippets are standalone comment fragments rather than parent-integrated IR:
+/// the snippet itself formats in-crate on the parent session (no dispatcher round trip)
+/// and returns a string for line-by-line splicing into the surrounding comment,
+/// while embeds INSIDE the snippet (css-in-js, …) dispatch through the session normally.
+///
+/// The snippet inherits the parent session's `InputKind` and dispatch depth AS-IS
+/// (the fence boundary is not a dispatch; the same interim shape as the string
+/// channel's fresh-session reset on the oxfmt side).
+///
+/// JSDoc-specific behaviour (inline comments below give the full rationale):
+/// - object-literal wrap for `{`-leading snippets
+/// - TSX → JSX fallback (TSX first so TS generics aren't miss-parsed)
+/// - `sort_imports` / `sort_tailwindcss` are disabled (top-level concerns)
+///
+/// Returns `None` on parse failure, the pass-through gate every caller uses.
+pub(super) fn format_jsdoc_js_snippet(
     code: &str,
     print_width: usize,
-    format_options: &FormatOptions,
-    allocator: &Allocator,
+    format_options: &JsFormatOptions,
+    session: &FormatSession<'_>,
 ) -> Option<String> {
-    let width = u16::try_from(print_width).unwrap_or(80).clamp(1, 320);
-    let line_width = LineWidth::try_from(width).unwrap();
-
-    // Null out sort_imports/sort_tailwindcss — they're top-level concerns irrelevant
-    // to embedded code, and their Vec fields make cloning expensive.
-    // Inherit indent_style from parent so embedded code uses tabs when useTabs=true,
-    // matching upstream prettier-plugin-jsdoc behavior.
-    let base_options = FormatOptions {
-        line_width,
-        jsdoc: None,
-        sort_imports: None,
-        sort_tailwindcss: None,
-        ..format_options.clone()
-    };
+    let base_options = snippet_options(format_options, print_width);
 
     // Try to parse and format with the given source type
-    let try_format = |code: &str, source_type: SourceType| -> Option<String> {
-        let ret =
-            Parser::new(allocator, code, source_type).with_options(get_parse_options()).parse();
-        if ret.panicked || !ret.errors.is_empty() {
-            return None;
-        }
-        let mut formatted = Formatter::new(allocator, base_options.clone()).build(&ret.program);
-        truncate_trim_end(&mut formatted);
-        Some(formatted)
+    let try_format = |code: &str, source_type: SourceType| {
+        parse_and_build(session, code, source_type, base_options.clone())
     };
 
     // If code starts with `{`, try expression wrapping FIRST to handle object
@@ -109,20 +139,14 @@ pub(super) fn format_embedded_js(
     // with labels. The upstream plugin uses `parser: "json"` for this case.
     let trimmed = code.trim();
     if trimmed.starts_with('{') {
-        let wrapped = allocator.alloc_concat_strs_array(["(", trimmed, ")"]);
+        let wrapped = session.allocator().alloc_concat_strs_array(["(", trimmed, ")"]);
         // Use TrailingCommas::None for object literals since JSON-like code
         // shouldn't have trailing commas
         let obj_options =
-            FormatOptions { trailing_commas: TrailingCommas::None, ..base_options.clone() };
+            JsFormatOptions { trailing_commas: TrailingCommas::None, ..base_options.clone() };
 
         let try_format_obj = |code: &str, source_type: SourceType| -> Option<String> {
-            let ret =
-                Parser::new(allocator, code, source_type).with_options(get_parse_options()).parse();
-            if ret.panicked || !ret.errors.is_empty() {
-                return None;
-            }
-            let formatted = Formatter::new(allocator, obj_options.clone()).build(&ret.program);
-            let formatted = formatted.trim_end();
+            let formatted = parse_and_build(session, code, source_type, obj_options.clone())?;
             // Remove the wrapping parens and trailing semicolon
             if let Some(inner) = formatted.strip_prefix('(')
                 && let Some(inner) = inner.strip_suffix(");")
@@ -138,7 +162,7 @@ pub(super) fn format_embedded_js(
                 }
                 return Some(String::from(inner));
             }
-            Some(String::from(formatted))
+            Some(formatted)
         };
 
         // If the original has quoted keys (JSON-like), reject formatting since
@@ -188,8 +212,8 @@ pub(super) fn format_embedded_js(
 /// preventing the formatter from changing quote style inside type expressions.
 pub(super) fn format_type_via_formatter(
     type_str: &str,
-    type_options: &FormatOptions,
-    allocator: &Allocator,
+    type_options: &JsFormatOptions,
+    session: &FormatSession<'_>,
 ) -> Option<String> {
     if type_str.is_empty() {
         return None;
@@ -202,8 +226,8 @@ pub(super) fn format_type_via_formatter(
         if rest.is_empty() {
             return None;
         }
-        let wrapped = allocator.alloc_concat_strs_array(["(", rest, ")[]"]);
-        let formatted = format_type_via_formatter(wrapped, type_options, allocator)?;
+        let wrapped = session.allocator().alloc_concat_strs_array(["(", rest, ")[]"]);
+        let formatted = format_type_via_formatter(wrapped, type_options, session)?;
         let inner = formatted.strip_suffix("[]")?;
         let mut result = String::with_capacity(inner.len() + 3);
         result.push_str("...");
@@ -222,16 +246,9 @@ pub(super) fn format_type_via_formatter(
     // Let the TS formatter handle quote conversion naturally, matching Prettier's
     // TS parser which uses the configured quote style (double by default).
     // No string literal protection needed — the formatter should convert quotes.
-    let input = allocator.alloc_concat_strs_array(["type __t = ", type_str, ";"]);
+    let input = session.allocator().alloc_concat_strs_array(["type __t = ", type_str, ";"]);
 
-    let ret =
-        Parser::new(allocator, input, SourceType::tsx()).with_options(get_parse_options()).parse();
-    if ret.panicked || !ret.errors.is_empty() {
-        return None;
-    }
-
-    let formatted = Formatter::new(allocator, type_options.clone()).build(&ret.program);
-    let formatted = formatted.trim_end();
+    let formatted = parse_and_build(session, input, SourceType::tsx(), type_options.clone())?;
 
     // Strip the `type __t = ` prefix (11 chars) using slice, matching upstream's
     // `pretty.slice(TYPE_START.length)` approach. This handles both same-line and

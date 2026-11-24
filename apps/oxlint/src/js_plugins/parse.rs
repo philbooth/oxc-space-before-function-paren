@@ -10,7 +10,7 @@ use napi_derive::napi;
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{Comment, CommentContent, CommentKind};
 use oxc_ast_visit::utf8_to_utf16::Utf8ToUtf16;
-use oxc_estree_tokens::{ESTreeTokenOptionsJS, update_tokens};
+use oxc_estree_tokens::update_tokens_as_js;
 use oxc_linter::RawTransferMetadata2 as RawTransferMetadata;
 use oxc_napi::get_source_type;
 use oxc_parser::{ParseOptions, Parser, ParserReturn, config::RuntimeParserConfig};
@@ -154,11 +154,18 @@ unsafe fn parse_raw_impl(
         unsafe { Allocator::from_raw_parts(buffer_ptr, BLOCK_SIZE, buffer_ptr, BLOCK_LAYOUT) };
     let allocator = ManuallyDrop::new(allocator);
 
+    // Check source text is in bounds of active data region of buffer.
+    // Caller guarantees it is, but as this is critical to avoid reading/writing out of bounds,
+    // we add this defensive runtime check.
+    let source_start = source_start as usize;
+    let source_end = source_start + (source_len as usize);
+    assert!(source_end <= ACTIVE_SIZE);
+
     // Set cursor to before start of source text. AST will be written into the buffer before the source text.
     // Round down the pointer, so it's aligned on `CURSOR_MIN_ALIGN`.
     // SAFETY: Caller guarantees that source text starts at `source_start` bytes from start of buffer.
     unsafe {
-        let cursor_pos = source_start as usize & !(CURSOR_MIN_ALIGN - 1);
+        let cursor_pos = source_start & !(CURSOR_MIN_ALIGN - 1);
         debug_assert!(cursor_pos <= ACTIVE_SIZE);
         let cursor_ptr = buffer_ptr.add(cursor_pos);
         allocator.set_cursor_ptr(cursor_ptr);
@@ -173,12 +180,17 @@ unsafe fn parse_raw_impl(
     // Parse source.
     // Enclose parsing logic in a scope to make 100% sure no references to within `Allocator` exist after this.
     let (program_offset, has_bom, tokens_offset, tokens_len) = {
-        // SAFETY: Caller guarantees source occupies this region of the buffer and is valid UTF-8
-        let source_text = unsafe {
-            let source_end = source_start as usize + source_len as usize;
-            debug_assert!(source_end <= ACTIVE_SIZE);
-            let source_bytes = buffer.get_unchecked(source_start as usize..source_end);
-            str::from_utf8_unchecked(source_bytes)
+        // Get source text from buffer.
+        // Use zero-cost unchecked conversion to `&str` in release builds, full UTF-8 validation in debug builds.
+        let source_text = if cfg!(debug_assertions) {
+            let source_bytes = &buffer[source_start..source_end];
+            str::from_utf8(source_bytes).expect("Source text is not valid UTF-8")
+        } else {
+            // SAFETY: Caller guarantees source occupies this region of the buffer and is valid UTF-8
+            unsafe {
+                let source_bytes = buffer.get_unchecked(source_start..source_end);
+                str::from_utf8_unchecked(source_bytes)
+            }
         };
 
         // Parse with same options as linter.
@@ -188,20 +200,24 @@ unsafe fn parse_raw_impl(
             .with_options(ParseOptions {
                 parse_regular_expression: true,
                 allow_return_outside_function: true,
+                // Semantic analysis is skipped when non-fatal errors are ignored.
+                enable_ident_hashes: !ignore_non_fatal_errors,
                 ..ParseOptions::default()
             })
             .with_config(RuntimeParserConfig::new(true))
             .parse();
-        let ParserReturn { program: parsed_program, errors, mut tokens, panicked, .. } = parser_ret;
+        let ParserReturn { program: parsed_program, diagnostics, mut tokens, fatal_error, .. } =
+            parser_ret;
         let program = allocator.alloc(parsed_program);
 
-        let mut parsing_failed = panicked || (!errors.is_empty() && !ignore_non_fatal_errors);
+        let mut parsing_failed =
+            fatal_error || (!diagnostics.is_empty() && !ignore_non_fatal_errors);
 
         // Check for semantic errors.
         // If `ignore_non_fatal_errors` is `true`, skip running semantic, as any errors will be ignored anyway.
         if !parsing_failed && !ignore_non_fatal_errors {
-            let semantic_ret = SemanticBuilder::new().with_check_syntax_error(true).build(program);
-            parsing_failed = !semantic_ret.errors.is_empty();
+            let semantic_ret = SemanticBuilder::new_compiler().build(program);
+            parsing_failed = !semantic_ret.diagnostics.is_empty();
         }
 
         if parsing_failed {
@@ -239,13 +255,13 @@ unsafe fn parse_raw_impl(
             };
 
             // Convert token spans to UTF-16 and update token kinds
-            update_tokens(&mut tokens, program, &span_converter, ESTreeTokenOptionsJS);
+            update_tokens_as_js(&mut tokens, program, &span_converter);
 
             // Convert AST spans to UTF-16
             span_converter.convert_program(program);
 
             // Convert comment spans to UTF-16.
-            // Also set the `content` field (byte 15) of each comment to `None` (0).
+            // Also set the `content` field of each comment to `None` (0).
             // JS side uses this byte as a "deserialized" flag for tracking lazy deserialization.
             if let Some(mut converter) = span_converter.converter() {
                 for comment in &mut program.comments {

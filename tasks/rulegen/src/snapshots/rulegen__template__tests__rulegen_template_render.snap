@@ -2,11 +2,12 @@
 source: tasks/rulegen/src/template.rs
 expression: rendered
 ---
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_span::Span;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 
 use crate::{
     context::LintContext,
@@ -57,11 +58,14 @@ declare_oxc_lint!(
     eslint,
     nursery, // TODO: change category to `correctness`, `suspicious`, `pedantic`, `perf`, `restriction`, or `style`
              // See <https://oxc.rs/docs/contribute/linter.html#rule-category> for details
+    // TODO: Uncomment the line below if the rule is recommended by default, or remove it if not.
+    // recommended,
     pending, // TODO: describe fix capabilities. Remove or set to `none` if no fix can be done,
              // keep at 'pending' if you think one could be added but don't know how.
              // Options are 'fix', 'fix_dangerous', 'suggestion', and 'conditional_fix_suggestion'
     config = MyRule,
     version = "next",
+    short_description = "FIXME: One-sentence description of the rule.",
 );
 
 impl Rule for MyRule {
@@ -76,8 +80,9 @@ impl Rule for MyRule {
 
 #[test]
 fn test() {
-    use crate::tester::Tester;
     use std::path::PathBuf;
+
+    use crate::tester::Tester;
 
     let pass = vec![
         ("a")

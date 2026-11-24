@@ -1,14 +1,15 @@
 use std::ops::Deref;
 
-use icu_segmenter::GraphemeClusterSegmenter;
 use lazy_regex::Regex;
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
+use unicode_segmentation::UnicodeSegmentation;
 
 use oxc_ast::AstKind;
 use oxc_ast::ast::{
-    BindingIdentifier, BindingPattern, BindingProperty, IdentifierName, PrivateIdentifier,
+    BindingIdentifier, BindingPattern, BindingProperty, Expression, IdentifierName,
+    IdentifierReference, PrivateIdentifier, PropertyKey,
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
@@ -18,6 +19,7 @@ use crate::{
     AstNode,
     context::LintContext,
     rule::{DefaultRuleConfig, Rule},
+    utils::{AlwaysNever, deserialize_regex_vec},
 };
 
 fn id_length_is_too_short_diagnostic(span: Span, config_min: u64) -> OxcDiagnostic {
@@ -30,16 +32,6 @@ fn id_length_is_too_long_diagnostic(span: Span, config_max: u64) -> OxcDiagnosti
 
 const DEFAULT_MAX_LENGTH: u64 = u64::MAX;
 const DEFAULT_MIN_LENGTH: u64 = 2;
-
-#[derive(Debug, Default, Clone, PartialEq, JsonSchema, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum PropertyKind {
-    /// Property names are checked just like other identifiers
-    #[default]
-    Always,
-    /// Property names are not checked for length.
-    Never,
-}
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct IdLength(Box<IdLengthConfig>);
@@ -57,7 +49,7 @@ impl Deref for IdLength {
 pub struct IdLengthConfig {
     /// An array of regex patterns for identifiers to exclude from the rule.
     /// For example, `["^x.*"]` would exclude all identifiers starting with "x".
-    #[serde(deserialize_with = "deserialize_exception_patterns")]
+    #[serde(deserialize_with = "deserialize_regex_vec")]
     exception_patterns: Vec<Regex>,
     /// An array of identifier names that are excluded from the rule.
     /// For example, `["x", "y", "z"]` would allow single-letter identifiers "x", "y", and "z".
@@ -71,7 +63,7 @@ pub struct IdLengthConfig {
     /// Defaults to `true`.
     check_generic: bool,
     /// Whether to check property names for length.
-    properties: PropertyKind,
+    properties: AlwaysNever,
 }
 
 impl Default for IdLengthConfig {
@@ -82,27 +74,15 @@ impl Default for IdLengthConfig {
             max: DEFAULT_MAX_LENGTH,
             min: DEFAULT_MIN_LENGTH,
             check_generic: true,
-            properties: PropertyKind::default(),
+            properties: AlwaysNever::default(),
         }
     }
-}
-
-fn deserialize_exception_patterns<'de, D>(deserializer: D) -> Result<Vec<Regex>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::Error;
-
-    Vec::<String>::deserialize(deserializer)?
-        .into_iter()
-        .map(|pattern| Regex::new(&pattern).map_err(D::Error::custom))
-        .collect()
 }
 
 declare_oxc_lint!(
     /// ### What it does
     ///
-    /// This rule enforces a minimum and/or maximum identifier length convention by counting the
+    /// Enforce a minimum and/or maximum identifier length convention by counting the
     /// graphemes for a given identifier.
     ///
     /// ### Why is this bad?
@@ -181,11 +161,12 @@ declare_oxc_lint!(
     style,
     config = IdLengthConfig,
     version = "1.4.0",
+    short_description = "Enforce a minimum and/or maximum identifier length convention by counting the graphemes for a given identifier.",
 );
 
 impl Rule for IdLength {
     fn from_configuration(value: Value) -> Result<Self, serde_json::error::Error> {
-        serde_json::from_value::<DefaultRuleConfig<Self>>(value).map(DefaultRuleConfig::into_inner)
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
     }
 
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
@@ -198,6 +179,9 @@ impl Rule for IdLength {
             }
             AstKind::PrivateIdentifier(ident) => {
                 self.handle_private_identifier(ident, node, ctx);
+            }
+            AstKind::IdentifierReference(ident) => {
+                self.handle_assignment_target(ident, node, ctx);
             }
             _ => {}
         }
@@ -222,8 +206,7 @@ impl IdLength {
             let ident_length = ident_name.len();
             (self.is_too_long(ident_length), self.is_too_short(ident_length))
         } else {
-            let segmenter = GraphemeClusterSegmenter::new();
-            let graphemes_length = segmenter.segment_str(&ident_name).count() - 1;
+            let graphemes_length = ident_name.graphemes(true).count();
             (self.is_too_long(graphemes_length), self.is_too_short(graphemes_length))
         };
 
@@ -232,7 +215,9 @@ impl IdLength {
         }
 
         let parent_node = ctx.nodes().parent_node(node.id());
-        if !self.check_generic && matches!(parent_node.kind(), AstKind::TSTypeParameter(_)) {
+        if !self.check_generic
+            && matches!(parent_node.kind(), AstKind::TSTypeParameter(_) | AstKind::TSMappedType(_))
+        {
             return;
         }
 
@@ -253,7 +238,7 @@ impl IdLength {
                         object_pattern.properties.iter().find(|x| x.span == ident.span);
 
                     if IdLength::is_binding_identifier_or_object_pattern(binding_property_option)
-                        && self.properties == PropertyKind::Never
+                        && self.properties == AlwaysNever::Never
                     {
                         return;
                     }
@@ -283,8 +268,7 @@ impl IdLength {
             let ident_length = ident_name.len();
             (self.is_too_long(ident_length), self.is_too_short(ident_length))
         } else {
-            let segmenter = GraphemeClusterSegmenter::new();
-            let graphemes_length = segmenter.segment_str(&ident_name).count() - 1;
+            let graphemes_length = ident_name.graphemes(true).count();
             (self.is_too_long(graphemes_length), self.is_too_short(graphemes_length))
         };
 
@@ -298,6 +282,9 @@ impl IdLength {
             AstKind::ExportSpecifier(_)
             | AstKind::ImportAttribute(_)
             | AstKind::ImportSpecifier(_)
+            | AstKind::TSQualifiedName(_)
+            | AstKind::TSImportType(_)
+            | AstKind::TSImportTypeQualifiedName(_)
             | AstKind::WithClause(_) => {
                 return;
             }
@@ -309,7 +296,7 @@ impl IdLength {
                 }
             property_key if property_key.is_property_key() => {
                 let property_key = property_key.as_property_key_kind().unwrap();
-                if self.properties == PropertyKind::Never {
+                if self.properties == AlwaysNever::Never {
                     return;
                 }
 
@@ -340,7 +327,7 @@ impl IdLength {
                 }
             }
             AstKind::BindingProperty(binding_prop) => {
-                if self.properties == PropertyKind::Never {
+                if self.properties == AlwaysNever::Never {
                     return;
                 }
                 // If this node is the original identifier in a binding property, we can skip it
@@ -352,7 +339,9 @@ impl IdLength {
                 }
             }
             AstKind::ObjectProperty(_)
-                if self.properties == PropertyKind::Never => {
+            | AstKind::TSPropertySignature(_)
+            | AstKind::TSMethodSignature(_)
+                if self.properties == AlwaysNever::Never => {
                     return;
                 }
             AstKind::AssignmentTargetPropertyProperty(assignment_target)
@@ -374,6 +363,66 @@ impl IdLength {
         }
     }
 
+    /// A variable assigned in a destructuring assignment, like `q` in `[q] = a`,
+    /// `({ a: q } = o)` or `for ([k, v] of e)`. A plain `q = 1` is not checked.
+    fn handle_assignment_target(
+        &self,
+        ident: &IdentifierReference,
+        node: &AstNode,
+        ctx: &LintContext,
+    ) {
+        let span = match ctx.nodes().parent_kind(node.id()) {
+            AstKind::ArrayAssignmentTarget(_) | AstKind::AssignmentTargetRest(_) => ident.span,
+            AstKind::AssignmentTargetWithDefault(target) if target.binding.span() == ident.span => {
+                ident.span
+            }
+            AstKind::AssignmentTargetPropertyProperty(property)
+                if property.binding.span() == ident.span =>
+            {
+                let key = match &property.name {
+                    PropertyKey::StaticIdentifier(key) => Some((key.name, key.span)),
+                    key => key.as_expression().and_then(|expr| match expr.without_parentheses() {
+                        Expression::Identifier(key) => Some((key.name, key.span)),
+                        _ => None,
+                    }),
+                };
+                if let Some((key_name, key_span)) = key
+                    && key_name == ident.name
+                {
+                    if self.properties == AlwaysNever::Never {
+                        return;
+                    }
+                    key_span
+                } else {
+                    ident.span
+                }
+            }
+            // `({ q } = o)` is a property name too, unless it has a default.
+            AstKind::AssignmentTargetPropertyIdentifier(property)
+                if property.binding.span == ident.span
+                    && (property.init.is_some() || self.properties == AlwaysNever::Always) =>
+            {
+                ident.span
+            }
+            _ => return,
+        };
+        if self.is_exception(&ident.name) {
+            return;
+        }
+
+        let length = if ident.name.is_ascii() {
+            ident.name.len()
+        } else {
+            ident.name.graphemes(true).count()
+        };
+        if self.is_too_long(length) {
+            ctx.diagnostic(id_length_is_too_long_diagnostic(span, self.max));
+        }
+        if self.is_too_short(length) {
+            ctx.diagnostic(id_length_is_too_short_diagnostic(span, self.min));
+        }
+    }
+
     fn handle_private_identifier(
         &self,
         ident: &PrivateIdentifier,
@@ -390,8 +439,7 @@ impl IdLength {
             let ident_length = ident_name.len();
             (self.is_too_long(ident_length), self.is_too_short(ident_length))
         } else {
-            let segmenter = GraphemeClusterSegmenter::new();
-            let graphemes_length = segmenter.segment_str(&ident_name).count() - 1;
+            let graphemes_length = ident_name.graphemes(true).count();
             (self.is_too_long(graphemes_length), self.is_too_short(graphemes_length))
         };
 
@@ -437,7 +485,7 @@ impl IdLength {
 
     fn should_check_member_expression_property(&self, node: &AstNode, ctx: &LintContext) -> bool {
         // Only check property names in member expressions if properties == Always
-        if self.properties != PropertyKind::Always {
+        if self.properties != AlwaysNever::Always {
             return false;
         }
 
@@ -586,6 +634,10 @@ fn test() {
             "export type Example<T> = T extends Array<infer U> ? U : never;",
             Some(serde_json::json!([{ "min": 2, "checkGeneric": false }])),
         ),
+        (
+            "type Foo<T> = { [K in keyof T]: unknown };",
+            Some(serde_json::json!([{ "min": 2, "checkGeneric": false }])),
+        ),
         ("var 𠮟 = 2", Some(serde_json::json!([{ "min": 1, "max": 1 }]))), // { "ecmaVersion": 6 },
         ("var 葛󠄀 = 2", Some(serde_json::json!([{ "min": 1, "max": 1 }]))), // { "ecmaVersion": 6 },
         ("var a = { 𐌘: 1 };", Some(serde_json::json!([{ "min": 1, "max": 1 }]))), // { "ecmaVersion": 6, },
@@ -615,19 +667,55 @@ fn test() {
             "export { default } from 'foo.json' with { type: 'json' }",
             Some(serde_json::json!([{ "min": 1, "max": 3, "properties": "always" }])),
         ), // { "ecmaVersion": 2025 },
-                                                                                      // TODO:
-                                                                                      // (
-                                                                                      //     "import('foo.json', { with: { type: 'json' } })",
-                                                                                      //     Some(serde_json::json!([{ "min": 1, "max": 3, "properties": "always" }])),
-                                                                                      // ), // { "ecmaVersion": 2025 },
-                                                                                      // (
-                                                                                      //     "import('foo.json', { 'with': { type: 'json' } })",
-                                                                                      //     Some(serde_json::json!([{ "min": 1, "max": 3, "properties": "always" }])),
-                                                                                      // ), // { "ecmaVersion": 2025 },
-                                                                                      // (
-                                                                                      //     "import('foo.json', { with: { type } })",
-                                                                                      //     Some(serde_json::json!([{ "min": 1, "max": 3, "properties": "always" }])),
-                                                                                      // ), // { "ecmaVersion": 2025 }
+        ("interface Foo { a: string; }", Some(serde_json::json!([{ "properties": "never" }]))),
+        ("interface Foo { a(): void; }", Some(serde_json::json!([{ "properties": "never" }]))),
+        ("type Foo = { a: string };", Some(serde_json::json!([{ "properties": "never" }]))),
+        ("type Foo = { a(): void };", Some(serde_json::json!([{ "properties": "never" }]))),
+        // TODO:
+        // (
+        //     "import('foo.json', { with: { type: 'json' } })",
+        //     Some(serde_json::json!([{ "min": 1, "max": 3, "properties": "always" }])),
+        // ), // { "ecmaVersion": 2025 },
+        // (
+        //     "import('foo.json', { 'with': { type: 'json' } })",
+        //     Some(serde_json::json!([{ "min": 1, "max": 3, "properties": "always" }])),
+        // ), // { "ecmaVersion": 2025 },
+        // (
+        //     "import('foo.json', { with: { type } })",
+        //     Some(serde_json::json!([{ "min": 1, "max": 3, "properties": "always" }])),
+        // ), // { "ecmaVersion": 2025 }
+        ("q = 3;", None),
+        ("[obj = r] = foo;", None),
+        ("({ obj = r } = foo);", None),
+        ("({ [k]: obj } = foo);", None),
+        ("({ q } = foo);", Some(serde_json::json!([{ "properties": "never" }]))),
+        ("({q: q} = foo);", Some(serde_json::json!([{ "properties": "never" }]))),
+        ("({[q]: q} = foo);", Some(serde_json::json!([{ "properties": "never" }]))),
+        ("({[((q))]: q} = foo);", Some(serde_json::json!([{ "properties": "never" }]))),
+        (
+            r#"import * as cp from "node:child_process";
+import type * as ts from "typescript";
+export const value = cp.someVeryLongExternalPropertyNameHere;
+export type Program = ts.EmitAndSemanticDiagnosticsBuilderProgram;
+export type Imported = import("typescript").EmitAndSemanticDiagnosticsBuilderProgram;
+export function run(options: cp.ExecFileSyncOptionsWithStringEncoding): void {}"#,
+            Some(
+                serde_json::json!([{ "min": 2, "max": 30, "properties": "never", "checkGeneric": false }]),
+            ),
+        ),
+        ("type Foo = a.b.c;", None),
+        ("type Foo = typeof a.b.c;", None),
+        (r#"type Foo = import("mod").a;"#, None),
+        (r#"type Foo = import("mod").a.b.c;"#, None),
+        (r#"type Foo = typeof import("mod").a.b.c;"#, None),
+        (
+            "type Foo = ns.VeryLongNamespace.VeryLongType;",
+            Some(serde_json::json!([{ "max": 5, "properties": "always" }])),
+        ),
+        (
+            r#"type Foo = import("mod").VeryLongNamespace.VeryLongType;"#,
+            Some(serde_json::json!([{ "max": 5, "properties": "never" }])),
+        ),
     ];
 
     let fail = vec![
@@ -708,6 +796,10 @@ fn test() {
             "export type Example<T> = T extends Array<infer U> ? U : never;",
             Some(serde_json::json!([{ "min": 2, "checkGeneric": true }])),
         ),
+        (
+            "type Foo<T> = { [K in keyof T]: unknown };",
+            Some(serde_json::json!([{ "min": 2, "checkGeneric": true }])),
+        ),
         ("var 𠮟 = 2", None),              // { "ecmaVersion": 6 },
         ("var 葛󠄀 = 2", None),              // { "ecmaVersion": 6 },
         ("var myObj = { 𐌘: 1 };", None),   // { "ecmaVersion": 6, },
@@ -725,6 +817,32 @@ fn test() {
         ("var { 𐌘 } = {};", None),         // { "ecmaVersion": 6, },
         ("var { prop: 𐌘} = {};", None),    // { "ecmaVersion": 6, },
         ("({ prop: obj.𐌘 } = {});", None), // { "ecmaVersion": 6, }
+        ("interface Foo { a: string; }", None),
+        ("interface Foo { a(): void; }", None),
+        ("type Foo = { a: string };", None),
+        ("type Foo = { a(): void };", None),
+        ("[q] = foo;", None),
+        ("for ([ix, s] of foo) {}", None),
+        ("({ a: q } = foo);", None),
+        ("({ q } = foo);", None),
+        ("({ q = rr } = foo);", None),
+        ("({ q = rr } = foo);", Some(serde_json::json!([{ "properties": "never" }]))),
+        ("[...q] = foo;", None),
+        ("[q = rr] = foo;", None),
+        ("({ k: [q] } = foo);", None),
+        ("({q: q} = foo);", None),
+        ("({[q]: q} = foo);", None),
+        ("({[((q))]: q} = foo);", None),
+        ("({q: q = q} = foo);", Some(serde_json::json!([{ "properties": "never" }]))),
+        ("for ([q] in foo) {}", None),
+        ("({...q} = foo);", None),
+        ("type A = ns.x;", None),
+        ("const a: ns.x = value;", None),
+        (r#"import * as a from "mod"; type Foo = a.b;"#, None),
+        (
+            "type VeryLongAlias = ns.VeryLongType;",
+            Some(serde_json::json!([{ "max": 5, "properties": "never" }])),
+        ),
     ];
 
     Tester::new(IdLength::NAME, IdLength::PLUGIN, pass, fail).test_and_snapshot();

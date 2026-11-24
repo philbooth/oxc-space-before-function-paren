@@ -5,12 +5,13 @@ use oxc_ast::{
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_span::{GetSpan, Span};
+use oxc_str::JSStr;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::{
     AstNode,
-    ast_util::outermost_paren_parent,
+    ast_util::{outermost_paren, outermost_paren_parent},
     context::LintContext,
     fixer::{RuleFix, RuleFixer},
     rule::{DefaultRuleConfig, Rule},
@@ -69,14 +70,16 @@ declare_oxc_lint!(
     NoUselessPromiseResolveReject,
     unicorn,
     pedantic,
+    recommended,
     fix,
     config = NoUselessPromiseResolveRejectOptions,
     version = "0.0.18",
+    short_description = "Disallows returning values wrapped in `Promise.resolve` or `Promise.reject` in an async function or a `Promise#then`/`catch`/`finally` callback.",
 );
 
 impl Rule for NoUselessPromiseResolveReject {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        serde_json::from_value::<DefaultRuleConfig<Self>>(value).map(DefaultRuleConfig::into_inner)
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
     }
 
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
@@ -95,9 +98,11 @@ impl Rule for NoUselessPromiseResolveReject {
             return;
         };
 
-        if !matches!(static_member_expr.property.name.as_str(), "resolve" | "reject") {
-            return;
-        }
+        let is_reject = match static_member_expr.property.name.as_str() {
+            "resolve" => false,
+            "reject" => true,
+            _ => return,
+        };
 
         let Some(parent) = outermost_paren_parent(node, ctx) else {
             return;
@@ -136,44 +141,19 @@ impl Rule for NoUselessPromiseResolveReject {
             return;
         }
 
-        match static_member_expr.property.name.as_str() {
-            "resolve" => {
-                ctx.diagnostic_with_fix(
-                    resolve(node.kind().span(), if is_yield { "yield" } else { "return" }),
-                    |fixer| {
-                        generate_fix(
-                            call_expr,
-                            false,
-                            is_yield,
-                            is_in_try_statement,
-                            fixer,
-                            ctx,
-                            node,
-                        )
-                    },
-                );
-            }
-            "reject" => {
-                if self.0.allow_reject {
-                    return;
-                }
-                ctx.diagnostic_with_fix(
-                    reject(node.kind().span(), if is_yield { "yield" } else { "return" }),
-                    |fixer| {
-                        generate_fix(
-                            call_expr,
-                            true,
-                            is_yield,
-                            is_in_try_statement,
-                            fixer,
-                            ctx,
-                            node,
-                        )
-                    },
-                );
-            }
-            _ => unreachable!(),
+        if is_reject && self.0.allow_reject {
+            return;
         }
+
+        let preferred = if is_yield { "yield" } else { "return" };
+        let diagnostic = if is_reject {
+            reject(node.kind().span(), preferred)
+        } else {
+            resolve(node.kind().span(), preferred)
+        };
+        ctx.diagnostic_with_fix(diagnostic, |fixer| {
+            generate_fix(call_expr, is_reject, is_yield, is_in_try_statement, fixer, ctx, node)
+        });
     }
 }
 
@@ -223,7 +203,7 @@ fn is_promise_callback<'a, 'b>(node: &'a AstNode<'b>, ctx: &'a LintContext<'b>) 
     if member_expr.is_computed() {
         return false;
     }
-    let Some(static_prop_name) = member_expr.static_property_name() else {
+    let Some(static_prop_name) = member_expr.static_property_name().and_then(JSStr::as_str) else {
         return false;
     };
 
@@ -270,16 +250,6 @@ fn is_bind_member_expression(node: &AstNode) -> bool {
     member_expr.static_property_name().is_some_and(|name| name == "bind")
 }
 
-fn match_arrow_function_body<'a>(ctx: &LintContext<'a>, parent: &AstNode<'a>) -> bool {
-    let parent = ctx.nodes().parent_node(parent.id());
-    if !matches!(parent.kind(), AstKind::FunctionBody(_)) {
-        return false;
-    }
-
-    let grand_parent = ctx.nodes().parent_node(parent.id());
-    matches!(grand_parent.kind(), AstKind::ArrowFunctionExpression(_))
-}
-
 fn generate_fix<'a>(
     call_expr: &CallExpression,
     is_reject: bool,
@@ -319,14 +289,13 @@ fn generate_fix<'a>(
         }
     }
 
-    let node = get_parenthesized_node(node, ctx);
-
-    let parent = ctx.nodes().parent_node(node.id());
-
-    let is_arrow_function_body = match parent.kind() {
-        AstKind::ExpressionStatement(_) => match_arrow_function_body(ctx, parent),
-        _ => false,
+    let node = outermost_paren(node, ctx);
+    let Some(parent) = outermost_paren_parent(node, ctx) else {
+        return fixer.noop();
     };
+
+    let is_arrow_function_body =
+        matches!(parent.kind(), AstKind::ArrowFunctionExpression(arrow) if arrow.is_expression());
 
     let mut replace_range = if is_reject { parent.kind().span() } else { call_expr.span() };
     let replacement_text = if is_reject {
@@ -334,13 +303,13 @@ fn generate_fix<'a>(
         let mut text = format!("throw {text}");
 
         if is_yield {
-            replace_range = get_parenthesized_node(parent, ctx).kind().span();
+            replace_range = outermost_paren(parent, ctx).kind().span();
             text
         } else {
             text = format!("{text};");
             // `=> Promise.reject(error)` -> `=> { throw error; }`
             if is_arrow_function_body {
-                replace_range = get_parenthesized_node(parent, ctx).kind().span();
+                replace_range = node.kind().span();
                 text = format!("{{ {text} }}");
             }
             text
@@ -370,22 +339,6 @@ fn generate_fix<'a>(
     };
 
     fixer.replace(replace_range, replacement_text)
-}
-
-fn get_parenthesized_node<'a, 'b>(
-    node: &'a AstNode<'b>,
-    ctx: &'a LintContext<'b>,
-) -> &'a AstNode<'b> {
-    let mut node = node;
-    loop {
-        let parent_node = ctx.nodes().parent_node(node.id());
-        if let AstKind::ParenthesizedExpression(_) = parent_node.kind() {
-            node = parent_node;
-        } else {
-            break;
-        }
-    }
-    node
 }
 
 #[test]

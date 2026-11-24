@@ -11,7 +11,7 @@ use crate::{
     utils::count_comment_lines,
 };
 
-fn max_lines_diagnostic(count: usize, max: usize, span: Span) -> OxcDiagnostic {
+fn max_lines_diagnostic(count: u32, max: u32, span: Span) -> OxcDiagnostic {
     OxcDiagnostic::warn(format!("File has too many lines ({count})."))
         .with_help(format!("Maximum allowed is {max}."))
         .with_label(span)
@@ -24,7 +24,7 @@ pub struct MaxLines(Box<MaxLinesConfig>);
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct MaxLinesConfig {
     /// Maximum number of lines allowed per file.
-    max: usize,
+    max: u32,
     /// Whether to ignore blank lines when counting.
     skip_blank_lines: bool,
     /// Whether to ignore comments when counting.
@@ -45,6 +45,14 @@ impl Default for MaxLinesConfig {
     }
 }
 
+#[derive(Debug, JsonSchema, Deserialize)]
+#[serde(untagged)]
+#[expect(unused)]
+enum MaxLinesConfigEnum {
+    Number(u32),
+    Object(MaxLinesConfig),
+}
+
 declare_oxc_lint!(
     /// ### What it does
     ///
@@ -60,8 +68,9 @@ declare_oxc_lint!(
     MaxLines,
     eslint,
     pedantic,
-    config = MaxLinesConfig,
+    config = MaxLinesConfigEnum,
     version = "0.2.14",
+    short_description = "Enforce a maximum number of lines per file.",
 );
 
 impl Rule for MaxLines {
@@ -70,7 +79,7 @@ impl Rule for MaxLines {
             .get(0)
             .and_then(Value::as_number)
             .and_then(serde_json::Number::as_u64)
-            .and_then(|v| usize::try_from(v).ok())
+            .and_then(|v| u32::try_from(v).ok())
         {
             Ok(Self(Box::new(MaxLinesConfig {
                 max,
@@ -78,8 +87,7 @@ impl Rule for MaxLines {
                 skip_blank_lines: false,
             })))
         } else {
-            serde_json::from_value::<DefaultRuleConfig<Self>>(value)
-                .map(DefaultRuleConfig::into_inner)
+            DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
         }
     }
 
@@ -103,11 +111,18 @@ impl Rule for MaxLines {
             if ctx.source_text().ends_with('\n') { newlines } else { newlines + 1 }
         };
 
-        let final_lines = lines_in_file.max(1).saturating_sub(comment_lines);
+        let final_lines = lines_in_file.max(1).saturating_sub(comment_lines) as u32;
         if final_lines > self.max {
-            // Point to end of the file for `eslint-disable max-lines` to work.
-            let end = ctx.source_text().len().saturating_sub(1) as u32;
-            ctx.diagnostic(max_lines_diagnostic(final_lines, self.max, Span::empty(end)));
+            // Point to end of the file for `eslint-disable max-lines` to work: the start of the
+            // last character, treating a trailing CRLF as one. This keeps the offset on a
+            // character boundary and out of the CRLF, which an LSP position cannot express.
+            let source_text = ctx.source_text();
+            let end = if source_text.ends_with("\r\n") {
+                source_text.len() - 2
+            } else {
+                source_text.char_indices().next_back().map_or(0, |(i, _)| i)
+            };
+            ctx.diagnostic(max_lines_diagnostic(final_lines, self.max, Span::empty(end as u32)));
         }
     }
 }
@@ -173,10 +188,15 @@ fn test() {
             ",
             Some(serde_json::json!([{ "max": 1 }])),
         ),
+        ("/* eslint-disable max-lines */\r\n\r\n;\r\n", Some(serde_json::json!([{ "max": 1 }]))),
     ];
 
     let fail = vec![
         ("var xyz;\nvar xyz;\nvar xyz;", Some(serde_json::json!([2]))),
+        // The diagnostic points before the final line break, not inside a trailing CRLF.
+        ("var xyz;\r\nvar xyz;\r\nvar xyz;\r\n", Some(serde_json::json!([2]))),
+        // The diagnostic points at a character boundary.
+        ("var xyz;\nvar xyz;\nvar é", Some(serde_json::json!([2]))),
         (
             "/* a multiline comment\n that goes to many lines*/\nvar xy;\nvar xy;",
             Some(serde_json::json!([2])),

@@ -76,23 +76,28 @@ declare_oxc_lint!(
     TextEncodingIdentifierCase,
     unicorn,
     style,
+    recommended,
     fix,
     config = TextEncodingIdentifierCase,
     version = "0.0.15",
+    short_description = "Enforce consistent case for text encoding identifiers.",
 );
 
 impl Rule for TextEncodingIdentifierCase {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        serde_json::from_value::<DefaultRuleConfig<Self>>(value).map(DefaultRuleConfig::into_inner)
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
     }
 
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
         let (s, span) = match node.kind() {
             AstKind::StringLiteral(string_lit) => (string_lit.value.as_str(), string_lit.span),
-            AstKind::JSXText(jsx_text) => (jsx_text.value.as_str(), jsx_text.span),
+            AstKind::JSXText(jsx_text) => (Some(jsx_text.value.as_str()), jsx_text.span),
             _ => return,
         };
 
+        let Some(s) = s else {
+            return;
+        };
         let with_dash = self.with_dash || should_enforce_dash(node.id(), ctx);
 
         if let Some(replacement) = get_replacement(s, with_dash)
@@ -207,18 +212,13 @@ fn test() {
         (r#"new TextDecoder("utf-8")"#, with_dash.clone()),
         (r#"<not-meta charset="utf-8" />"#, with_dash.clone()),
         (r#"<not-meta notCharset="utf-8" />"#, with_dash.clone()),
-        (r#"<meta charset="utf-8" />"#, with_dash.clone()),
         (r#"<meta charset="utf-8" />"#, no_dash.clone()),
         (r#"<META CHARSET="utf-8" />"#, with_dash.clone()),
         (r#"<META CHARSET="utf-8" />"#, no_dash.clone()),
-        (r#"<form acceptCharset="utf-8" />"#, with_dash.clone()),
         (r#"<form acceptCharset="utf-8" />"#, no_dash.clone()),
         (r#"<form accept-charset="utf-8" />"#, with_dash.clone()),
         (r#"<form accept-charset="utf-8" />"#, no_dash.clone()),
-        (r#"new TextDecoder("utf-8")"#, with_dash.clone()),
         (r#"new TextDecoder("utf-8")"#, no_dash.clone()),
-        (r#"<not-meta charset="utf-8" />"#, with_dash.clone()),
-        (r#"<not-meta notCharset="utf-8" />"#, with_dash.clone()),
         (r#"<not-meta charset="utf8" />"#, no_dash.clone()),
         (r#"<not-meta notCharset="utf8" />"#, no_dash.clone()),
     ];

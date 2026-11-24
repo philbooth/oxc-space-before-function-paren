@@ -25,7 +25,7 @@ The easiest way to get started with `oxc` is by adding this to your `Cargo.toml`
 
 ```toml
 [dependencies]
-oxc = { version = "*", features = ["full"] }
+oxc = { version = "*", features = ["full", "cfg"] }
 ```
 
 In most cases, code using oxc will follow this general pipeline:
@@ -77,7 +77,7 @@ let mut errors = Vec::new();
 
 // Step 1: Parsing
 // Parse the TSX file into an AST. The root AST node is a `Program` struct.
-let ParserReturn { program, trivias, errors: parser_errors, panicked } =
+let ParserReturn { program, diagnostics: parser_errors, fatal_error, .. } =
     Parser::new(&allocator, source_text, source_type).parse();
 errors.extend(parser_errors);
 
@@ -85,7 +85,7 @@ errors.extend(parser_errors);
 // parser could recover from errors, `program` will be a valid AST and
 // `errors` will be populated. We can still perform semantic analysis in
 // such cases (if we want).
-if panicked {
+if fatal_error {
     for error in &errors {
         eprintln!("{error:?}");
         panic!("Parsing failed.");
@@ -98,7 +98,7 @@ if panicked {
 // these, and they are disabled by default.
 let SemanticBuilderReturn {
     semantic,
-    errors: semantic_errors,
+    diagnostics: semantic_errors,
 } = SemanticBuilder::new()
     .with_check_syntax_error(true) // Enable extra syntax error checking
     .with_cfg(true)                // Build a Control Flow Graph
@@ -123,26 +123,23 @@ These feature flags enable/disable various tools in oxc's toolchain:
 
 - `full`: Enable all features that provide access to a tool.
 - `semantic`: Enable the `semantic` module for semantic analysis on ASTs.
-- `transformer`: Enable the `transform` module for babel-like transpiling.
+- `transformer`: Enable the `transformer` module for babel-like transpiling.
 - `minifier`: Enable the `minifier` and `mangler` modules for terser-like minification.
-- `codegen`: Enable the `codegen` module, which prints ASTs to source code.
+- `codegen`: Enable the `codegen` module, which prints ASTs to source code and source maps.
 - `mangler`: Enable the `mangler` module without enabling `minifier`.
-- `cfg`: Expose the `cfg` module. CFGs may still be created in `semantic`
-  without turning this on.
-- `sourcemap`: Enable the `sourcemap` module. Useful when using `codegen` to
-  print both source code and source maps.
+- `cfg`: Expose the `cfg` module and enable control flow graph construction in `semantic`.
+  This feature is not included in `full`.
+- `ast_visit`: Enable the `ast_visit` module for AST traversal.
+- `regular_expression`: Enable regular expression parsing support.
 - `isolated_declarations`: enable the `isolated_declarations` module for
   generating typescript type declarations
 
 These feature flags modify the behavior of oxc's tools. None of them are enabled
 by the `full` feature.
 
-- `serialize`: Implements `Serialize` and `Deserialize` for various oxc data
-  structures.
-- `sourcemap_concurrent`: Generate source maps in parallel. Only useful when
-  the `sourcemap` feature is also enabled.
-- `wasm`: Enable WASM bindings for the transformer/transpiler. Only useful when
-  the `transformer` feature is enabled.
+- `serialize`: Enable ESTree JSON serialization for AST nodes and serialization support
+  for supporting data structures.
+- `conformance`: Enables additional AST visitor hooks for conformance tests.
 
 [crate-oxc-badge]: https://img.shields.io/crates/v/oxc?style=flat-square&logo=rust
 [crate-oxc-url]: https://crates.io/crates/oxc

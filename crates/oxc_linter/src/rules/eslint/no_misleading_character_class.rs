@@ -1,24 +1,41 @@
 use itertools::Itertools;
+use lazy_regex::{Lazy, Regex, lazy_regex};
+use oxc_allocator::Allocator;
+use oxc_ast::{
+    AstKind,
+    ast::{Argument, Expression, RegExpLiteral},
+};
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_regular_expression::{
+    ConstructorParser, LiteralParser, Options,
     ast::{Character, CharacterClassContents, CharacterKind},
     visit::{RegExpAstKind, Visit},
 };
-use oxc_span::Span;
+use oxc_span::{GetSpan, Span};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::{
     AstNode,
     context::LintContext,
+    fixer::{RuleFix, RuleFixer},
     rule::{DefaultRuleConfig, Rule},
-    utils::run_on_regex_node,
+    utils::{
+        RegexFlagsParseResult, get_regex_flags_span, get_regex_pattern_span, is_regexp_callee,
+        run_on_regex_node,
+    },
 };
 
 fn surrogate_pair_diagnostic(span: Span) -> OxcDiagnostic {
     OxcDiagnostic::warn("Unexpected surrogate pair in character class.")
-        .with_help("Add the Unicode flag 'u' to the regular expression or use Unicode code point escapes (e.g., \\u{1F44D}) instead of surrogate pairs.")
+        .with_help("Use Unicode code point escapes (e.g., \\u{1F44D}) instead of surrogate pairs.")
+        .with_label(span)
+}
+
+fn surrogate_pair_without_flag_diagnostic(span: Span) -> OxcDiagnostic {
+    OxcDiagnostic::warn("Unexpected surrogate pair in character class.")
+        .with_help("Add the Unicode flag 'u'.")
         .with_label(span)
 }
 
@@ -116,9 +133,11 @@ declare_oxc_lint!(
     NoMisleadingCharacterClass,
     eslint,
     correctness,
-    pending,
+    recommended,
+    suggestion,
     config = NoMisleadingCharacterClass,
     version = "1.17.0",
+    short_description = "This rule reports regular expressions which include multiple code point characters in character class syntax.",
 );
 
 #[derive(Debug)]
@@ -173,7 +192,7 @@ impl<'ast> Visit<'ast> for CharacterSequenceCollector<'ast> {
 
 impl Rule for NoMisleadingCharacterClass {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        serde_json::from_value::<DefaultRuleConfig<Self>>(value).map(DefaultRuleConfig::into_inner)
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
     }
 
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
@@ -202,7 +221,7 @@ impl Rule for NoMisleadingCharacterClass {
                 zwj_sequences(unfiltered_chars, ctx);
                 emoji_modifier_sequences(unfiltered_chars, ctx);
                 surrogate_pair_sequences(unfiltered_chars, ctx);
-                surrogate_pair_sequences_without_flag(unfiltered_chars, ctx);
+                surrogate_pair_sequences_without_flag(unfiltered_chars, node, ctx);
             }
         });
     }
@@ -231,43 +250,18 @@ fn regional_indicator_symbol_sequences(chars: &[&Character], ctx: &LintContext<'
     }
 }
 
-// Returns true if the code point is a combining mark (Unicode category Mn, Mc, or Me)
-//
-// Unicode Combining Character Ranges
-// A. General Combining Characters (Mn, Mc, Me)
-// Combining characters are those whose General Category falls under:
-// - Mn — Nonspacing Mark
-// - Mc — Spacing Mark
-// - Me — Enclosing Mark
-//
-// Some Unicode blocks dedicated (entirely or in part) to combining marks include :
-// - Combining Diacritical Marks: U+0300–U+036F
-// - Combining Diacritical Marks Extended: U+1AB0–U+1AFF
-// - Combining Diacritical Marks Supplement: U+1DC0–U+1DFF
-// - Combining Diacritical Marks for Symbols: U+20D0–U+20FF
-// - Combining Half Marks: U+FE20–U+FE2F
-//
-// Additional combining characters exist within script-specific blocks
-// (e.g., Devanagari signs, Hiragana/Katakana marks) and are not confined to a block,
-// but share the Mn/Mc/Me categories
-//
-// B. Variation Selectors (also Combining)
-//
-// Variation selectors are also combining characters. There are two blocks:
-// - Variation Selectors (Basic): U+FE00–U+FE0F
-// - Variation Selectors Supplement: U+E0100–U+E01EF (256 total)
+static COMBINING_MARK_REGEX: Lazy<Regex> = lazy_regex!(r"^\p{M}$");
+
 fn is_combining_character(value: u32) -> bool {
-    // Covers Mn (Nonspacing_Mark), Mc (Spacing_Mark), Me (Enclosing_Mark), and variation selectors
-    matches!(
-        value,
-        0x0300..=0x036F | // Combining Diacritical Marks
-        0x1AB0..=0x1AFF | // Combining Diacritical Marks Extended
-        0x1DC0..=0x1DFF | // Combining Diacritical Marks Supplement
-        0x20D0..=0x20FF | // Combining Diacritical Marks for Symbols
-        0xFE20..=0xFE2F | // Combining Half Marks
-        0xFE00..=0xFE0F | // Variation Selectors (Basic)
-        0xE0100..=0xE01EF  // Variation Selectors (Supplement)
-    )
+    if value < 0x80 {
+        return false;
+    }
+
+    let Some(character) = char::from_u32(value) else {
+        return false;
+    };
+    let mut buffer = [0; 4];
+    COMBINING_MARK_REGEX.is_match(character.encode_utf8(&mut buffer))
 }
 
 // Find combining mark sequences: previous is not combining, current is combining
@@ -346,25 +340,77 @@ fn is_surrogate_pair(hi: u32, lo: u32) -> bool {
 }
 
 // Returns true if the character was written as a Unicode code point escape (e.g., \u{1F44D})
-fn is_unicode_code_point_escape(char: &Character) -> bool {
-    matches!(char.kind, CharacterKind::UnicodeEscape)
+// tries to align how `oxc_parser` uses `unicode_code_point`
+fn is_unicode_code_point_escape(char: &Character, source_text: &str) -> bool {
+    let char_source = char.span.source_text(source_text);
+    let Some(hex) = char_source.strip_circumfix("\\u{", '}') else {
+        return false;
+    };
+
+    if hex.is_empty() {
+        return false;
+    }
+
+    let mut value: u32 = 0;
+    for ch in hex.chars() {
+        let Some(digit) = ch.to_digit(16) else {
+            return false;
+        };
+
+        let Some(next) = value.checked_mul(16).and_then(|v| v.checked_add(digit)) else {
+            return false;
+        };
+        value = next;
+    }
+
+    value <= 0x10_FFFF
 }
 
 // Find surrogate pairs where neither character is a Unicode code point escape
-fn surrogate_pair_sequences_without_flag(chars: &[&Character], ctx: &LintContext<'_>) {
+fn surrogate_pair_sequences_without_flag(
+    chars: &[&Character],
+    node: &AstNode,
+    ctx: &LintContext<'_>,
+) {
     for (index, &char) in chars.iter().enumerate() {
         if index == 0 {
             continue;
         }
         let previous = chars[index - 1];
         if is_surrogate_pair(previous.value, char.value)
-            && !is_unicode_code_point_escape(previous)
-            && !is_unicode_code_point_escape(char)
+            && !is_unicode_code_point_escape(previous, ctx.source_text())
+            && !is_unicode_code_point_escape(char, ctx.source_text())
         {
-            ctx.diagnostic(surrogate_pair_diagnostic(Span::new(
-                previous.span.start,
-                char.span.end,
-            )));
+            ctx.diagnostic_with_suggestion(
+                surrogate_pair_without_flag_diagnostic(Span::new(
+                    previous.span.start,
+                    char.span.end,
+                )),
+                |fixer| {
+                    match node.kind() {
+                        AstKind::RegExpLiteral(lit) => fix_regexp_literal(fixer, lit),
+                        AstKind::NewExpression(expr) if is_regexp_callee(&expr.callee, ctx) => {
+                            fix_on_arguments(
+                                fixer,
+                                expr.arguments.first(),
+                                expr.arguments.get(1),
+                                ctx,
+                            )
+                        }
+
+                        // RegExp()
+                        AstKind::CallExpression(expr) if is_regexp_callee(&expr.callee, ctx) => {
+                            fix_on_arguments(
+                                fixer,
+                                expr.arguments.first(),
+                                expr.arguments.get(1),
+                                ctx,
+                            )
+                        }
+                        _ => fixer.noop(),
+                    }
+                },
+            );
         }
     }
 }
@@ -377,13 +423,107 @@ fn surrogate_pair_sequences(chars: &[&Character], ctx: &LintContext<'_>) {
         }
         let previous = chars[index - 1];
         if is_surrogate_pair(previous.value, char.value)
-            && (is_unicode_code_point_escape(previous) || is_unicode_code_point_escape(char))
+            && (is_unicode_code_point_escape(previous, ctx.source_text())
+                || is_unicode_code_point_escape(char, ctx.source_text()))
         {
             ctx.diagnostic(surrogate_pair_diagnostic(Span::new(
                 previous.span.start,
                 char.span.end,
             )));
         }
+    }
+}
+
+fn fix_regexp_literal(fixer: RuleFixer<'_, '_>, literal: &RegExpLiteral) -> RuleFix {
+    let literal_text = literal.regex.pattern.text;
+    if !validate_regex_pattern(&literal_text, true, Some("u")) {
+        return fixer.noop();
+    }
+    fixer.insert_text_after_range(literal.span(), "u")
+}
+
+fn fix_on_arguments<'a>(
+    fixer: RuleFixer<'_, 'a>,
+    arg1: Option<&Argument>,
+    arg2: Option<&Argument>,
+    ctx: &LintContext<'a>,
+) -> RuleFix {
+    match get_regex_flags_span(arg2) {
+        RegexFlagsParseResult::Valid(span) => {
+            let Some(arg1_expr) = arg1
+                .expect("invalid patterns should be filtered out by `run_on_regex_node`")
+                .as_expression()
+                .map(Expression::get_inner_expression)
+            else {
+                return fixer.noop();
+            };
+            if span.is_none()
+                && let Expression::RegExpLiteral(lit) = &arg1_expr
+            {
+                return fix_regexp_literal(fixer, lit);
+            }
+
+            fix_regexp_call_or_new(
+                fixer,
+                get_regex_pattern_span(arg1)
+                    .expect("invalid patterns should be filtered out by `run_on_regex_node`"),
+                arg1.unwrap().span(),
+                span.map(|span: Span| span.shrink(1)),
+                matches!(arg1_expr, Expression::RegExpLiteral(_)),
+                ctx,
+            )
+        }
+        _ => fixer.noop(),
+    }
+}
+
+fn fix_regexp_call_or_new<'a>(
+    fixer: RuleFixer<'_, 'a>,
+    pattern_span: Span,
+    first_arg_span: Span,
+    flag_span: Option<Span>,
+    is_regex_literal: bool,
+    ctx: &LintContext<'a>,
+) -> RuleFix {
+    let flags_text = flag_span.map(|span| span.source_text(ctx.source_text()));
+    if flags_text.is_some_and(|flags| flags.contains('u') || flags.contains('v')) {
+        return fixer.noop();
+    }
+
+    let pattern_text = pattern_span.source_text(ctx.source_text());
+    let flags_text =
+        if let Some(flags) = flags_text { format!("{flags}u") } else { "u".to_string() };
+
+    if is_regex_literal {
+        if !validate_regex_pattern(pattern_text, true, Some(&flags_text)) {
+            return fixer.noop();
+        }
+    } else if !validate_regex_pattern(pattern_text, false, Some(&format!(r#""{flags_text}""#))) {
+        return fixer.noop();
+    }
+
+    if let Some(flag_span) = flag_span {
+        if flag_span.is_empty() {
+            fixer.insert_text_after(&flag_span, "u")
+        } else {
+            fixer.replace(flag_span, flags_text)
+        }
+    } else {
+        fixer.insert_text_after(&first_arg_span, r#", "u""#)
+    }
+}
+
+fn validate_regex_pattern(pattern: &str, is_regex_literal: bool, flags: Option<&str>) -> bool {
+    let allocator = Allocator::default();
+    // we do not care about the actual span positions for this validation, so we can set them to 0
+    let options = Options { pattern_span_offset: 0, flags_span_offset: 0 };
+
+    if is_regex_literal {
+        let parser = LiteralParser::new(&allocator, pattern, flags, options);
+        parser.parse().is_ok()
+    } else {
+        let parser = ConstructorParser::new(&allocator, pattern, flags, options);
+        parser.parse().is_ok()
     }
 }
 
@@ -468,6 +608,8 @@ fn test() {
         // Separate character classes should not trigger warnings for cross-class sequences
         (r"/[\u200c][\u200d][a]/", None),
         (r"/[\uD83D][\uDC4D]/", None), // Solo surrogates in separate classes
+        // with overridden flags it is valid
+        ("RegExp(/[👍]/, 'u');", None),
     ];
 
     let fail = vec![
@@ -604,8 +746,7 @@ fn test() {
         // (r#"new RegExp(`${"[👍🇯🇵]"}[😊]`);"#, None),
         // references from variables
         // (r#"const pattern = "[👍]"; new RegExp(pattern);"#, None),
-        // flag overrides, see oxc-project/oxc#13436
-        // ("RegExp(/[a👍z]/u, '');", None),
+        ("RegExp(/[a👍z]/u, '');", None),
         ("RegExp(/[👍]/)", None),
         ("RegExp(/[👍]/, 'i');", None),
         ("RegExp(/[👍]/, 'g');", None), // { "globals": { "RegExp": "off" } },
@@ -637,9 +778,8 @@ fn test() {
             r"new RegExp(`[.\\\x75200D.]`)", // "u" escaped as "\x75"
             None,
         ),
-        ("var r = /[[👶🏻]]/v", None), // { "ecmaVersion": 2024 },
-        // flag overrides, see oxc-project/oxc#13436
-        // ("new RegExp(/^[👍]$/v, '')", None), // { "ecmaVersion": 2024, },
+        ("var r = /[[👶🏻]]/v", None),         // { "ecmaVersion": 2024 },
+        ("new RegExp(/^[👍]$/v, '')", None), // { "ecmaVersion": 2024, },
         (r"/[Á]/", Some(serde_json::json!([{ "allowEscape": false }]))),
         (r"/[\\̶]/", Some(serde_json::json!([{ "allowEscape": true }]))),
         (r"/[\n̅]/", Some(serde_json::json!([{ "allowEscape": true }]))),
@@ -660,8 +800,156 @@ fn test() {
         // https://github.com/oxc-project/oxc/issues/19090 -- without u flag it should fail
         // this should not be a `UnicodePropertyEscape`
         (r"/[\u200c\u200d\p{ID_Continue}.]/", None),
+        // https://github.com/oxc-project/oxc/issues/28729
+        ("/[ગુ]/", None),
+        ("/[कि]/", None),
+        ("/[ક્]/", None),
+        ("/[नमस्ते]/", None),
+        ("new RegExp('[ગુ]', 'u');", None),
+        // combining marks of other scripts (base letter + mark)
+        ("/[а҃]/u", None),  // Cyrillic
+        ("/[אָ]/u", None),  // Hebrew
+        ("/[بَ]/u", None),  // Arabic
+        ("/[ܐܰ]/u", None),  // Syriac
+        ("/[ހަ]/u", None),  // Thaana
+        ("/[ߊ߫]/u", None),  // NKo
+        ("/[কা]/u", None),  // Bengali
+        ("/[ਕਾ]/u", None), // Gurmukhi
+        ("/[କା]/u", None),  // Oriya
+        ("/[கா]/u", None),  // Tamil
+        ("/[కా]/u", None),  // Telugu
+        ("/[ಕಾ]/u", None), // Kannada
+        ("/[കാ]/u", None),  // Malayalam
+        ("/[කා]/u", None),  // Sinhala
+        ("/[กั]/u", None),  // Thai
+        ("/[ກັ]/u", None),  // Lao
+        ("/[ཀཱ]/u", None),  // Tibetan
+        ("/[ကါ]/u", None), // Myanmar
+        ("/[កា]/u", None), // Khmer
+        ("/[ᠠ᠋]/u", None),  // Mongolian
+        ("/[ᬆ]/u", None),  // Balinese
+        ("/[が]/u", None), // Kana
+        ("/[ꦏꦴ]/u", None), // Javanese
+        ("/[𑀓𑀸]/u", None),  // Brahmi
+        ("/[𐨕𐨁]/u", None),  // Kharoshthi
+        ("/[𑌕𑌾]/u", None),  // Grantha
+    ];
+
+    let fix = vec![
+        ("var r = /[👍]/", "var r = /[👍]/u", None),
+        (r"var r = /[\uD83D\uDC4D]/", r"var r = /[\uD83D\uDC4D]/u", None),
+        (r"var r = /before[\uD83D\uDC4D]after/", r"var r = /before[\uD83D\uDC4D]after/u", None),
+        (r"var r = /[before\uD83D\uDC4Dafter]/", r"var r = /[before\uD83D\uDC4Dafter]/u", None),
+        (r"var r = /\uDC4D[\uD83D\uDC4D]/", r"var r = /\uDC4D[\uD83D\uDC4D]/u", None),
+        ("var r = /(?<=[👍])/", "var r = /(?<=[👍])/u", None),
+        ("var r = /[👶🏻]/", "var r = /[👶🏻]/u", None),
+        ("var r = /[🇯🇵]/", "var r = /[🇯🇵]/u", None),
+        ("var r = /[🇯🇵]/i", "var r = /[🇯🇵]/iu", None),
+        ("var r = /[👨‍👩‍👦]/", "var r = /[👨‍👩‍👦]/u", None),
+        (r#"var r = RegExp("[👍]", "")"#, r#"var r = RegExp("[👍]", "u")"#, None),
+        (r#"var r = new RegExp("[👍]", "")"#, r#"var r = new RegExp("[👍]", "u")"#, None),
+        (r#"var r = RegExp("[👍]", ``)"#, r#"var r = RegExp("[👍]", `u`)"#, None),
+        (
+            "var r = new RegExp(`
+                [👍]`)",
+            r#"var r = new RegExp(`
+                [👍]`, "u")"#,
+            None,
+        ),
+        (
+            r#"const flags = ""; var r = new RegExp("[👍]", flags)"#,
+            r#"const flags = ""; var r = new RegExp("[👍]", flags)"#, // no fix, regex would be invalid
+            None,
+        ),
+        (
+            r#"var r = RegExp("[\\uD83D\\uDC4D]", "")"#,
+            r#"var r = RegExp("[\\uD83D\\uDC4D]", "u")"#,
+            None,
+        ),
+        (
+            r#"var r = RegExp("before[\\uD83D\\uDC4D]after", "")"#,
+            r#"var r = RegExp("before[\\uD83D\\uDC4D]after", "u")"#,
+            None,
+        ),
+        (
+            r#"var r = RegExp("[before\\uD83D\\uDC4Dafter]", "")"#,
+            r#"var r = RegExp("[before\\uD83D\\uDC4Dafter]", "u")"#,
+            None,
+        ),
+        (r#"var r = RegExp("\t\t\t👍[👍]")"#, r#"var r = RegExp("\t\t\t👍[👍]", "u")"#, None),
+        (
+            r#"var r = new RegExp("\u1234[\\uD83D\\uDC4D]")"#,
+            r#"var r = new RegExp("\u1234[\\uD83D\\uDC4D]", "u")"#,
+            None,
+        ),
+        (
+            r#"var r = new RegExp("\\u1234\\u5678👎[👍]")"#,
+            r#"var r = new RegExp("\\u1234\\u5678👎[👍]", "u")"#,
+            None,
+        ),
+        (
+            r#"var r = new RegExp("\\u1234\\u5678👍[👍]")"#,
+            r#"var r = new RegExp("\\u1234\\u5678👍[👍]", "u")"#,
+            None,
+        ),
+        (
+            r#"var r = new RegExp("/(?<=[👍])", "")"#,
+            r#"var r = new RegExp("/(?<=[👍])", "u")"#,
+            None,
+        ),
+        (r#"var r = new RegExp("[👶🏻]", "")"#, r#"var r = new RegExp("[👶🏻]", "u")"#, None),
+        (r"var r = RegExp(`\t\t\t👍[👍]`)", r#"var r = RegExp(`\t\t\t👍[👍]`, "u")"#, None),
+        (r"var r = RegExp(`\\t\\t\\t👍[👍]`)", r#"var r = RegExp(`\\t\\t\\t👍[👍]`, "u")"#, None),
+        (r#"var r = new RegExp("[🇯🇵]", "")"#, r#"var r = new RegExp("[🇯🇵]", "u")"#, None),
+        (r#"var r = new RegExp("[🇯🇵]", "i")"#, r#"var r = new RegExp("[🇯🇵]", "iu")"#, None),
+        ("var r = new RegExp('[🇯🇵]', `i`)", "var r = new RegExp('[🇯🇵]', `iu`)", None),
+        (r#"var r = new RegExp("[🇯🇵]")"#, r#"var r = new RegExp("[🇯🇵]", "u")"#, None),
+        (r#"var r = new RegExp("[🇯🇵]",)"#, r#"var r = new RegExp("[🇯🇵]", "u",)"#, None),
+        (r#"var r = new RegExp(("[🇯🇵]"))"#, r#"var r = new RegExp(("[🇯🇵]"), "u")"#, None),
+        (r#"var r = new RegExp((("[🇯🇵]")))"#, r#"var r = new RegExp((("[🇯🇵]")), "u")"#, None),
+        (
+            r#"var r = new RegExp((("[🇯🇵]")) as string)"#,
+            r#"var r = new RegExp((("[🇯🇵]")) as string, "u")"#,
+            None,
+        ),
+        (r#"var r = new RegExp(("[🇯🇵]"),)"#, r#"var r = new RegExp(("[🇯🇵]"), "u",)"#, None),
+        (r#"var r = new RegExp("[👨‍👩‍👦]", "")"#, r#"var r = new RegExp("[👨‍👩‍👦]", "u")"#, None),
+        (
+            r#"var r = new globalThis.RegExp("[🇯🇵]", "")"#,
+            r#"var r = new globalThis.RegExp("[🇯🇵]", "u")"#,
+            None,
+        ),
+        // complex template literal
+        // (r#"new RegExp(`${"[👍🇯🇵]"}[😊]`);"#, r#"new RegExp(`${"[👍🇯🇵]"}[😊]`, "u");"#, None),
+        // references from variables
+        // (
+        //     r#"const pattern = "[👍]"; new RegExp(pattern);"#,
+        //     r#"const pattern = "[👍]"; new RegExp(pattern, "u");"#,
+        //     None,
+        // ),
+        //
+        // see https://github.com/oxc-project/oxc/issues/13436
+        ("RegExp(/[a👍z]/u, '');", "RegExp(/[a👍z]/u, 'u');", None),
+        ("RegExp(/[👍]/)", "RegExp(/[👍]/u)", None),
+        ("RegExp(/[👍]/, 'i');", "RegExp(/[👍]/, 'iu');", None),
+        // ("RegExp(/[👍]/, 'g')", "RegExp(/[👍]/u, 'g');", None), // languageOptions: { globals: { RegExp: "off" } },
+        ("new RegExp(/^[👍]$/v, '')", "new RegExp(/^[👍]$/v, 'u')", None),
+        (r"/[\👍]/", r"/[\👍]/", Some(serde_json::json!([{ "allowEscape": true }]))), // no fix, regex would be invalid
+        (r"RegExp('[\👍]')", r#"RegExp('[\👍]', "u")"#, None),
+        (
+            r"RegExp('[\\👍]')",
+            r"RegExp('[\\👍]')", // no fix, regex would be invalid
+            Some(serde_json::json!([{ "allowEscape": true }])),
+        ),
+        // Backslash + U+D83D + U+DC4D
+        (
+            r"RegExp(`[\👍]`)",
+            r#"RegExp(`[\👍]`, "u")"#,
+            Some(serde_json::json!([{ "allowEscape": true }])),
+        ),
     ];
 
     Tester::new(NoMisleadingCharacterClass::NAME, NoMisleadingCharacterClass::PLUGIN, pass, fail)
+        .expect_fix(fix)
         .test_and_snapshot();
 }

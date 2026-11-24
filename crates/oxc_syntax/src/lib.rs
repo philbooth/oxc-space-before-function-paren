@@ -9,6 +9,7 @@ pub mod constant_value;
 pub mod es_target;
 pub mod identifier;
 pub mod keyword;
+pub mod label;
 pub mod line_terminator;
 pub mod module_record;
 pub mod node;
@@ -17,10 +18,13 @@ pub mod operator;
 pub mod precedence;
 pub mod reference;
 pub mod scope;
+pub mod semantic_id;
 #[cfg(feature = "serialize")]
 mod serialize;
 pub mod symbol;
 pub mod xml_entities;
+
+pub use node::GetNodeId;
 
 mod generated {
     #[cfg(debug_assertions)]

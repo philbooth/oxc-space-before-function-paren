@@ -1,23 +1,23 @@
+use oxc_ast::AstKind;
 use oxc_macros::declare_oxc_lint;
+use oxc_semantic::AstNode;
 
 use crate::{
-    context::LintContext,
+    context::{ContextHost, LintContext},
     rule::Rule,
-    rules::{
-        PossibleJestNode, shared::no_restricted_jest_methods as SharedNoRestrictedJestMethods,
-    },
+    rules::shared::no_restricted_jest_methods as SharedNoRestrictedJestMethods,
 };
 
 #[derive(Debug, Default, Clone)]
 pub struct NoRestrictedJestMethods(
-    Box<SharedNoRestrictedJestMethods::NoRestrictedJestMethodsConfig>,
+    Box<SharedNoRestrictedJestMethods::NoRestrictedTestMethodsConfig>,
 );
 
 declare_oxc_lint!(
     NoRestrictedJestMethods,
     jest,
     style,
-    config = SharedNoRestrictedJestMethods::NoRestrictedJestMethodsConfig,
+    config = SharedNoRestrictedJestMethods::NoRestrictedTestMethodsConfig,
     docs = SharedNoRestrictedJestMethods::DOCUMENTATION,
     version = "0.2.3",
 );
@@ -25,18 +25,19 @@ declare_oxc_lint!(
 impl Rule for NoRestrictedJestMethods {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
         Ok(Self(Box::new(
-            SharedNoRestrictedJestMethods::NoRestrictedJestMethodsConfig::from_configuration(
+            SharedNoRestrictedJestMethods::NoRestrictedTestMethodsConfig::from_configuration(
                 &value,
             )?,
         )))
     }
 
-    fn run_on_jest_node<'a, 'c>(
-        &self,
-        jest_node: &PossibleJestNode<'a, 'c>,
-        ctx: &'c LintContext<'a>,
-    ) {
-        self.0.run(jest_node, ctx);
+    fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
+        let AstKind::CallExpression(_) = node.kind() else { return };
+        self.0.run(node, ctx);
+    }
+
+    fn should_run(&self, ctx: &ContextHost) -> bool {
+        ctx.frameworks().is_test()
     }
 }
 
@@ -58,6 +59,12 @@ fn test() {
             ",
             None,
         ),
+        (
+            "const method = 'fn'; jest[method]().mock.calls.at(0);",
+            Some(serde_json::json!([{ "mock": null }])),
+        ),
+        ("jest[getMethod()]().mock.calls.at(0);", Some(serde_json::json!([{ "mock": null }]))),
+        ("jest().mock().calls.at(0);", Some(serde_json::json!([{ "mock": null }]))),
     ];
 
     let fail = vec![
@@ -72,6 +79,11 @@ fn test() {
             ",
             Some(serde_json::json!([{ "advanceTimersByTime": null }])),
         ),
+        (
+            "jest.spyOn({m:()=>0}, 'm').mockImplementation(() => 1);",
+            Some(serde_json::json!([{ "spyOn": null }])),
+        ),
+        ("jest.fn().mockReturnValue(1);", Some(serde_json::json!([{ "fn": null }]))),
     ];
 
     Tester::new(NoRestrictedJestMethods::NAME, NoRestrictedJestMethods::PLUGIN, pass, fail)

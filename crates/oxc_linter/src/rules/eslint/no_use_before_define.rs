@@ -1,6 +1,6 @@
 use oxc_ast::{
     AstKind,
-    ast::{BindingPattern, ForStatementLeft, IdentifierReference, ModuleExportName},
+    ast::{BindingPattern, ClassElement, ForStatementLeft, IdentifierReference, ModuleExportName},
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
@@ -15,7 +15,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AstNode,
-    context::{ContextHost, LintContext},
+    ast_util::is_iife,
+    context::LintContext,
     rule::{DefaultRuleConfig, Rule},
 };
 
@@ -67,6 +68,20 @@ impl Default for NoUseBeforeDefineConfig {
     }
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+enum Nofunc {
+    Nofunc,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(untagged)]
+#[expect(unused)] // This is used in the rule configuration schema
+enum NoUseBeforeDefineConfigJson {
+    String(Nofunc),
+    Object(NoUseBeforeDefineConfig),
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct NoUseBeforeDefine(NoUseBeforeDefineConfig);
 
@@ -96,13 +111,22 @@ declare_oxc_lint!(
     NoUseBeforeDefine,
     eslint,
     restriction,
-    config = NoUseBeforeDefineConfig,
+    config = NoUseBeforeDefineConfigJson,
     version = "1.49.0",
+    short_description = "Disallows using variables before they are defined.",
 );
 
 impl Rule for NoUseBeforeDefine {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::Error> {
-        serde_json::from_value::<DefaultRuleConfig<NoUseBeforeDefineConfig>>(value)
+        if let Some(serde_json::Value::String(s)) = value.as_array().and_then(|a| a.first())
+            && s == "nofunc"
+        {
+            return Ok(Self(NoUseBeforeDefineConfig {
+                functions: false,
+                ..NoUseBeforeDefineConfig::default()
+            }));
+        }
+        DefaultRuleConfig::<NoUseBeforeDefineConfig>::from_value(value)
             .map(DefaultRuleConfig::into_inner)
             .map(Self)
     }
@@ -162,10 +186,6 @@ impl Rule for NoUseBeforeDefine {
             Some(ctx.scoping().symbol_span(symbol_id)),
         ));
     }
-
-    fn should_run(&self, ctx: &ContextHost) -> bool {
-        ctx.source_type().is_typescript()
-    }
 }
 
 fn is_forbidden(
@@ -184,15 +204,15 @@ fn is_forbidden(
         return options.functions;
     }
 
-    if is_outer_class(symbol_id, symbol_flags, reference.scope_id(), ctx) {
+    if is_outer_class(symbol_id, symbol_flags, reference_node, ctx) {
         return options.classes;
     }
 
-    if is_outer_variable(symbol_id, reference.scope_id(), ctx) {
+    if is_outer_variable(symbol_id, reference_node, ctx) {
         return options.variables;
     }
 
-    if is_outer_enum(symbol_id, symbol_flags, reference.scope_id(), ctx) {
+    if is_outer_enum(symbol_id, symbol_flags, reference_node, ctx) {
         return options.enums;
     }
 
@@ -206,33 +226,67 @@ fn is_forbidden(
 fn is_outer_class(
     symbol_id: SymbolId,
     symbol_flags: SymbolFlags,
-    reference_scope_id: ScopeId,
+    reference_node: &AstNode<'_>,
     ctx: &LintContext<'_>,
 ) -> bool {
-    symbol_flags.is_class()
-        && get_parent_variable_scope(ctx.scoping().symbol_scope_id(symbol_id), ctx)
-            != get_parent_variable_scope(reference_scope_id, ctx)
+    symbol_flags.is_class() && is_from_separate_execution_context(symbol_id, reference_node, ctx)
 }
 
 fn is_outer_variable(
     symbol_id: SymbolId,
-    reference_scope_id: ScopeId,
+    reference_node: &AstNode<'_>,
     ctx: &LintContext<'_>,
 ) -> bool {
     matches!(ctx.symbol_declaration(symbol_id).kind(), AstKind::VariableDeclarator(_))
-        && get_parent_variable_scope(ctx.scoping().symbol_scope_id(symbol_id), ctx)
-            != get_parent_variable_scope(reference_scope_id, ctx)
+        && is_from_separate_execution_context(symbol_id, reference_node, ctx)
+}
+
+fn is_from_separate_execution_context(
+    symbol_id: SymbolId,
+    reference_node: &AstNode<'_>,
+    ctx: &LintContext<'_>,
+) -> bool {
+    let declaration_scope =
+        get_parent_variable_scope(ctx.scoping().symbol_scope_id(symbol_id), ctx);
+    let declaration_scope_node = ctx.scoping().get_node_id(declaration_scope);
+    let reference_span = reference_node.kind().span();
+
+    ctx.nodes()
+        .ancestors(reference_node.id())
+        .take_while(|ancestor| ancestor.id() != declaration_scope_node)
+        .any(|ancestor| match ancestor.kind() {
+            AstKind::Function(function) => {
+                function.r#async || function.generator || !is_iife(ancestor, ctx.semantic())
+            }
+            AstKind::ArrowFunctionExpression(function) => {
+                function.r#async || !is_iife(ancestor, ctx.semantic())
+            }
+            AstKind::PropertyDefinition(property) => {
+                !property.r#static
+                    && property
+                        .value
+                        .as_ref()
+                        .is_some_and(|value| value.span().contains_inclusive(reference_span))
+            }
+            AstKind::AccessorProperty(property) => {
+                !property.r#static
+                    && property
+                        .value
+                        .as_ref()
+                        .is_some_and(|value| value.span().contains_inclusive(reference_span))
+            }
+            AstKind::TSModuleBlock(_) => true,
+            _ => false,
+        })
 }
 
 fn is_outer_enum(
     symbol_id: SymbolId,
     symbol_flags: SymbolFlags,
-    reference_scope_id: ScopeId,
+    reference_node: &AstNode<'_>,
     ctx: &LintContext<'_>,
 ) -> bool {
-    symbol_flags.is_enum()
-        && get_parent_variable_scope(ctx.scoping().symbol_scope_id(symbol_id), ctx)
-            != get_parent_variable_scope(reference_scope_id, ctx)
+    symbol_flags.is_enum() && is_from_separate_execution_context(symbol_id, reference_node, ctx)
 }
 
 fn is_typedef(symbol_id: SymbolId, ctx: &LintContext<'_>) -> bool {
@@ -292,7 +346,7 @@ fn is_defined_before_use(
     let defined_before_reference =
         ctx.scoping().symbol_span(symbol_id).end <= reference_node.kind().span().end;
     defined_before_reference
-        && !(reference.is_value() && is_in_initializer(symbol_id, reference, reference_node, ctx))
+        && !(reference.is_value() && is_in_initializer(symbol_id, reference_node, ctx))
 }
 
 fn unresolved_initializer_reference_declaration_span(
@@ -308,12 +362,12 @@ fn unresolved_initializer_reference_declaration_span(
 
 fn binding_pattern_name_span(pattern: &BindingPattern<'_>, name: &str) -> Option<Span> {
     let mut declaration_span = None;
-    pattern.all_binding_identifiers(&mut |identifier| {
+    pattern.any_binding_identifiers(&mut |identifier| {
         if identifier.name == name {
             declaration_span = Some(identifier.span);
-            false
-        } else {
             true
+        } else {
+            false
         }
     });
     declaration_span
@@ -349,10 +403,9 @@ where
         match ancestor.kind() {
             AstKind::FormalParameter(formal_parameter) => {
                 if let Some(declaration_span) = find_declaration_span(&formal_parameter.pattern)
-                    && formal_parameter
-                        .initializer
-                        .as_ref()
-                        .is_some_and(|init| is_in_range(init.span(), reference_location))
+                    && formal_parameter.initializer.as_ref().is_some_and(|init| {
+                        init.span().contains_inclusive(Span::empty(reference_location))
+                    })
                 {
                     return Some(declaration_span);
                 }
@@ -362,11 +415,9 @@ where
                     continue;
                 };
 
-                if declarator
-                    .init
-                    .as_ref()
-                    .is_some_and(|init| is_in_range(init.span(), reference_location))
-                {
+                if declarator.init.as_ref().is_some_and(|init| {
+                    init.span().contains_inclusive(Span::empty(reference_location))
+                }) {
                     return Some(declaration_span);
                 }
 
@@ -376,11 +427,11 @@ where
                     if matches!(
                         grand_parent.kind(),
                         AstKind::ForInStatement(for_in)
-                            if is_in_range(for_in.right.span(), reference_location)
+                            if for_in.right.span().contains_inclusive(Span::empty(reference_location))
                     ) || matches!(
                         grand_parent.kind(),
                         AstKind::ForOfStatement(for_of)
-                            if is_in_range(for_of.right.span(), reference_location)
+                            if for_of.right.span().contains_inclusive(Span::empty(reference_location))
                     ) {
                         return Some(declaration_span);
                     }
@@ -390,7 +441,10 @@ where
             }
             AstKind::AssignmentPattern(assignment_pattern) => {
                 if let Some(declaration_span) = find_declaration_span(&assignment_pattern.left)
-                    && is_in_range(assignment_pattern.right.span(), reference_location)
+                    && assignment_pattern
+                        .right
+                        .span()
+                        .contains_inclusive(Span::empty(reference_location))
                 {
                     return Some(declaration_span);
                 }
@@ -398,7 +452,7 @@ where
             AstKind::ForInStatement(for_in) => {
                 if let Some(declaration_span) =
                     for_statement_left_declaration_span(&for_in.left, &mut find_declaration_span)
-                    && is_in_range(for_in.right.span(), reference_location)
+                    && for_in.right.span().contains_inclusive(Span::empty(reference_location))
                 {
                     return Some(declaration_span);
                 }
@@ -406,7 +460,7 @@ where
             AstKind::ForOfStatement(for_of) => {
                 if let Some(declaration_span) =
                     for_statement_left_declaration_span(&for_of.left, &mut find_declaration_span)
-                    && is_in_range(for_of.right.span(), reference_location)
+                    && for_of.right.span().contains_inclusive(Span::empty(reference_location))
                 {
                     return Some(declaration_span);
                 }
@@ -416,7 +470,9 @@ where
             | AstKind::ArrowFunctionExpression(_)
             | AstKind::CatchClause(_)
             | AstKind::ImportDeclaration(_)
-            | AstKind::ExportNamedDeclaration(_) => break,
+            | AstKind::ExportDeclaration(_)
+            | AstKind::ExportNamedDeclaration(_)
+            | AstKind::ExportFromDeclaration(_) => break,
             _ => {}
         }
     }
@@ -426,10 +482,48 @@ where
 
 fn is_in_initializer(
     symbol_id: SymbolId,
-    _reference: &Reference,
     reference_node: &AstNode<'_>,
     ctx: &LintContext<'_>,
 ) -> bool {
+    if is_from_separate_execution_context(symbol_id, reference_node, ctx) {
+        return false;
+    }
+
+    let reference_span = reference_node.kind().span();
+    if let AstKind::Class(class) = ctx.symbol_declaration(symbol_id).kind() {
+        if !class.span.contains_inclusive(reference_span) {
+            return false;
+        }
+
+        return !class.body.body.iter().any(|element| match element {
+            ClassElement::StaticBlock(block) => block.span.contains_inclusive(reference_span),
+            ClassElement::PropertyDefinition(property) => {
+                property.r#static
+                    && property
+                        .value
+                        .as_ref()
+                        .is_some_and(|value| value.span().contains_inclusive(reference_span))
+            }
+            ClassElement::AccessorProperty(property) => {
+                property.r#static
+                    && property
+                        .value
+                        .as_ref()
+                        .is_some_and(|value| value.span().contains_inclusive(reference_span))
+            }
+            _ => false,
+        });
+    }
+
+    if let AstKind::VariableDeclarator(declarator) = ctx.symbol_declaration(symbol_id).kind()
+        && declarator
+            .init
+            .as_ref()
+            .is_some_and(|init| init.span().contains_inclusive(reference_span))
+    {
+        return true;
+    }
+
     let declaration_span = ctx.scoping().symbol_span(symbol_id);
     initializer_reference_declaration_span(reference_node, ctx, |pattern| {
         pattern.span().contains_inclusive(declaration_span).then_some(declaration_span)
@@ -477,12 +571,7 @@ fn get_parent_variable_scope(scope_id: ScopeId, ctx: &LintContext<'_>) -> ScopeI
         .unwrap_or_else(|| ctx.scoping().root_scope_id())
 }
 
-fn is_in_range(span: Span, location: u32) -> bool {
-    span.start <= location && location <= span.end
-}
-
 #[test]
-#[ignore = "eslint test cases are failing"]
 fn test() {
     use crate::tester::Tester;
 
@@ -1256,7 +1345,6 @@ fn test() {
         ("a(); var a=function() {};", Some(serde_json::json!(["nofunc"]))),
         ("(() => { alert(a); var a = 42; })();", None), // { "ecmaVersion": 6 },
         ("(() => a())(); function a() { }", None),      // { "ecmaVersion": 6 },
-        (r#""use strict"; a(); { function a() {} }"#, None),
         ("a(); try { throw new Error() } catch (foo) {var a;}", None),
         ("var f = () => a; var a;", None), // { "ecmaVersion": 6 },
         ("new A(); class A {};", None),    // { "ecmaVersion": 6 },
@@ -2535,6 +2623,17 @@ fn test_typescript_eslint() {
                 ",
             None,
         ),
+        ("a(); function a() { alert(arguments); }", Some(serde_json::json!(["nofunc"]))),
+        (
+            "
+            a();
+            function a() {
+              alert(arguments);
+            }
+                  ",
+            Some(serde_json::json!(["nofunc"])),
+        ),
+        (r#""use strict"; { a(); function a() {} }"#, Some(serde_json::json!(["nofunc"]))),
     ];
 
     let fail = vec![
@@ -3001,9 +3100,30 @@ fn test_typescript_eslint() {
                   ",
             None,
         ),
+        ("a(); var a=function() {};", Some(serde_json::json!(["nofunc"]))),
+        (
+            "
+            a();
+            var a = function () {};
+                  ",
+            Some(serde_json::json!(["nofunc"])),
+        ),
+        ("export { a }; const a = 1;", Some(serde_json::json!(["nofunc"]))),
     ];
 
     Tester::new(NoUseBeforeDefine::NAME, NoUseBeforeDefine::PLUGIN, pass, fail)
         .with_snapshot_suffix("typescript-eslint")
         .test_and_snapshot();
+}
+
+#[test]
+fn test_javascript() {
+    use crate::tester::Tester;
+
+    let pass = vec!["const a = 1;"];
+    let fail = vec!["const a = b; const b = 1;"];
+
+    Tester::new(NoUseBeforeDefine::NAME, NoUseBeforeDefine::PLUGIN, pass, fail)
+        .change_rule_path_extension("js")
+        .test();
 }

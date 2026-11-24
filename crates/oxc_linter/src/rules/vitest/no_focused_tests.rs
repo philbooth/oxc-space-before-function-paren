@@ -1,10 +1,11 @@
+use oxc_ast::AstKind;
 use oxc_macros::declare_oxc_lint;
+use oxc_semantic::AstNode;
 
 use crate::{
-    context::LintContext,
+    context::{ContextHost, LintContext},
     rule::Rule,
     rules::shared::no_focused_tests::{DOCUMENTATION, run},
-    utils::PossibleJestNode,
 };
 
 #[derive(Debug, Default, Clone)]
@@ -14,23 +15,26 @@ declare_oxc_lint!(
     NoFocusedTests,
     vitest,
     correctness,
-    fix,
+    recommended,
+    suggestion,
     docs = DOCUMENTATION,
     version = "0.0.8",
 );
 
 impl Rule for NoFocusedTests {
-    fn run_on_jest_node<'a, 'c>(
-        &self,
-        jest_node: &PossibleJestNode<'a, 'c>,
-        ctx: &'c LintContext<'a>,
-    ) {
-        run(jest_node, ctx);
+    fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
+        let AstKind::CallExpression(_) = node.kind() else { return };
+        run(node, ctx);
+    }
+
+    fn should_run(&self, ctx: &ContextHost) -> bool {
+        ctx.frameworks().is_test()
     }
 }
 
 #[test]
 fn test() {
+    use crate::fixer::FixKind;
     use crate::tester::Tester;
 
     let mut pass = vec![
@@ -73,8 +77,13 @@ fn test() {
     ];
 
     let mut fix = vec![
-        ("describe.only('foo', () => {})", "describe('foo', () => {})", None),
-        ("describe['only']('foo', () => {})", "describe('foo', () => {})", None),
+        ("describe.only('foo', () => {})", "describe('foo', () => {})", None, FixKind::Suggestion),
+        (
+            "describe['only']('foo', () => {})",
+            "describe('foo', () => {})",
+            None,
+            FixKind::Suggestion,
+        ),
     ];
 
     let pass_vitest = vec![
@@ -100,12 +109,37 @@ fn test() {
     ];
 
     let fix_vitest = vec![
-        (r#"it.only("test", () => {});"#, r#"it("test", () => {});"#, None),
-        (r#"describe.only("test", () => {});"#, r#"describe("test", () => {});"#, None),
-        (r#"test.only("test", () => {});"#, r#"test("test", () => {});"#, None),
-        (r#"it.only.each([])("test", () => {});"#, r#"it.each([])("test", () => {});"#, None),
-        (r#"test.only.each``("test", () => {});"#, r#"test.each``("test", () => {});"#, None),
-        (r#"it.only.each``("test", () => {});"#, r#"it.each``("test", () => {});"#, None),
+        (r#"it.only("test", () => {});"#, r#"it("test", () => {});"#, None, FixKind::Suggestion),
+        (
+            r#"describe.only("test", () => {});"#,
+            r#"describe("test", () => {});"#,
+            None,
+            FixKind::Suggestion,
+        ),
+        (
+            r#"test.only("test", () => {});"#,
+            r#"test("test", () => {});"#,
+            None,
+            FixKind::Suggestion,
+        ),
+        (
+            r#"it.only.each([])("test", () => {});"#,
+            r#"it.each([])("test", () => {});"#,
+            None,
+            FixKind::Suggestion,
+        ),
+        (
+            r#"test.only.each``("test", () => {});"#,
+            r#"test.each``("test", () => {});"#,
+            None,
+            FixKind::Suggestion,
+        ),
+        (
+            r#"it.only.each``("test", () => {});"#,
+            r#"it.each``("test", () => {});"#,
+            None,
+            FixKind::Suggestion,
+        ),
     ];
 
     pass.extend(pass_vitest);

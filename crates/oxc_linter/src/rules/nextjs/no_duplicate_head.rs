@@ -70,7 +70,9 @@ declare_oxc_lint!(
     NoDuplicateHead,
     nextjs,
     correctness,
+    recommended,
     version = "0.3.3",
+    short_description = "Prevent duplicate usage of `<Head>` in `pages/_document.js`.",
 );
 
 impl Rule for NoDuplicateHead {
@@ -86,7 +88,7 @@ impl Rule for NoDuplicateHead {
         };
 
         let scoping = ctx.scoping();
-        let symbol_id = head_specifier.local().symbol_id();
+        let symbol_id = head_specifier.symbol_id();
 
         let flags = scoping.symbol_flags(symbol_id);
         if !flags.is_import() {

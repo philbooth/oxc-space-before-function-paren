@@ -57,14 +57,16 @@ declare_oxc_lint!(
     PreferModule,
     unicorn,
     restriction,
+    recommended,
     pending,
     version = "1.50.0",
+    short_description = "Prefer JavaScript modules (ESM) over CommonJS.",
 );
 
 impl Rule for PreferModule {
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
         match node.kind() {
-            AstKind::Directive(directive) if directive.directive == "use strict" => {
+            AstKind::Directive(directive) if directive.is_use_strict() => {
                 ctx.diagnostic(use_strict_directive_diagnostic(directive.span));
             }
             AstKind::ReturnStatement(return_statement) if is_top_level_return(node, ctx) => {
@@ -267,7 +269,6 @@ fn test() {
         (r#"const {foo} = require( (("foo")) );"#, None, None, None),
         (r#"const {foo} = ((require))("foo");"#, None, None, None),
         (r#"const {foo} = (( require("foo") ));"#, None, None, None),
-        (r#"const {foo} = (( require("foo") ));"#, None, None, None),
         (r#"const {foo: foo}=require("foo");"#, None, None, None),
         (
             r#"const {foo: foo}
@@ -281,7 +282,6 @@ fn test() {
         (r#"const {foo: foo} = require( (("foo")) );"#, None, None, None),
         (r#"const {foo: foo} = ((require))("foo");"#, None, None, None),
         (r#"const {foo: foo} = (( require("foo") ));"#, None, None, None),
-        (r#"const {foo: foo} = (( require("foo") ));"#, None, None, None),
         (r#"const {foo:bar}=require("foo");"#, None, None, None),
         (
             r#"const {foo:bar}
@@ -294,7 +294,6 @@ fn test() {
         (r#"const {foo:bar} = require("foo");"#, None, None, None),
         (r#"const {foo:bar} = require( (("foo")) );"#, None, None, None),
         (r#"const {foo:bar} = ((require))("foo");"#, None, None, None),
-        (r#"const {foo:bar} = (( require("foo") ));"#, None, None, None),
         (r#"const {foo:bar} = (( require("foo") ));"#, None, None, None),
         (r#"const {a   :foo, b:   bar, default   :   baz}=require("foo");"#, None, None, None),
         (
@@ -375,7 +374,6 @@ fn test() {
             None,
         ),
         (r#"const foo = require("foo"), bar = 1;"#, None, None, None),
-        (r#"const foo = require("foo"), bar = require("bar");"#, None, None, None),
         ("exports = foo;", None, None, None),
         ("module.exports = foo;", None, None, None),
         ("(( ((exports)) = ((foo)) ));", None, None, None),

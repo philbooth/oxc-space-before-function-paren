@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use nodejs_built_in_modules::is_nodejs_builtin_module;
 use oxc_ast::{
     AstKind,
@@ -12,7 +14,11 @@ use serde::{Deserialize, Serialize};
 
 use serde_json::Value;
 
-use crate::{AstNode, context::LintContext, rule::Rule};
+use crate::{
+    AstNode,
+    context::LintContext,
+    rule::{MixedTupleRuleConfig, Rule},
+};
 
 fn extension_should_not_be_included_in_diagnostic(
     span: Span,
@@ -96,6 +102,42 @@ impl PathGroupOverride {
     }
 }
 
+#[derive(Debug, Clone, JsonSchema)]
+#[serde(rename_all = "lowercase", deny_unknown_fields)]
+#[expect(dead_code)]
+struct PathGroupOverrideConfig {
+    /// Glob pattern to match import specifiers.
+    pattern: String,
+    /// Action to take when pattern matches.
+    action: PathGroupAction,
+}
+
+#[derive(Debug, Clone, Default, JsonSchema)]
+#[serde(transparent)]
+#[expect(dead_code)]
+struct ExtensionRulesConfig(FxHashMap<String, ExtensionRule>);
+
+#[derive(Debug, Clone, Default, JsonSchema)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
+struct ImportExtensionsConfig {
+    /// Whether to ignore package imports when enforcing extension rules.
+    ignore_packages: bool,
+    /// Whether to check type imports when enforcing extension rules.
+    check_type_imports: bool,
+    /// Per-extension rules.
+    pattern: ExtensionRulesConfig,
+    /// Path group overrides for bespoke import specifiers.
+    path_group_overrides: Vec<PathGroupOverrideConfig>,
+}
+
+#[derive(Debug, Clone, JsonSchema)]
+#[serde(untagged)]
+#[expect(dead_code)]
+enum ImportExtensionsObject {
+    Config(ImportExtensionsConfig),
+    Extensions(FxHashMap<String, ExtensionRule>),
+}
+
 /// This rule accepts three types of configuration:
 ///
 /// 1. **Global rule** (string): `"always"`, `"never"`, or `"ignorePackages"`
@@ -146,7 +188,7 @@ impl PathGroupOverride {
 /// **Default behavior (no configuration)**: All imports - of all kinds - pass.
 /// Unconfigured file extensions are ignored, to avoid false positives.
 #[derive(Debug, Clone, JsonSchema, Serialize, Default)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct ExtensionsConfig {
     /// Whether to ignore package imports when enforcing extension rules.
     ///
@@ -319,37 +361,28 @@ impl ExtensionsConfig {
                 (default, false)
             };
 
-        let ignore_packages =
-            value.get("ignorePackages").and_then(Value::as_bool).unwrap_or(default_ignore_packages);
+        let ignore_packages = default_ignore_packages
+            || value.get("ignorePackages").and_then(Value::as_bool).unwrap_or_default();
         let check_type_imports =
             value.get("checkTypeImports").and_then(Value::as_bool).unwrap_or_default();
 
         // Parse pathGroupOverrides if present
-        let path_group_overrides = value
-            .get("pathGroupOverrides")
-            .and_then(Value::as_array)
-            .map(|overrides| {
+        let path_group_overrides =
+            value.get("pathGroupOverrides").and_then(Value::as_array).map_or_default(|overrides| {
                 overrides
                     .iter()
                     .filter_map(|override_val| {
                         serde_json::from_value::<PathGroupOverride>(override_val.clone()).ok()
                     })
                     .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
+            });
 
-        // Pre-allocate HashMap with estimated capacity for better performance
-        let capacity = if let Some(obj) = value.as_object() {
-            // Estimate: most fields are extension configs, reserve space
-            obj.len()
-        } else {
-            0
-        };
-
+        let extension_rules = value.get("pattern").unwrap_or(value);
+        let capacity = extension_rules.as_object().map_or(0, serde_json::Map::len);
         let mut extensions = FxHashMap::with_capacity_and_hasher(capacity, FxBuildHasher);
 
         // Process known extensions from the configuration
-        if let Some(obj) = value.as_object() {
+        if let Some(obj) = extension_rules.as_object() {
             for (key, val) in obj {
                 // Skip non-extension config fields
                 if matches!(
@@ -472,8 +505,9 @@ declare_oxc_lint!(
     Extensions,
     import,
     restriction,
-    config = ExtensionsConfig,
+    config = MixedTupleRuleConfig<ExtensionRule, ImportExtensionsObject>,
     version = "1.2.0",
+    short_description = "Enforce consistent use of file extensions in import paths.",
 );
 
 impl Rule for Extensions {
@@ -482,9 +516,7 @@ impl Rule for Extensions {
             let default = ExtensionRule::from_str(first_arg);
 
             if let Some(val) = value.get(1) {
-                let root = val.get("pattern").unwrap_or(val);
-
-                let config = ExtensionsConfig::from_json_value(root, default);
+                let config = ExtensionsConfig::from_json_value(val, default);
 
                 Ok(Self(Box::new(config)))
             } else {
@@ -510,10 +542,12 @@ impl Rule for Extensions {
             return;
         }
         for argument in &call_expr.arguments {
-            if let Argument::StringLiteral(s) = argument {
+            if let Argument::StringLiteral(s) = argument
+                && let Some(source) = s.value.as_str()
+            {
                 self.process_import(
                     ctx,
-                    s.value.as_str(),
+                    source,
                     call_expr.span,
                     false, // require() is never a type import
                     true,  // treat require as import for diagnostics
@@ -551,8 +585,20 @@ impl Extensions {
     ) {
         let config = &self.0;
 
-        // Prefer resolved extension (actual file), fallback to written extension (import text)
-        let extension_to_check = resolved_extension.or(written_extension);
+        // Prefer the resolved extension, but honor an explicitly-written genuine extension that
+        // differs from it: TS ESM `import './foo.js'` resolves to `./foo.ts`, yet `js: never`
+        // must still flag the written `.js`. "Genuine" excludes compound-name parts like
+        // `.stories` in `./foo.stories` (which resolves to `foo.stories.tsx`).
+        let written_is_genuine_extension = written_extension.is_some_and(|written| {
+            resolved_extension != Some(written)
+                && (ExtensionsConfig::is_standard_extension(written) || config.has_rule(written))
+        });
+
+        let extension_to_check = if written_is_genuine_extension {
+            written_extension
+        } else {
+            resolved_extension.or(written_extension)
+        };
 
         if let Some(ext_str) = extension_to_check {
             // Skip validation for unconfigured extensions (prevents false positives)
@@ -569,7 +615,10 @@ impl Extensions {
             // For files with multiple extensions (e.g., foo.stories.tsx), we need to check
             // if the ACTUAL file extension (resolved) matches what's written in the import.
             // If resolved is "tsx" but written is "stories", then tsx is NOT written.
-            let extension_is_written = if let Some(resolved) = resolved_extension {
+            let extension_is_written = if written_is_genuine_extension {
+                // The specifier explicitly ends with this genuine extension.
+                true
+            } else if let Some(resolved) = resolved_extension {
                 // If we have a resolved extension, check if it matches the written extension
                 written_extension == Some(resolved)
             } else {
@@ -615,6 +664,14 @@ impl Extensions {
         is_import: bool,
     ) {
         let config = &self.0;
+
+        // Default / empty config: nothing is enforced (all imports pass).
+        if config.require_extension.is_none()
+            && config.extensions.is_empty()
+            && config.path_group_overrides.is_empty()
+        {
+            return;
+        }
 
         // Type imports check (only for ESM, always false for require)
         if is_type_import && !config.check_type_imports {
@@ -766,17 +823,16 @@ fn is_package_import(module_name: &str) -> bool {
 /// - `"./foo"` → `None`
 /// - `"./foo."` → `None` (empty extension)
 /// - `"./foo.bar/"` → `None` (directory path)
-fn get_file_extension_from_module_name(module_name: &str) -> Option<String> {
+fn get_file_extension_from_module_name(module_name: &str) -> Option<Cow<'_, str>> {
     use cow_utils::CowUtils;
-    if let Some((_, extension)) =
-        module_name.split('?').next().unwrap_or(module_name).rsplit_once('.')
-        && !extension.is_empty()
-        && !extension.starts_with('/')
-    {
-        return Some(extension.cow_to_ascii_lowercase().into_owned());
+    let path = module_name.split_once('?').map_or(module_name, |(path, _)| path);
+    let file_name = path.rsplit_once('/').map_or(path, |(_, file_name)| file_name);
+    let (_, extension) = file_name.rsplit_once('.')?;
+    if extension.is_empty() {
+        return None;
     }
 
-    None
+    Some(extension.cow_to_ascii_lowercase())
 }
 
 /// Get the actual file extension from the resolved module path.
@@ -811,6 +867,8 @@ fn test() {
     use serde_json::json;
 
     let pass = vec![
+        // A `require()` specifier with a lone surrogate is not checked.
+        (r#"const foo = require("./foo\uD800");"#, Some(json!(["always"]))),
         // Default config: no extension requirements, unconfigured extensions are ignored
         (r#"import a from "@/a""#, None),
         (r#"import a from "a""#, None),
@@ -1259,6 +1317,8 @@ fn test() {
         (r"import { Component } from './Component.stories';", Some(json!([{ "tsx": "never" }]))),
         (r"import { testUtil } from './utils.test';", Some(json!([{ "ts": "never" }]))),
         (r"import { helper } from './helper.spec';", Some(json!([{ "js": "never" }]))),
+        // `./typescript.js` resolves to `typescript.ts`; the written `.js` is allowed under `js: always`.
+        (r#"import x from "./typescript.js";"#, Some(json!(["always", { "js": "always" }]))),
         // Subpath imports
         // https://nodejs.org/api/packages.html#subpath-imports
         // (
@@ -1273,6 +1333,31 @@ fn test() {
         //     r##"import internalZ from "#internal/z.js";"##,
         //     Some(json!(["always"])),
         // ),
+        (
+            r"import notes from './notes.md?raw';",
+            Some(json!([
+                "never",
+                {
+                    "pattern": { "js": "never" },
+                    "pathGroupOverrides": [{ "pattern": "**/*.md?raw", "action": "ignore" }]
+                }
+            ])),
+        ),
+        (
+            r"import lodash from 'lodash';",
+            Some(json!(["always", { "pattern": { "js": "always" }, "ignorePackages": true }])),
+        ),
+        (
+            r"import foo from '@scope/pkg/subpath';",
+            Some(json!([
+                "ignorePackages",
+                { "pattern": { "js": "always" }, "ignorePackages": false }
+            ])),
+        ),
+        (
+            r"import foo from '@scope/pkg/subpath';",
+            Some(json!(["ignorePackages", { "js": "always", "ignorePackages": false }])),
+        ),
     ];
 
     let fail = vec![
@@ -1692,6 +1777,9 @@ fn test() {
         (r"import x from './foo#section';", Some(json!(["always"]))),
         // Edge case fail: Path alias without extension
         (r"import x from '@/components/Button';", Some(json!(["always"]))),
+        // Edge case fail: Dot in a directory segment is not a written file extension
+        (r"import x from './foo.bar/baz';", Some(json!(["always"]))),
+        (r"import x from './foo.bar/';", Some(json!(["always"]))),
         // Edge case fail: Mixed - some with, some without extensions
         (
             r"
@@ -1737,6 +1825,14 @@ fn test() {
             Some(json!(["never", { "ts": "never" }])),
         ),
         (r"import utils from './utils.spec.js';", Some(json!(["never", { "js": "never" }]))),
+        // `./typescript.js` resolves to `typescript.ts`, but the written `.js` must still be flagged under `never`.
+        (
+            r#"import def from "./typescript.js";"#,
+            Some(json!(["never", { "checkTypeImports": true, "js": "never" }])),
+        ),
+        (r#"import x from "./typescript.js";"#, Some(json!(["never"]))),
+        (r#"import x from "./typescript.js";"#, Some(json!([{ "js": "never" }]))),
+        (r#"import x from "./typescript.js";"#, Some(json!(["always", { "js": "never" }]))),
         // TODO: This should probably fail? Needs further investigation.
         // (
         //     r"import useState from '@foo/bar/useState';",

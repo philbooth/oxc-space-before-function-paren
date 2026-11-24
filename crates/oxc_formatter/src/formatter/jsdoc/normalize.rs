@@ -3,6 +3,10 @@ use std::fmt::Write as _;
 
 use cow_utils::CowUtils;
 
+use oxc_syntax::line_terminator::{LineTerminatorSplitter, is_line_terminator};
+
+use crate::options::QuoteStyle;
+
 /// Normalize JSDoc tag aliases to their canonical form.
 /// Matches prettier-plugin-jsdoc's `TAGS_SYNONYMS` from `roles.ts`.
 pub fn normalize_tag_kind(kind: &str) -> &str {
@@ -28,196 +32,6 @@ pub fn normalize_tag_kind(kind: &str) -> &str {
         // @linkcode, @linkplain are also NOT normalized to @link.
         _ => kind,
     }
-}
-
-/// Normalize markdown emphasis markers:
-/// - `__text__` → `**text**` (double underscore bold → asterisk bold)
-/// - `*text*` → `_text_` (single asterisk italic → underscore italic)
-///
-/// Matches prettier-plugin-jsdoc which normalizes emphasis through remark.
-/// Bold uses `**`, italic uses `_`.
-pub fn normalize_markdown_emphasis(text: &str) -> Cow<'_, str> {
-    if !text.contains("__") && !text.contains('*') {
-        return Cow::Borrowed(text);
-    }
-
-    // Read-only scan: check if any emphasis change would actually occur,
-    // avoiding a heap allocation when `*` or `__` appear only inside code spans.
-    if !emphasis_needs_change(text.as_bytes()) {
-        return Cow::Borrowed(text);
-    }
-
-    // Work with bytes directly — all significant chars (_, *, `, whitespace)
-    // are ASCII single-byte, so byte-level mutation is safe and uses ~3x less
-    // memory than Vec<char>.
-    let mut bytes: Vec<u8> = text.as_bytes().to_vec();
-    let len = bytes.len();
-    let mut i = 0;
-    let mut in_code = false;
-
-    // First pass: convert `__` → `**`
-    while i < len {
-        if bytes[i] == b'`' {
-            in_code = !in_code;
-            i += 1;
-            continue;
-        }
-        if in_code {
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'_' && i + 1 < len && bytes[i + 1] == b'_' {
-            bytes[i] = b'*';
-            bytes[i + 1] = b'*';
-            i += 2;
-            continue;
-        }
-        i += 1;
-    }
-
-    // Second pass: convert single `*text*` → `_text_`
-    // Skip `**` (bold) and content inside backticks.
-    in_code = false;
-    i = 0;
-    while i < len {
-        if bytes[i] == b'`' {
-            in_code = !in_code;
-            i += 1;
-            continue;
-        }
-        if in_code {
-            i += 1;
-            continue;
-        }
-
-        // Skip `**` (bold markers)
-        if bytes[i] == b'*' && i + 1 < len && bytes[i + 1] == b'*' {
-            i += 2;
-            continue;
-        }
-
-        // Single `*` — check if it's an opening emphasis marker:
-        // Must be followed by a non-whitespace character
-        if bytes[i] == b'*' && i + 1 < len && !bytes[i + 1].is_ascii_whitespace() {
-            // Look for matching closing `*`
-            let opener = i;
-            let mut j = opener + 1;
-            while j < len {
-                if bytes[j] == b'`' {
-                    // Skip inline code spans
-                    j += 1;
-                    while j < len && bytes[j] != b'`' {
-                        j += 1;
-                    }
-                    if j < len {
-                        j += 1;
-                    }
-                    continue;
-                }
-                // Skip `**` inside emphasis
-                if bytes[j] == b'*' && j + 1 < len && bytes[j + 1] == b'*' {
-                    j += 2;
-                    continue;
-                }
-                // Found closing `*`: must be preceded by non-whitespace
-                if bytes[j] == b'*' && j > opener + 1 && !bytes[j - 1].is_ascii_whitespace() {
-                    bytes[opener] = b'_';
-                    bytes[j] = b'_';
-                    i = j + 1;
-                    break;
-                }
-                j += 1;
-            }
-            if i <= opener {
-                i = opener + 1;
-            }
-            continue;
-        }
-
-        i += 1;
-    }
-
-    // We only replaced ASCII bytes (_, *) with other ASCII bytes (*, _),
-    // so UTF-8 validity is preserved.
-    Cow::Owned(String::from_utf8(bytes).unwrap())
-}
-
-/// Read-only scan that checks whether `normalize_markdown_emphasis` would
-/// actually change any bytes. Runs the same two-pass logic without mutation.
-fn emphasis_needs_change(bytes: &[u8]) -> bool {
-    let len = bytes.len();
-    let mut i = 0;
-    let mut in_code = false;
-
-    // Pass 1: would any `__` outside code be converted to `**`?
-    while i < len {
-        if bytes[i] == b'`' {
-            in_code = !in_code;
-            i += 1;
-            continue;
-        }
-        if in_code {
-            i += 1;
-            continue;
-        }
-        if bytes[i] == b'_' && i + 1 < len && bytes[i + 1] == b'_' {
-            return true;
-        }
-        i += 1;
-    }
-
-    // Pass 2: would any single `*text*` outside code be converted to `_text_`?
-    // After pass 1, `__` would become `**`, so `**` sequences need to be skipped.
-    // Since we're read-only, `__` is still `__` — but the mutation pass would have
-    // converted it. We simulate that by also skipping `__` as if it were `**`.
-    in_code = false;
-    i = 0;
-    while i < len {
-        if bytes[i] == b'`' {
-            in_code = !in_code;
-            i += 1;
-            continue;
-        }
-        if in_code {
-            i += 1;
-            continue;
-        }
-        // Skip `**` and `__` (which would become `**` after pass 1)
-        if (bytes[i] == b'*' || bytes[i] == b'_') && i + 1 < len && bytes[i + 1] == bytes[i] {
-            i += 2;
-            continue;
-        }
-        // Single `*` — check for matching closing emphasis
-        if bytes[i] == b'*' && i + 1 < len && !bytes[i + 1].is_ascii_whitespace() {
-            let opener = i;
-            let mut j = opener + 1;
-            while j < len {
-                if bytes[j] == b'`' {
-                    j += 1;
-                    while j < len && bytes[j] != b'`' {
-                        j += 1;
-                    }
-                    if j < len {
-                        j += 1;
-                    }
-                    continue;
-                }
-                if bytes[j] == b'*' && j + 1 < len && bytes[j + 1] == b'*' {
-                    j += 2;
-                    continue;
-                }
-                if bytes[j] == b'*' && j > opener + 1 && !bytes[j - 1].is_ascii_whitespace() {
-                    return true;
-                }
-                j += 1;
-            }
-            i = opener + 1;
-            continue;
-        }
-        i += 1;
-    }
-
-    false
 }
 
 /// Capitalize the first ASCII lowercase letter of a string.
@@ -283,52 +97,31 @@ pub fn append_trailing_dot(s: &str) -> Cow<'_, str> {
     Cow::Borrowed(s)
 }
 
-/// Strip JSDoc `*` continuation prefixes from multi-line type content.
+/// Strip JSDoc `*` continuation prefixes from multi-line type or name content,
+/// joining the lines with `separator`.
 ///
 /// When a type expression spans multiple lines inside a JSDoc block, the raw
 /// content extracted by the parser includes `\n   *   ` prefixes from the
-/// continuation lines. This function joins lines by replacing each
-/// `\n<whitespace>*<optional space>` with a single space.
-fn strip_jsdoc_continuation_prefixes(s: &str) -> String {
+/// continuation lines.
+/// Each `<line terminator><whitespace>*<optional space>` is replaced with `separator`:
+/// - `' '` collapses the type to one line for normalization
+/// - `'\n'` keeps its lines for the TS formatter,
+///   as upstream's `comment-parser` strips `*` prefixes but keeps the newlines for `formatType()`
+///
+/// NOTE: This compensates for `oxc_jsdoc`'s `JSDocTagTypePart::parsed()` and `JSDocTagTypeNamePart::raw()`
+/// returning the raw source text, `*` prefixes and line terminators included;
+/// the upgrade path is to strip them there.
+pub fn strip_jsdoc_star_prefixes(s: &str, separator: char) -> String {
     let mut result = String::with_capacity(s.len());
-    for (i, line) in s.lines().enumerate() {
+    for (i, line) in LineTerminatorSplitter::new(s).enumerate() {
         if i == 0 {
             result.push_str(line);
             continue;
         }
-        result.push(' ');
+        result.push(separator);
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed.strip_prefix('*') {
             // Strip the `*` and optional single space after it
-            let rest = rest.strip_prefix(' ').unwrap_or(rest);
-            result.push_str(rest);
-        } else {
-            result.push_str(trimmed);
-        }
-    }
-    result
-}
-
-/// Strip JSDoc `*` continuation prefixes but **preserve newlines**.
-///
-/// Similar to `strip_jsdoc_continuation_prefixes()` but keeps `\n` instead
-/// of collapsing to spaces. This preserves multi-line type structure so the
-/// TS formatter receives multi-line input and maintains the line breaks.
-/// Matches upstream behavior where `comment-parser` strips `*` prefixes
-/// but the type retains its newline structure for `formatType()`.
-pub fn strip_jsdoc_stars_preserve_newlines(s: &str) -> String {
-    if !s.contains('\n') {
-        return s.to_string();
-    }
-    let mut result = String::with_capacity(s.len());
-    for (i, line) in s.lines().enumerate() {
-        if i == 0 {
-            result.push_str(line);
-            continue;
-        }
-        result.push('\n');
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix('*') {
             let rest = rest.strip_prefix(' ').unwrap_or(rest);
             result.push_str(rest);
         } else {
@@ -345,31 +138,37 @@ pub fn strip_jsdoc_stars_preserve_newlines(s: &str) -> String {
 /// - `...Type` → `...Type` (with normalized spacing)
 /// - `Array.<T>` / `Array<T>` → `T[]`
 /// - `Foo.<T>` → `Foo<T>` (Closure Compiler dot syntax)
-/// - Single quotes → double quotes in import() paths
+/// - Quotes in import() paths normalized to the configured quote style
 /// - Normalize whitespace and operator spacing
 ///
 /// Matches prettier-plugin-jsdoc's `convertToModernType()` which uses
 /// `withoutStrings()` to protect quoted strings during transformation.
-pub fn normalize_type(type_str: &str) -> Cow<'_, str> {
-    normalize_type_impl(type_str, true)
+pub fn normalize_type(type_str: &str, quote_style: QuoteStyle) -> Cow<'_, str> {
+    normalize_type_impl(type_str, true, quote_style)
 }
 
 /// Normalize type but preserve original quotes.
 /// Used for `@type`, `@typedef`, `@satisfies` where the plugin keeps the type
 /// mostly as-is (via `getUpdatedType()` in stringify.ts).
 pub fn normalize_type_preserve_quotes(type_str: &str) -> Cow<'_, str> {
-    normalize_type_impl(type_str, false)
+    normalize_type_impl(type_str, false, QuoteStyle::Double)
 }
 
-fn normalize_type_impl(type_str: &str, convert_quotes: bool) -> Cow<'_, str> {
+fn normalize_type_impl(
+    type_str: &str,
+    convert_quotes: bool,
+    quote_style: QuoteStyle,
+) -> Cow<'_, str> {
     // Strip JSDoc `*` continuation prefixes from multi-line type strings.
     // When a type spans multiple lines in a JSDoc block, the raw content
     // may include `\n * ` or `\n *` prefixes from continuation lines.
     // These `*` chars must be removed before normalization, otherwise
     // the `*` → `any` replacement will corrupt the type.
-    if type_str.contains('\n') {
-        let stripped = strip_jsdoc_continuation_prefixes(type_str);
-        return Cow::Owned(normalize_type_impl(&stripped, convert_quotes).into_owned());
+    if type_str.contains(is_line_terminator) {
+        let stripped = strip_jsdoc_star_prefixes(type_str, ' ');
+        return Cow::Owned(
+            normalize_type_impl(&stripped, convert_quotes, quote_style).into_owned(),
+        );
     }
 
     // Fast path: common simple types need no transformation at all.
@@ -405,8 +204,11 @@ fn normalize_type_impl(type_str: &str, convert_quotes: bool) -> Cow<'_, str> {
     // This matches the plugin's convertToModernType() inside withoutStrings().
     let transformed = without_strings(type_str, normalize_type_inner);
     // Phase 2: Convert import() path quotes (simulating Prettier's TS parser).
-    let quoted =
-        if convert_quotes { normalize_type_quotes(&transformed) } else { Cow::Owned(transformed) };
+    let quoted = if convert_quotes {
+        normalize_type_quotes(&transformed, quote_style)
+    } else {
+        Cow::Owned(transformed)
+    };
     // Phase 3: Unquote object property names that are valid JS identifiers.
     // The plugin's formatType() uses Prettier's TS parser which strips unnecessary quotes.
     let unquoted = if convert_quotes { unquote_object_property_names(&quoted) } else { quoted };
@@ -744,19 +546,19 @@ fn split_at_top_level_pipe(type_str: &str) -> Vec<&str> {
 
 /// Normalize a type for return-like tags (returns, yields, throws).
 /// Handles `type=` → `type | undefined` (Closure optional return syntax).
-pub fn normalize_type_return(type_str: &str) -> Cow<'_, str> {
+pub fn normalize_type_return(type_str: &str, quote_style: QuoteStyle) -> Cow<'_, str> {
     let trimmed = type_str.trim();
     if trimmed.ends_with('=') && !trimmed.ends_with("=>") && !contains_quotes(trimmed) {
         let inner = &trimmed[..trimmed.len() - 1];
         if !inner.is_empty() {
-            let normalized = normalize_type(inner);
+            let normalized = normalize_type(inner, quote_style);
             let mut s = String::with_capacity(normalized.len() + 12);
             s.push_str(&normalized);
             s.push_str(" | undefined");
             return Cow::Owned(s);
         }
     }
-    normalize_type(trimmed)
+    normalize_type(trimmed, quote_style)
 }
 
 /// Check for optional suffix `=` on a param type.
@@ -873,16 +675,20 @@ fn contains_quotes(s: &str) -> bool {
     s.contains('"') || s.contains('\'')
 }
 
-/// Convert single quotes to double quotes ONLY inside `import()` paths.
-/// Matches Prettier's TS parser behavior which normalizes import path quotes.
-/// Converts:
-/// - `import('foo')` → `import("foo")`
+/// Normalize quotes inside `import()` paths to the configured `quote_style`,
+/// matching what Prettier's TS parser would output. Converts:
+/// - `import('foo')` → `import("foo")` when `quote_style` is `Double`
+/// - `import("foo")` → `import('foo')` when `quote_style` is `Single`
 ///
 /// Does NOT convert quotes in property access (`Foo['bar']`), string literal types
 /// (`'hello'`), or other contexts. The upstream prettier-plugin-jsdoc uses
 /// `withoutStrings()` to protect all string literals from quote changes.
-fn normalize_type_quotes(type_str: &str) -> Cow<'_, str> {
-    if !type_str.contains('\'') {
+fn normalize_type_quotes(type_str: &str, quote_style: QuoteStyle) -> Cow<'_, str> {
+    let (source_quote, target_quote) = match quote_style {
+        QuoteStyle::Double => (b'\'', b'"'),
+        QuoteStyle::Single => (b'"', b'\''),
+    };
+    if !type_str.as_bytes().contains(&source_quote) {
         return Cow::Borrowed(type_str);
     }
 
@@ -902,14 +708,14 @@ fn normalize_type_quotes(type_str: &str) -> Cow<'_, str> {
                 result.push(' ');
                 i += 1;
             }
-            // Convert single-quoted import path to double-quoted
-            if i < len && bytes[i] == b'\'' {
-                result.push('"');
+            // Convert source-quoted import path to target-quoted
+            if i < len && bytes[i] == source_quote {
+                result.push(target_quote as char);
                 i += 1;
-                while i < len && bytes[i] != b'\'' {
+                while i < len && bytes[i] != source_quote {
                     if bytes[i] == b'\\' && i + 1 < len {
-                        if bytes[i + 1] == b'\'' {
-                            result.push('\'');
+                        if bytes[i + 1] == source_quote {
+                            result.push(source_quote as char);
                             i += 2;
                         } else {
                             let ch = type_str[i..].chars().next().unwrap();
@@ -919,8 +725,9 @@ fn normalize_type_quotes(type_str: &str) -> Cow<'_, str> {
                             result.push(ch);
                             i += ch.len_utf8();
                         }
-                    } else if bytes[i] == b'"' {
-                        result.push_str("\\\"");
+                    } else if bytes[i] == target_quote {
+                        result.push('\\');
+                        result.push(target_quote as char);
                         i += 1;
                     } else {
                         let ch = type_str[i..].chars().next().unwrap();
@@ -928,8 +735,8 @@ fn normalize_type_quotes(type_str: &str) -> Cow<'_, str> {
                         i += ch.len_utf8();
                     }
                 }
-                if i < len && bytes[i] == b'\'' {
-                    result.push('"');
+                if i < len && bytes[i] == source_quote {
+                    result.push(target_quote as char);
                     i += 1;
                 }
             }
@@ -1310,6 +1117,14 @@ mod tests {
         assert_eq!(normalize_tag_kind("memberOf"), "memberOf");
     }
 
+    fn normalize_type(type_str: &str) -> Cow<'_, str> {
+        super::normalize_type(type_str, QuoteStyle::Double)
+    }
+
+    fn normalize_type_return(type_str: &str) -> Cow<'_, str> {
+        super::normalize_type_return(type_str, QuoteStyle::Double)
+    }
+
     #[test]
     fn test_normalize_type() {
         assert_eq!(normalize_type("*"), "any");
@@ -1331,6 +1146,14 @@ mod tests {
         // String literal types should be preserved
         assert_eq!(normalize_type("'hello'"), "'hello'");
         assert_eq!(normalize_type("'foo' | 'bar'"), "'foo' | 'bar'");
+    }
+
+    #[test]
+    fn test_normalize_type_quotes_single() {
+        let single = |s| super::normalize_type(s, QuoteStyle::Single);
+        assert_eq!(single("import('axios')"), "import('axios')");
+        assert_eq!(single("import('../types').Foo"), "import('../types').Foo");
+        assert_eq!(single("import(\"axios\")"), "import('axios')");
     }
 
     #[test]

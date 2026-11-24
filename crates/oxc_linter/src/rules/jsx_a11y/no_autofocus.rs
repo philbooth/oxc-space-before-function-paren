@@ -1,6 +1,6 @@
 use oxc_ast::{
     AstKind,
-    ast::{Expression, JSXAttributeItem, JSXAttributeValue},
+    ast::{Expression, JSXAttributeItem, JSXAttributeValue, JSXOpeningElement},
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
@@ -13,7 +13,9 @@ use crate::{
     context::LintContext,
     globals::HTML_TAG,
     rule::{DefaultRuleConfig, Rule},
-    utils::{get_element_type, has_jsx_prop},
+    utils::{
+        get_element_type, get_string_literal_prop_value, has_jsx_prop, has_jsx_prop_ignore_case,
+    },
 };
 
 fn no_autofocus_diagnostic(span: Span) -> OxcDiagnostic {
@@ -42,6 +44,13 @@ declare_oxc_lint!(
     /// without user input and can interfere with assistive technologies.
     /// Users should control when and where focus moves on a page.
     ///
+    /// ### Exceptions
+    ///
+    /// `<dialog>` elements, elements with `role="dialog"`, and elements with the
+    /// `popover` attribute (and their descendants) are exempt, since directing
+    /// focus into them when opened is the expected behavior.
+    /// See [MDN: `<dialog>` accessibility](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/dialog#accessibility).
+    ///
     /// ### Examples
     ///
     /// Examples of **incorrect** code for this rule:
@@ -55,18 +64,23 @@ declare_oxc_lint!(
     /// Examples of **correct** code for this rule:
     /// ```jsx
     /// <div />
+    /// <dialog><input autoFocus /></dialog>
+    /// <div role="dialog"><input autoFocus /></div>
+    /// <div popover><input autoFocus /></div>
     /// ```
     NoAutofocus,
     jsx_a11y,
     correctness,
+    recommended,
     suggestion,
     config = NoAutofocus,
     version = "0.0.19",
+    short_description = "Enforce that `autoFocus` prop is not used on elements.",
 );
 
 impl Rule for NoAutofocus {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        serde_json::from_value::<DefaultRuleConfig<Self>>(value).map(DefaultRuleConfig::into_inner)
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
     }
 
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
@@ -82,6 +96,13 @@ impl Rule for NoAutofocus {
         };
 
         if attr.value.as_ref().is_some_and(is_false_attribute_value) {
+            return;
+        }
+
+        if ctx.nodes().ancestor_kinds(node.id()).any(|kind| {
+                matches!(kind, AstKind::JSXElement(ancestor) if is_dialog_or_popover(ctx, &ancestor.opening_element))
+            })
+        {
             return;
         }
 
@@ -102,6 +123,21 @@ impl Rule for NoAutofocus {
     }
 }
 
+fn is_dialog_or_popover<'a>(ctx: &LintContext<'a>, opening: &JSXOpeningElement<'a>) -> bool {
+    if get_element_type(ctx, opening) == "dialog" {
+        return true;
+    }
+    if has_jsx_prop_ignore_case(opening, "popover").is_some() {
+        return true;
+    }
+    if let Some(role_attr) = has_jsx_prop_ignore_case(opening, "role")
+        && get_string_literal_prop_value(role_attr).is_some_and(|value| value == "dialog")
+    {
+        return true;
+    }
+    false
+}
+
 fn is_false_attribute_value(value: &JSXAttributeValue) -> bool {
     match value {
         JSXAttributeValue::StringLiteral(string_lit) => string_lit.value == "false",
@@ -114,13 +150,7 @@ fn is_false_attribute_value(value: &JSXAttributeValue) -> bool {
                 Expression::BooleanLiteral(bool_lit) => !bool_lit.value,
                 Expression::StringLiteral(string_lit) => string_lit.value == "false",
                 Expression::TemplateLiteral(template_lit) => {
-                    template_lit.quasis.len() == 1
-                        && template_lit.expressions.is_empty()
-                        && template_lit.quasis[0]
-                            .value
-                            .cooked
-                            .as_ref()
-                            .is_some_and(|cooked| cooked == "false")
+                    template_lit.single_quasi().is_some_and(|cooked| cooked == "false")
                 }
                 _ => false,
             }
@@ -168,6 +198,18 @@ fn test() {
         ("<div><div autofocus /></div>", Some(ignore_non_dom_schema()), None),
         ("<Button />", None, Some(components_settings())),
         ("<Button />", Some(ignore_non_dom_schema()), Some(components_settings())),
+        ("<dialog><div autoFocus /></dialog>", None, None),
+        ("<dialog><input autoFocus /></dialog>", None, None),
+        (r#"<div role="dialog"><input autoFocus /></div>"#, None, None),
+        ("<div popover><input autoFocus /></div>", None, None),
+        (r#"<div popover="auto"><input autoFocus /></div>"#, None, None),
+        ("<dialog><div><input autoFocus /></div></dialog>", None, None),
+        (
+            r#"<div role="dialog"><section><div><input autoFocus /></div></section></div>"#,
+            None,
+            None,
+        ),
+        ("<div popover><section><input autoFocus /></section></div>", None, None),
     ];
 
     let fail = vec![
@@ -185,6 +227,10 @@ fn test() {
         ("<Foo autoFocus />", None, None),
         ("<Button autoFocus />", None, Some(components_settings())),
         ("<Button autoFocus />", Some(ignore_non_dom_schema()), Some(components_settings())),
+        ("<dialog autoFocus />", None, None),
+        (r#"<div role="dialog" autoFocus />"#, None, None),
+        ("<div popover autoFocus />", None, None),
+        (r#"<div popover="auto" autoFocus />"#, None, None),
     ];
 
     let fix = vec![

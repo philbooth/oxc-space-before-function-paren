@@ -3,8 +3,9 @@ use itertools::Itertools as _;
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    Attribute, Error, Expr, Ident, Lit, LitStr, Meta, Path, Result, Token,
-    parse::{Parse, ParseStream},
+    Attribute, Error, Expr, Ident, LitStr, Meta, Path, Result, Token,
+    parse::{Parse, ParseStream, Parser},
+    punctuated::Punctuated,
 };
 
 /// Documentation source for a lint rule
@@ -16,10 +17,20 @@ pub enum DocumentationSource {
     Path(syn::Path),
 }
 
+/// Short description source for a lint rule
+#[cfg(feature = "ruledocs")]
+pub enum ShortDescriptionSource {
+    /// Inline string literal
+    Inline(LitStr),
+    /// Reference to a shared short description constant
+    Path(syn::Path),
+}
+
 pub struct LintRuleMeta {
     name: Ident,
     // Whether this rule should be exposed to tsgolint integration
     is_tsgolint_rule: bool,
+    is_recommended: bool,
     plugin: Ident,
     category: Ident,
     /// Describes what auto-fixing capabilities the rule has
@@ -33,6 +44,9 @@ pub struct LintRuleMeta {
     config: Option<Path>,
     /// The version of oxlint in which this rule was first available.
     version: LitStr,
+    /// A short, one-line summary of what the rule does.
+    #[cfg(feature = "ruledocs")]
+    short_description: Option<ShortDescriptionSource>,
 }
 
 impl Parse for LintRuleMeta {
@@ -46,11 +60,10 @@ impl Parse for LintRuleMeta {
         let mut backtick_fences_count: usize = 0;
 
         for attr in input.call(Attribute::parse_outer)? {
-            match parse_attr(["doc"], &attr) {
-                Some(lit) => {
+            match parse_doc_attr(&attr)? {
+                Some(value) => {
                     #[cfg(feature = "ruledocs")]
                     {
-                        let value = lit.value();
                         let line = value.strip_prefix(' ').unwrap_or(&value);
                         doc_comments.push_str(line);
                         doc_comments.push('\n');
@@ -60,7 +73,7 @@ impl Parse for LintRuleMeta {
                     }
                     #[cfg(not(feature = "ruledocs"))]
                     {
-                        let _ = lit;
+                        let _ = value;
                     }
                 }
                 _ => {
@@ -106,9 +119,11 @@ impl Parse for LintRuleMeta {
         let mut fix: Option<Ident> = None;
         let mut config: Option<Path> = None;
         let mut version: Option<LitStr> = None;
+        let mut is_recommended = false;
+        #[cfg(feature = "ruledocs")]
+        let mut short_description: Option<ShortDescriptionSource> = None;
 
-        // remaining options are `key = value` pairs, with the exception of
-        // fix kinds. Those can be short-handed to just the fix kind
+        // Remaining options are `key = value` pairs, standalone fix kinds, or `recommended`.
         while input.peek(Token!(,)) {
             input.parse::<Token!(,)>()?;
             if input.is_empty() {
@@ -116,7 +131,13 @@ impl Parse for LintRuleMeta {
             }
             let key: Ident = input.parse()?;
             match key.to_string().as_str() {
+                "recommended" => {
+                    is_recommended = true;
+                }
                 "fix" => {
+                    if fix.is_some() {
+                        return Err(Error::new_spanned(key, "fix capabilities already specified"));
+                    }
                     if input.peek(Token!(=)) {
                         // `fix = some-fix-kind`
                         input.parse::<Token!(=)>()?;
@@ -151,9 +172,26 @@ impl Parse for LintRuleMeta {
                     input.parse::<Token!(=)>()?;
                     version.replace(input.parse()?);
                 }
+                // short_description = "One-line summary."
+                // or short_description = path::to::SHARED_SHORT_DESCRIPTION_CONSTANT
+                "short_description" => {
+                    #[cfg(feature = "ruledocs")]
+                    {
+                        input.parse::<Token!(=)>()?;
+                        if input.peek(LitStr) {
+                            short_description
+                                .replace(ShortDescriptionSource::Inline(input.parse()?));
+                        } else {
+                            short_description.replace(ShortDescriptionSource::Path(input.parse()?));
+                        }
+                    }
+                }
                 _ => {
-                    if input.peek(Token!(=)) || fix.is_some() {
+                    if input.peek(Token!(=)) {
                         return Err(Error::new_spanned(key, "unexpected key in rule declaration"));
+                    }
+                    if fix.is_some() {
+                        return Err(Error::new_spanned(key, "fix capabilities already specified"));
                     }
                     // fix kind shorthand, e.g. `dangerous-suggestion``
                     fix.replace(key);
@@ -196,6 +234,7 @@ impl Parse for LintRuleMeta {
         Ok(Self {
             name: struct_name,
             is_tsgolint_rule,
+            is_recommended,
             plugin,
             category,
             fix,
@@ -204,6 +243,8 @@ impl Parse for LintRuleMeta {
             used_in_test: false,
             config,
             version,
+            #[cfg(feature = "ruledocs")]
+            short_description,
         })
     }
 }
@@ -216,6 +257,7 @@ pub fn declare_oxc_lint(metadata: LintRuleMeta) -> TokenStream {
     let LintRuleMeta {
         name,
         is_tsgolint_rule,
+        is_recommended,
         plugin,
         category,
         fix,
@@ -224,6 +266,8 @@ pub fn declare_oxc_lint(metadata: LintRuleMeta) -> TokenStream {
         used_in_test,
         config,
         version,
+        #[cfg(feature = "ruledocs")]
+        short_description,
     } = metadata;
 
     let canonical_name = rule_name_converter().convert(name.to_string());
@@ -250,7 +294,7 @@ pub fn declare_oxc_lint(metadata: LintRuleMeta) -> TokenStream {
         None
     } else {
         Some(quote! {
-            use crate::{rule::{RuleCategory, RuleMeta, RuleFixMeta, RuleRunner}, fixer::FixKind};
+            use crate::{rule::{RuleCategory, RuleMeta, RuleInfo, RuleFixMeta, RuleFlags, RuleRunner}, fixer::FixKind};
             use oxc_semantic::AstTypesBitset;
         })
     };
@@ -272,11 +316,16 @@ pub fn declare_oxc_lint(metadata: LintRuleMeta) -> TokenStream {
         },
     });
 
-    let has_config = if config.is_some() {
-        quote! { const HAS_CONFIG: bool = true; }
-    } else {
-        quote! { const HAS_CONFIG: bool = false; }
-    };
+    let mut flags = quote! { RuleFlags::empty() };
+    if is_tsgolint_rule {
+        flags = quote! { #flags.union(RuleFlags::IS_TSGOLINT_RULE) };
+    }
+    if config.is_some() {
+        flags = quote! { #flags.union(RuleFlags::HAS_CONFIG) };
+    }
+    if is_recommended {
+        flags = quote! { #flags.union(RuleFlags::IS_RECOMMENDED) };
+    }
 
     #[cfg(not(feature = "ruledocs"))]
     let config_schema: Option<proc_macro2::TokenStream> = {
@@ -303,6 +352,22 @@ pub fn declare_oxc_lint(metadata: LintRuleMeta) -> TokenStream {
         }
     };
 
+    #[cfg(not(feature = "ruledocs"))]
+    let info_const: Option<proc_macro2::TokenStream> = None;
+
+    #[cfg(feature = "ruledocs")]
+    let info_const = short_description.map(|short_description| {
+        let short_description = match short_description {
+            ShortDescriptionSource::Inline(lit) => quote! { #lit },
+            ShortDescriptionSource::Path(path) => quote! { #path },
+        };
+        quote! {
+            const INFO: RuleInfo = RuleInfo {
+                short_description: #short_description,
+            };
+        }
+    });
+
     let output = quote! {
         #import_statement
 
@@ -313,37 +378,45 @@ pub fn declare_oxc_lint(metadata: LintRuleMeta) -> TokenStream {
 
             const CATEGORY: RuleCategory = #category;
 
-            const IS_TSGOLINT_RULE: bool = #is_tsgolint_rule;
+            const FLAGS: RuleFlags = #flags;
 
             #fix
 
             #docs
 
-            #has_config
-
             #config_schema
 
             #version_const
+
+            #info_const
         }
     };
 
     TokenStream::from(output)
 }
 
-fn parse_attr<'a, const LEN: usize>(
-    path: [&'static str; LEN],
-    attr: &'a Attribute,
-) -> Option<&'a LitStr> {
+fn parse_doc_attr(attr: &Attribute) -> Result<Option<String>> {
     if let Meta::NameValue(name_value) = &attr.meta {
         let path_idents = name_value.path.segments.iter().map(|segment| &segment.ident);
-        if itertools::equal(path_idents, path)
-            && let Expr::Lit(expr_lit) = &name_value.value
-            && let Lit::Str(s) = &expr_lit.lit
-        {
-            return Some(s);
+        if !itertools::equal(path_idents, ["doc"]) {
+            return Ok(None);
+        }
+
+        match &name_value.value {
+            Expr::Lit(expr_lit) => {
+                if let syn::Lit::Str(lit) = &expr_lit.lit {
+                    return Ok(Some(lit.value()));
+                }
+            }
+            Expr::Macro(expr_macro) if expr_macro.mac.path.is_ident("concat") => {
+                let literals = Punctuated::<LitStr, Token![,]>::parse_terminated
+                    .parse2(expr_macro.mac.tokens.clone())?;
+                return Ok(Some(literals.iter().map(LitStr::value).collect()));
+            }
+            _ => {}
         }
     }
-    None
+    Ok(None)
 }
 
 fn parse_fix(s: &str) -> proc_macro2::TokenStream {

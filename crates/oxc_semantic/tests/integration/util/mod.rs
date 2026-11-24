@@ -1,11 +1,9 @@
-use std::sync::Arc;
-
 use itertools::Itertools;
 
 use oxc_allocator::Allocator;
 #[cfg(feature = "cfg")]
 use oxc_cfg::DisplayDot;
-use oxc_diagnostics::{Error, NamedSource, OxcDiagnostic};
+use oxc_diagnostics::{Diagnostic, NamedSource, OxcDiagnostic};
 #[cfg(feature = "cfg")]
 use oxc_semantic::dot::DebugDot;
 use oxc_semantic::{Semantic, SemanticBuilder, SemanticBuilderReturn};
@@ -141,13 +139,13 @@ impl<'a> SemanticTester<'a> {
     #[expect(unstable_name_collisions)]
     pub fn build(&self) -> Semantic<'_> {
         let semantic_ret = self.build_with_errors();
-        match (self.expect_errors, semantic_ret.errors.is_empty()) {
+        match (self.expect_errors, semantic_ret.diagnostics.is_empty()) {
             (true, true) => panic!("Expected errors, but none were produced"),
             (false, false) => panic!(
                 "Semantic analysis failed:\n\n{}\n\n{}",
                 self.source_text,
                 semantic_ret
-                    .errors
+                    .diagnostics
                     .iter()
                     .map(ToString::to_string)
                     .intersperse("\n\n".to_owned())
@@ -167,19 +165,19 @@ impl<'a> SemanticTester<'a> {
             oxc_parser::Parser::new(&self.allocator, self.source_text, self.source_type).parse();
 
         assert!(
-            parse.errors.is_empty(),
+            parse.diagnostics.is_empty(),
             "\n Failed to parse source:\n{}\n\n{}",
             self.source_text,
             parse
-                .errors
+                .diagnostics
                 .iter()
                 .map(|e| format!("{e}"))
                 .intersperse("\n\n".to_owned())
                 .collect::<String>()
         );
 
-        SemanticBuilder::new()
-            .with_check_syntax_error(true)
+        SemanticBuilder::new_compiler()
+            .with_build_nodes(true)
             .with_cfg(self.cfg)
             .build(self.allocator.alloc(parse.program))
     }
@@ -268,18 +266,21 @@ impl<'a> SemanticTester<'a> {
     ///
     /// [`parsing`]: oxc_parser::Parser::parse
     pub fn has_error(&self, message: &str) {
-        let SemanticBuilderReturn { errors, .. } = self.build_with_errors();
+        let SemanticBuilderReturn { diagnostics, .. } = self.build_with_errors();
         assert!(
-            !errors.is_empty(),
+            !diagnostics.is_empty(),
             "Expected an error matching '{message}', but no errors were produced"
         );
-        if errors.iter().any(|e| e.message.contains(message)) {
+        if diagnostics.iter().any(|e| e.message.contains(message)) {
             return;
         }
 
-        let num_errors = errors.len();
-        let rendered_errors =
-            self.wrap_diagnostics(errors).into_iter().map(|e| e.to_string()).join("\n\n");
+        let num_errors = diagnostics.len();
+        let rendered_errors = self
+            .wrap_diagnostics(diagnostics.into())
+            .into_iter()
+            .map(|e| e.to_string())
+            .join("\n\n");
 
         panic!(
             "Expected an error containing '{message}', but none of the {num_errors} matched:\n\n{rendered_errors}",
@@ -296,19 +297,21 @@ impl<'a> SemanticTester<'a> {
         SymbolTester::new_unique(self, self.build(), name)
     }
 
-    fn wrap_diagnostics(&self, diagnostics: Vec<OxcDiagnostic>) -> Vec<Error> {
-        let name = "test".to_owned()
-            + match (self.source_type.is_javascript(), self.source_type.is_jsx()) {
-                (true, true) => ".jsx",
-                (true, false) => ".js",
-                (false, true) => ".tsx",
-                (false, false) => ".ts",
-            };
+    fn wrap_diagnostics(
+        &self,
+        diagnostics: Vec<OxcDiagnostic>,
+    ) -> Vec<Box<dyn Diagnostic + Send + Sync + '_>> {
+        let name = match (self.source_type.is_javascript(), self.source_type.is_jsx()) {
+            (true, true) => "test.jsx",
+            (true, false) => "test.js",
+            (false, true) => "test.tsx",
+            (false, false) => "test.ts",
+        };
+        let named_source = NamedSource::new(name, self.source_text);
 
-        let source = Arc::new(NamedSource::new(name, self.source_text.to_owned()));
         diagnostics
             .into_iter()
-            .map(|diagnostic| diagnostic.with_source_code(Arc::clone(&source)))
+            .map(|diagnostic| diagnostic.with_source_code(named_source.clone()))
             .collect()
     }
 }

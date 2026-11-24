@@ -3,7 +3,7 @@ use std::{borrow::Cow, cmp::Ordering};
 use cow_utils::CowUtils;
 use oxc_ast::{
     AstKind,
-    ast::{BindingPattern, VariableDeclarator},
+    ast::{BindingIdentifier, BindingPattern, Expression, VariableDeclarator},
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
@@ -19,7 +19,7 @@ fn sort_vars_diagnostic(span: Span) -> OxcDiagnostic {
 }
 
 #[derive(Debug, Default, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct SortVars {
     /// When `true`, the rule ignores case-sensitivity when sorting variables.
     ignore_case: bool,
@@ -28,10 +28,12 @@ pub struct SortVars {
 declare_oxc_lint!(
     /// ### What it does
     ///
-    /// When declaring multiple variables within the same block, sorting variable names make it
-    /// easier to find necessary variable easier at a later time.
+    /// Enforce sorting of variable declarations within the same block.
     ///
     /// ### Why is this bad?
+    ///
+    /// When declaring multiple variables within the same block, sorting variable names can make it
+    /// easier to find necessary variables at a later time.
     ///
     /// Unsorted variable declarations can make the code harder to read and maintain.
     ///
@@ -51,9 +53,10 @@ declare_oxc_lint!(
     SortVars,
     eslint,
     pedantic,
-    pending,
+    conditional_fix,
     config = SortVars,
     version = "0.9.3",
+    short_description = "Enforce sorting of variable declarations within the same block.",
 );
 
 impl Rule for SortVars {
@@ -76,36 +79,122 @@ impl Rule for SortVars {
             return;
         }
 
-        let mut previous: Option<&VariableDeclarator> = None;
-        for current in var_decl
-            .declarations
-            .iter()
-            .filter(|decl| matches!(decl.id, BindingPattern::BindingIdentifier(_)))
-        {
-            if let Some(previous) = previous
-                && self.get_sortable_name(previous).cmp(&self.get_sortable_name(current))
+        let mut maximum: Option<&BindingIdentifier> = None;
+        let mut checked_until = 0;
+        for (current_index, current) in var_decl.declarations.iter().enumerate() {
+            let Some(identifier) = current.id.get_binding_identifier() else {
+                continue;
+            };
+            if let Some(maximum) = maximum
+                && self.get_sortable_name(maximum).cmp(&self.get_sortable_name(identifier))
                     == Ordering::Greater
             {
-                ctx.diagnostic(sort_vars_diagnostic(current.span));
+                let diagnostic = sort_vars_diagnostic(current.span);
+                if current.span.start >= checked_until
+                    && let Some((span, replacement)) = self.build_declarations_fix(
+                        current_index,
+                        &var_decl.declarations,
+                        ctx,
+                        &mut checked_until,
+                    )
+                {
+                    ctx.diagnostic_with_fix(diagnostic, |fixer| fixer.replace(span, replacement));
+                } else {
+                    ctx.diagnostic(diagnostic);
+                }
+                continue;
             }
 
-            previous = Some(current);
+            maximum = Some(identifier);
         }
     }
 }
 
 impl SortVars {
-    fn get_sortable_name<'a>(&self, decl: &VariableDeclarator<'a>) -> Cow<'a, str> {
-        let BindingPattern::BindingIdentifier(ident) = &decl.id else {
-            unreachable!();
-        };
-
+    fn get_sortable_name<'a>(&self, ident: &BindingIdentifier<'a>) -> Cow<'a, str> {
         if self.ignore_case {
             return ident.name.as_str().cow_to_ascii_lowercase();
         }
 
         Cow::Borrowed(ident.name.as_str()) // avoid string allocs in the default case
     }
+
+    fn build_declarations_fix<'a>(
+        &self,
+        current_index: usize,
+        declarations: &'a [VariableDeclarator<'a>],
+        ctx: &LintContext<'a>,
+        checked_until: &mut u32,
+    ) -> Option<(Span, String)> {
+        // Only reorder a contiguous safe run:
+        // `var {} = obj, b, a` can fix `b, a`, but must not move the destructuring.
+        if !is_fixable_declarator(&declarations[current_index]) {
+            return None;
+        }
+
+        let mut start_index = current_index;
+        while start_index > 0 && is_fixable_declarator(&declarations[start_index - 1]) {
+            start_index -= 1;
+        }
+
+        let mut end_index = current_index;
+        while declarations.get(end_index + 1).is_some_and(is_fixable_declarator) {
+            end_index += 1;
+        }
+        *checked_until = declarations[end_index].span.end;
+
+        if start_index == end_index {
+            return None;
+        }
+
+        let declarations = &declarations[start_index..=end_index];
+        let replace_span = declarations[0].span.merge(declarations[declarations.len() - 1].span);
+
+        // `var b, /* keep with a? */ a` is ambiguous; leave it for the user.
+        if ctx.has_comments_between(replace_span) {
+            return None;
+        }
+
+        // Preserve separators as written: `var b , a` should become `var a , b`.
+        let mut paddings: Vec<&str> = declarations
+            .windows(2)
+            .map(|window| ctx.source_range(Span::new(window[0].span.end, window[1].span.start)))
+            .collect();
+        paddings.push("");
+
+        let mut sorted_declarations = Vec::with_capacity(declarations.len());
+        for declaration in declarations {
+            let identifier = declaration.id.get_binding_identifier()?;
+            sorted_declarations.push((declaration, identifier));
+        }
+        sorted_declarations.sort_unstable_by(|(_, a), (_, b)| {
+            self.get_sortable_name(a).cmp(&self.get_sortable_name(b))
+        });
+
+        let mut replacement = String::new();
+        for ((declaration, _), padding) in sorted_declarations.into_iter().zip(paddings) {
+            replacement.push_str(ctx.source_range(declaration.span));
+            replacement.push_str(padding);
+        }
+
+        Some((replace_span, replacement))
+    }
+}
+
+fn is_fixable_declarator(decl: &VariableDeclarator<'_>) -> bool {
+    // Sorting `var b = f(), a` would move when `f()` runs, so only literals are movable.
+    matches!(decl.id, BindingPattern::BindingIdentifier(_))
+        && decl.init.as_ref().is_none_or(|init| {
+            matches!(
+                init.without_parentheses(),
+                Expression::BooleanLiteral(_)
+                    | Expression::NullLiteral(_)
+                    | Expression::NumericLiteral(_)
+                    | Expression::BigIntLiteral(_)
+                    | Expression::RegExpLiteral(_)
+                    | Expression::StringLiteral(_)
+            )
+        })
 }
 
 #[test]
@@ -201,9 +290,12 @@ fn test() {
         ("var b = f(), c, d, a;", None),
         ("var b = `${f()}`, c, d, a;", None), // { "ecmaVersion": 6 },
         ("var c, a = b = 0", None),
+        ("var c, a, b;", None),
+        ("var C, a, b;", Some(serde_json::json!([{ "ignoreCase": true }]))),
+        ("var c, a, e, d;", None),
     ];
 
-    let _fix = vec![
+    let fix = vec![
         ("var b, a", "var a, b", None),
         ("var b , a", "var a , b", None),
         ("var b=10, a=20;", "var a=20, b=10;", None),
@@ -227,7 +319,13 @@ fn test() {
             Some(serde_json::json!([{ "ignoreCase": true }])),
         ),
         ("var {} = 1, b, a", "var {} = 1, a, b", Some(serde_json::json!([{ "ignoreCase": true }]))),
+        ("var b = f(), c, d, a;", "var b = f(), a, c, d;", None),
+        ("var b, /* comment */ a", "var b, /* comment */ a", None),
+        ("var c, a, b;", "var a, b, c;", None),
+        ("var C, a, b;", "var a, b, C;", Some(serde_json::json!([{ "ignoreCase": true }]))),
+        ("var f, d, e, {} = obj, c, a, b;", "var d, e, f, {} = obj, a, b, c;", None),
+        ("var c, /* comment */ a, b;", "var c, /* comment */ a, b;", None),
     ];
 
-    Tester::new(SortVars::NAME, SortVars::PLUGIN, pass, fail).test_and_snapshot();
+    Tester::new(SortVars::NAME, SortVars::PLUGIN, pass, fail).expect_fix(fix).test_and_snapshot();
 }

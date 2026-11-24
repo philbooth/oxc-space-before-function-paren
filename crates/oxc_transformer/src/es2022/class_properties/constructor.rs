@@ -101,11 +101,11 @@
 
 use std::iter;
 
-use oxc_allocator::TakeIn;
+use oxc_allocator::{ArenaVec, ReplaceWith};
 use rustc_hash::FxHashMap;
 
-use oxc_ast::{NONE, ast::*};
-use oxc_ast_visit::{VisitMut, walk_mut};
+use oxc_ast::ast::*;
+use oxc_ast_visit::{VisitJsMut, VisitMut, walk_js_mut};
 use oxc_span::SPAN;
 use oxc_str::Ident;
 use oxc_syntax::{
@@ -125,7 +125,7 @@ use crate::{
 use super::{ClassProperties, utils::exprs_into_stmts};
 
 /// Location to insert instance property initializers
-pub(super) enum InstanceInitsInsertLocation<'a> {
+enum InstanceInitsInsertLocation<'a> {
     /// Create new constructor, containing initializers
     NewConstructor,
     /// Insert initializers into existing constructor at this statement index
@@ -137,17 +137,134 @@ pub(super) enum InstanceInitsInsertLocation<'a> {
 }
 
 /// Scopes related to inserting and transforming instance property initializers
-pub(super) struct InstanceInitScopes {
+struct InstanceInitScopes {
     /// Scope that instance prop initializers will be inserted into
-    pub insert_in_scope_id: ScopeId,
+    insert_in_scope_id: ScopeId,
     /// Scope of class constructor, if initializers will be inserted into constructor,
     /// (either directly, or in `_super` function within constructor)
     /// and constructor's scope contains any bindings.
     /// This is used for renaming symbols if any shadow symbols referenced by instance prop initializers.
-    pub constructor_scope_id: Option<ScopeId>,
+    constructor_scope_id: Option<ScopeId>,
 }
 
 impl<'a> ClassProperties<'a> {
+    /// Insert ordered instance initializers into a class constructor, creating one if necessary.
+    ///
+    /// `constructor_index` identifies an existing constructor with a body, found during collection.
+    /// Chooses the insertion location, reparents initializer scopes, and renames clashing constructor
+    /// bindings before insertion. An empty initializer list leaves the constructor unchanged.
+    pub(super) fn insert_instance_initializers(
+        &mut self,
+        body: &mut ClassBody<'a>,
+        instance_inits: Vec<Expression<'a>>,
+        constructor_index: Option<usize>,
+        class_scope_id: ScopeId,
+        has_super_class: bool,
+        ctx: &mut TraverseCtx<'a>,
+    ) {
+        if instance_inits.is_empty() {
+            return;
+        }
+
+        // The collection pass already located the constructor, so no second class-body scan is needed.
+        let mut constructor = constructor_index.map(|index| {
+            let ClassElement::MethodDefinition(method) = &mut body.body[index] else {
+                unreachable!("Constructor index must refer to a method");
+            };
+            method.value.as_mut()
+        });
+
+        // Scope that instance property initializers will be inserted into.
+        // This is usually class constructor, but can also be a `_super` function which is created.
+        let instance_inits_scope_id;
+        // Scope of class constructor, if instance property initializers will be inserted into constructor.
+        // Used for checking for variable name clashes.
+        // e.g. `class C { prop = x(); constructor(x) {} }`
+        // - `x` in constructor needs to be renamed when `x()` is moved into constructor body.
+        // `None` if class has no existing constructor, as then there can't be any clashes.
+        let mut instance_inits_constructor_scope_id = None;
+
+        // Determine where to insert instance property initializers in constructor
+        let instance_inits_insert_location = if let Some(constructor) = constructor.as_deref_mut() {
+            if has_super_class {
+                let (insert_scopes, insert_location) =
+                    Self::replace_super_in_constructor(constructor, ctx);
+                instance_inits_scope_id = insert_scopes.insert_in_scope_id;
+                instance_inits_constructor_scope_id = insert_scopes.constructor_scope_id;
+                insert_location
+            } else {
+                let constructor_scope_id = constructor.scope_id();
+                instance_inits_scope_id = constructor_scope_id;
+                // Only record `constructor_scope_id` if constructor's scope has some bindings.
+                // If it doesn't, no need to check for shadowed symbols in instance prop initializers,
+                // because no bindings to clash with.
+                instance_inits_constructor_scope_id =
+                    if ctx.scoping().get_bindings(constructor_scope_id).is_empty() {
+                        None
+                    } else {
+                        Some(constructor_scope_id)
+                    };
+                InstanceInitsInsertLocation::ExistingConstructor(0)
+            }
+        } else {
+            // No existing constructor - create scope for one
+            let constructor_scope_id = ctx.scoping_mut().add_scope(
+                Some(class_scope_id),
+                NodeId::DUMMY,
+                ScopeFlags::Function | ScopeFlags::Constructor | ScopeFlags::StrictMode,
+            );
+            instance_inits_scope_id = constructor_scope_id;
+            InstanceInitsInsertLocation::NewConstructor
+        };
+
+        // Reparent property initializers scope to `instance_inits_scope_id`.
+        self.reparent_initializers_scope(
+            instance_inits.as_slice(),
+            instance_inits_scope_id,
+            instance_inits_constructor_scope_id,
+            ctx,
+        );
+
+        // Insert instance initializers into constructor.
+        // Create a constructor if there isn't one.
+        match instance_inits_insert_location {
+            InstanceInitsInsertLocation::NewConstructor => {
+                Self::insert_constructor(
+                    body,
+                    instance_inits,
+                    has_super_class,
+                    instance_inits_scope_id,
+                    ctx,
+                );
+            }
+            InstanceInitsInsertLocation::ExistingConstructor(stmt_index) => {
+                self.insert_inits_into_constructor_as_statements(
+                    constructor.as_mut().unwrap(),
+                    instance_inits,
+                    stmt_index,
+                    ctx,
+                );
+            }
+            InstanceInitsInsertLocation::SuperFnInsideConstructor(super_binding) => {
+                self.create_super_function_inside_constructor(
+                    constructor.as_mut().unwrap(),
+                    instance_inits,
+                    &super_binding,
+                    instance_inits_scope_id,
+                    ctx,
+                );
+            }
+            InstanceInitsInsertLocation::SuperFnOutsideClass(super_binding) => {
+                self.create_super_function_outside_constructor(
+                    instance_inits,
+                    &super_binding,
+                    instance_inits_scope_id,
+                    ctx,
+                );
+            }
+        }
+    }
+
     /// Replace `super()` call(s) in constructor, if required.
     ///
     /// Returns:
@@ -178,7 +295,7 @@ impl<'a> ClassProperties<'a> {
     /// `insert_in_scope_id` in returned `InstanceInitScopes`.
     ///
     /// This function does not create the `_super` function or insert it. That happens later.
-    pub(super) fn replace_super_in_constructor(
+    fn replace_super_in_constructor(
         constructor: &mut Function<'a>,
         ctx: &mut TraverseCtx<'a>,
     ) -> (InstanceInitScopes, InstanceInitsInsertLocation<'a>) {
@@ -219,7 +336,7 @@ impl<'a> ClassProperties<'a> {
     // TODO: Handle private props in constructor params `class C { #x; constructor(x = this.#x) {} }`.
 
     /// Add a constructor to class containing property initializers.
-    pub(super) fn insert_constructor(
+    fn insert_constructor(
         body: &mut ClassBody<'a>,
         inits: Vec<Expression<'a>>,
         has_super_class: bool,
@@ -227,7 +344,7 @@ impl<'a> ClassProperties<'a> {
         ctx: &mut TraverseCtx<'a>,
     ) {
         // Create statements to go in function body
-        let mut stmts = ctx.ast.vec_with_capacity(inits.len() + usize::from(has_super_class));
+        let mut stmts = ArenaVec::with_capacity_in(inits.len() + usize::from(has_super_class), ctx);
 
         // Add `super(..._args);` statement and `..._args` param if class has a super class.
         // `constructor(..._args) { super(..._args); /* prop initialization */ }`
@@ -236,19 +353,23 @@ impl<'a> ClassProperties<'a> {
             let args_binding =
                 ctx.generate_uid("args", constructor_scope_id, SymbolFlags::FunctionScopedVariable);
             let rest_element =
-                ctx.ast.binding_rest_element(SPAN, args_binding.create_binding_pattern(ctx));
-            params_rest =
-                Some(ctx.ast.alloc_formal_parameter_rest(SPAN, ctx.ast.vec(), rest_element, NONE));
-            stmts.push(ctx.ast.statement_expression(SPAN, create_super_call(&args_binding, ctx)));
+                BindingRestElement::new(SPAN, args_binding.create_binding_pattern(ctx), ctx);
+            params_rest = Some(FormalParameterRest::boxed(SPAN, [], rest_element, None, ctx));
+            stmts.push(Statement::new_expression_statement(
+                SPAN,
+                create_super_call(&args_binding, ctx),
+                ctx,
+            ));
         }
         // TODO: Should these have the span of the original `PropertyDefinition`s?
-        stmts.extend(exprs_into_stmts(inits, ctx.ast));
+        stmts.extend(exprs_into_stmts(inits, &ctx.ast));
 
-        let params = ctx.ast.alloc_formal_parameters(
+        let params = FormalParameters::boxed(
             SPAN,
             FormalParameterKind::FormalParameter,
-            ctx.ast.vec(),
+            [],
             params_rest,
+            ctx,
         );
 
         let ctor = create_class_constructor_with_params(stmts, params, constructor_scope_id, ctx);
@@ -258,7 +379,7 @@ impl<'a> ClassProperties<'a> {
     }
 
     /// Insert instance property initializers into constructor body at `insertion_index`.
-    pub(super) fn insert_inits_into_constructor_as_statements(
+    fn insert_inits_into_constructor_as_statements(
         &mut self,
         constructor: &mut Function<'a>,
         inits: Vec<Expression<'a>>,
@@ -270,13 +391,13 @@ impl<'a> ClassProperties<'a> {
 
         // Insert inits into constructor body
         let body_stmts = &mut constructor.body.as_mut().unwrap().statements;
-        body_stmts.splice(insertion_index..insertion_index, exprs_into_stmts(inits, ctx.ast));
+        body_stmts.splice(insertion_index..insertion_index, exprs_into_stmts(inits, &ctx.ast));
     }
 
     /// Create `_super` function containing instance property initializers,
     /// and insert at top of constructor body.
     /// `var _super = (..._args) => (super(..._args), <inits>, this);`
-    pub(super) fn create_super_function_inside_constructor(
+    fn create_super_function_inside_constructor(
         &mut self,
         constructor: &mut Function<'a>,
         inits: Vec<Expression<'a>>,
@@ -297,52 +418,55 @@ impl<'a> ClassProperties<'a> {
         let args_binding =
             ctx.generate_uid("args", super_func_scope_id, SymbolFlags::FunctionScopedVariable);
         let super_call = create_super_call(&args_binding, ctx);
-        let this_expr = ctx.ast.expression_this(SPAN);
-        let body_exprs = ctx.ast.expression_sequence(
+        let this_expr = Expression::new_this_expression(SPAN, ctx);
+        let body_exprs = Expression::new_sequence_expression(
             SPAN,
-            ctx.ast.vec_from_iter(iter::once(super_call).chain(inits).chain(iter::once(this_expr))),
+            ArenaVec::from_iter_in(
+                iter::once(super_call).chain(inits).chain(iter::once(this_expr)),
+                ctx,
+            ),
+            ctx,
         );
-        let body = ctx.ast.vec1(ctx.ast.statement_expression(SPAN, body_exprs));
-
         // `(..._args) => (super(..._args), <inits>, this)`
-        let super_func = ctx.ast.expression_arrow_function_with_scope_id_and_pure_and_pife(
+        let super_func = Expression::new_arrow_function_expression_with_scope_id_and_pure_and_pife(
             SPAN,
-            true,
             false,
-            NONE,
+            None,
             {
                 let rest_element =
-                    ctx.ast.binding_rest_element(SPAN, args_binding.create_binding_pattern(ctx));
-                let rest =
-                    ctx.ast.alloc_formal_parameter_rest(SPAN, ctx.ast.vec(), rest_element, NONE);
-                ctx.ast.alloc_formal_parameters(
+                    BindingRestElement::new(SPAN, args_binding.create_binding_pattern(ctx), ctx);
+                let rest = FormalParameterRest::boxed(SPAN, [], rest_element, None, ctx);
+                FormalParameters::boxed(
                     SPAN,
                     FormalParameterKind::ArrowFormalParameters,
-                    ctx.ast.vec(),
+                    [],
                     Some(rest),
+                    ctx,
                 )
             },
-            NONE,
-            ctx.ast.alloc_function_body(SPAN, ctx.ast.vec(), body),
+            None,
+            ArrowFunctionBody::from(body_exprs),
             super_func_scope_id,
             false,
             false,
+            ctx,
         );
 
         // `var _super = (..._args) => ( ... );`
-        let super_func_decl = Statement::from(ctx.ast.declaration_variable(
+        let super_func_decl = Statement::new_variable_declaration(
             SPAN,
             VariableDeclarationKind::Var,
-            ctx.ast.vec1(ctx.ast.variable_declarator(
+            [VariableDeclarator::new(
                 SPAN,
-                VariableDeclarationKind::Var,
                 super_binding.create_binding_pattern(ctx),
-                NONE,
+                None,
                 Some(super_func),
                 false,
-            )),
+                ctx,
+            )],
             false,
-        ));
+            ctx,
+        );
 
         // Insert at top of function
         let body_stmts = &mut constructor.body.as_mut().unwrap().statements;
@@ -352,7 +476,7 @@ impl<'a> ClassProperties<'a> {
     /// Create `_super` function containing instance property initializers,
     /// and insert it outside class.
     /// `let _super = function() { <inits>; return this; }`
-    pub(super) fn create_super_function_outside_constructor(
+    fn create_super_function_outside_constructor(
         &mut self,
         inits: Vec<Expression<'a>>,
         super_binding: &BoundIdentifier<'a>,
@@ -363,37 +487,37 @@ impl<'a> ClassProperties<'a> {
         // TODO: This should be parent scope if insert `_super` function as expression before class expression.
         let outer_scope_id = ctx.current_block_scope_id();
         let directives = if ctx.scoping().scope_flags(outer_scope_id).is_strict_mode() {
-            ctx.ast.vec()
+            ArenaVec::new_in(ctx)
         } else {
-            ctx.ast.vec1(ctx.ast.use_strict_directive())
+            ArenaVec::from_value_in(Directive::new_use_strict(ctx), ctx)
         };
 
         // `return this;`
-        let return_stmt = ctx.ast.statement_return(SPAN, Some(ctx.ast.expression_this(SPAN)));
+        let return_stmt = Statement::new_return_statement(
+            SPAN,
+            Some(Expression::new_this_expression(SPAN, ctx)),
+            ctx,
+        );
         // `<inits>; return this;`
         let body_stmts =
-            ctx.ast.vec_from_iter(exprs_into_stmts(inits, ctx.ast).chain([return_stmt]));
+            ArenaVec::from_iter_in(exprs_into_stmts(inits, &ctx.ast).chain([return_stmt]), ctx);
         // `function() { <inits>; return this; }`
-        let super_func = ctx.ast.expression_function_with_scope_id_and_pure_and_pife(
+        let super_func = Expression::new_function_expression_with_scope_id_and_pure_and_pife(
             SPAN,
             FunctionType::FunctionExpression,
             None,
             false,
             false,
             false,
-            NONE,
-            NONE,
-            ctx.ast.alloc_formal_parameters(
-                SPAN,
-                FormalParameterKind::FormalParameter,
-                ctx.ast.vec(),
-                NONE,
-            ),
-            NONE,
-            Some(ctx.ast.alloc_function_body(SPAN, directives, body_stmts)),
+            None,
+            None,
+            FormalParameters::boxed(SPAN, FormalParameterKind::FormalParameter, [], None, ctx),
+            None,
+            Some(FunctionBody::boxed(SPAN, directives, body_stmts, ctx)),
             super_func_scope_id,
             false,
             false,
+            ctx,
         );
 
         // Insert `_super` function after class.
@@ -412,7 +536,7 @@ impl<'a> ClassProperties<'a> {
             self.insert_after_exprs.push(assignment);
             None
         };
-        ctx.state.var_declarations.insert_let(super_binding, init, ctx.ast);
+        ctx.state.var_declarations.insert_let(super_binding, init, &ctx.ast);
     }
 
     /// Rename any symbols in constructor which clash with symbols used in initializers
@@ -501,7 +625,7 @@ impl<'a, 'ctx> ConstructorParamsSuperReplacer<'a, 'ctx> {
     }
 }
 
-impl<'a> VisitMut<'a> for ConstructorParamsSuperReplacer<'a, '_> {
+impl<'a> VisitJsMut<'a> for ConstructorParamsSuperReplacer<'a, '_> {
     /// Replace `super()` with `_super.call(super())`.
     // `#[inline]` to make hot path for all other expressions as cheap as possible.
     #[inline]
@@ -518,7 +642,7 @@ impl<'a> VisitMut<'a> for ConstructorParamsSuperReplacer<'a, '_> {
             return;
         }
 
-        walk_mut::walk_expression(self, expr);
+        walk_js_mut::walk_expression(self, expr);
     }
 
     // Stop traversing where scope of current `super` ends
@@ -549,7 +673,7 @@ impl<'a> VisitMut<'a> for ConstructorParamsSuperReplacer<'a, '_> {
         // Don't visit `type_annotation` field because can't contain `super()`.
         // TODO: Are decorators in scope?
         self.visit_decorators(&mut prop.decorators);
-        if prop.computed {
+        if prop.key.is_computed() {
             self.visit_property_key(&mut prop.key);
         }
     }
@@ -559,7 +683,7 @@ impl<'a> VisitMut<'a> for ConstructorParamsSuperReplacer<'a, '_> {
         // Visit computed `key` but not `value`, for same reasons as `visit_property_definition` above.
         // TODO: Are decorators in scope?
         self.visit_decorators(&mut prop.decorators);
-        if prop.computed {
+        if prop.key.is_computed() {
             self.visit_property_key(&mut prop.key);
         }
     }
@@ -577,19 +701,22 @@ impl<'a> ConstructorParamsSuperReplacer<'a, '_> {
         });
 
         let ctx = &mut *self.ctx;
-        let super_call = expr.take_in(ctx.ast);
-        *expr = ctx.ast.expression_call(
-            span,
-            Expression::from(ctx.ast.member_expression_static(
-                SPAN,
-                super_binding.create_read_expression(ctx),
-                ctx.ast.identifier_name(SPAN, Str::from("call")),
+        expr.replace_with(|super_call| {
+            Expression::new_call_expression(
+                span,
+                Expression::new_static_member_expression(
+                    SPAN,
+                    super_binding.create_read_expression(ctx),
+                    IdentifierName::new(SPAN, "call", ctx),
+                    false,
+                    ctx,
+                ),
+                None,
+                [Argument::from(super_call)],
                 false,
-            )),
-            NONE,
-            ctx.ast.vec1(Argument::from(super_call)),
-            false,
-        );
+                ctx,
+            )
+        });
     }
 }
 
@@ -691,7 +818,7 @@ impl<'a, 'ctx> ConstructorBodySuperReplacer<'a, 'ctx> {
     }
 }
 
-impl<'a> VisitMut<'a> for ConstructorBodySuperReplacer<'a, '_> {
+impl<'a> VisitJsMut<'a> for ConstructorBodySuperReplacer<'a, '_> {
     /// Replace `super()` with `_super()`.
     // `#[inline]` to make hot path for all other function calls as cheap as possible.
     #[inline]
@@ -701,7 +828,7 @@ impl<'a> VisitMut<'a> for ConstructorBodySuperReplacer<'a, '_> {
             self.replace_super(call_expr, span);
         }
 
-        walk_mut::walk_call_expression(self, call_expr);
+        walk_js_mut::walk_call_expression(self, call_expr);
     }
 
     // Stop traversing where scope of current `super` ends
@@ -732,7 +859,7 @@ impl<'a> VisitMut<'a> for ConstructorBodySuperReplacer<'a, '_> {
         // Don't visit `type_annotation` field because can't contain `super()`.
         // TODO: Are decorators in scope?
         self.visit_decorators(&mut prop.decorators);
-        if prop.computed {
+        if prop.key.is_computed() {
             self.visit_property_key(&mut prop.key);
         }
     }
@@ -742,7 +869,7 @@ impl<'a> VisitMut<'a> for ConstructorBodySuperReplacer<'a, '_> {
         // Visit computed `key` but not `value`, for same reasons as `visit_property_definition` above.
         // TODO: Are decorators in scope?
         self.visit_decorators(&mut prop.decorators);
-        if prop.computed {
+        if prop.key.is_computed() {
             self.visit_property_key(&mut prop.key);
         }
     }

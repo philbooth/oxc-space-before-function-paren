@@ -1,0 +1,31 @@
+---
+source: crates/oxc_react_compiler/tests/snapshot.rs
+input_file: crates/oxc_react_compiler/fixtures/primitive-alias-mutate.js
+---
+function component(a) {
+	let x;
+	if (a) {
+		x = "bar";
+	} else {
+		x = "baz";
+	}
+	const y = x;
+	mutate(y);
+	return y;
+}
+import { mutate } from "shared-runtime";
+const sproutInputs = [[true], [false]];
+export const FIXTURE_ENTRYPOINT = {
+	fn: (args) => {
+		"use no memo";
+		return component(...args);
+	},
+	params: [sproutInputs[0]],
+	sequentialRenders: [
+		sproutInputs[0],
+		sproutInputs[0],
+		...sproutInputs.slice(1),
+		sproutInputs.at(-1),
+		sproutInputs[0]
+	]
+};

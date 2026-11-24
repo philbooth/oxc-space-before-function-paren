@@ -10,21 +10,22 @@ permissions: {}
 
 on:
   workflow_dispatch:
+  # No `paths` filter for PRs: GitHub applies it to a PR's own diff, so on the top PR of a native GitHub stack it'd miss
+  # the changes in the PRs below, which skip this workflow (see `if` below). `generate-benchmark-matrix.js` filters
+  # on PRs instead.
   pull_request:
     types: [opened, synchronize]
-    branches-ignore:
-      - "**/graphite-base/**"
-    paths: &paths
+  push:
+    branches:
+      - main
+    # Keep in sync with `isRelevantFile` in `.github/scripts/generate-benchmark-matrix.js`.
+    paths:
       - "crates/**/*.rs"
       - "tasks/benchmark/**/*.rs"
       - "tasks/common/**/*.rs"
       - "Cargo.lock"
       - "rust-toolchain.toml"
       - ".github/workflows/benchmark.yml"
-  push:
-    branches:
-      - main
-    paths: *paths
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.event.pull_request.number || github.sha }}
@@ -34,7 +35,18 @@ jobs:
   determine-matrix:
     name: Determine Benchmark
     runs-on: ubuntu-latest
-    if: ${{ github.event_name != 'pull_request' || !contains(github.event.pull_request.labels.*.name, '0-merge') }}
+    # Skip on PRs in the middle of a native GitHub stack. Same as `*not-mid-stack` in `ci.yml`, see comment there.
+    if: >
+      github.repository == 'oxc-project/oxc' &&
+      (
+        github.event_name != 'pull_request' ||
+        !contains(github.event.pull_request.labels.*.name, '0-merge')
+      ) &&
+      (
+        github.event.pull_request.stack == null ||
+        github.event.pull_request.base.ref == github.event.pull_request.stack.base.ref ||
+        github.event.pull_request.stack.position == github.event.pull_request.stack.size
+      )
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
     steps:
@@ -69,12 +81,14 @@ jobs:
     steps:
       - uses: taiki-e/checkout-action@7d1e50e93dc4fb3bba58f85018fadf77898aee8b # v1.4.2
 
-      - uses: oxc-project/setup-rust@23f38cfb0c04af97a055f76acee94d5be71c7c82 # v1.0.16
+      - uses: oxc-project/setup-rust@3d6fb132fbe7cdcb66bf8ec193911c2945369d12 # v1.0.17
         with:
           cache-key: benchmark-${{ matrix.feature }}
           save-cache: ${{ github.ref_name == 'main' }}
           tools: cargo-codspeed
 
+      # Memory mode reuses these binaries: cargo-codspeed maps both simulation and
+      # memory modes to the same `analysis` build (`--cfg codspeed`) and directory.
       - name: Build benchmark
         env:
           RUSTFLAGS: "-C debuginfo=1 -C strip=none -g --cfg codspeed"
@@ -87,13 +101,16 @@ jobs:
               --bench ${{ matrix.component }} \
               --no-default-features --features ${{ matrix.feature }} --features codspeed
           fi
+          bench=$(cargo build --release -p oxc_benchmark --bench ${{ matrix.component }} \
+            --no-default-features --features ${{ matrix.feature }} --features codspeed \
+            --message-format=json \
+            | jq -r 'select(.reason == "compiler-artifact" and .target.kind == ["bench"]) | .executable')
           mkdir -p target/codspeed/analysis/oxc_benchmark
-          mv target/release/deps/${{ matrix.component }}-* target/codspeed/analysis/oxc_benchmark
-          rm target/codspeed/analysis/oxc_benchmark/*.d
+          mv "$bench" target/codspeed/analysis/oxc_benchmark
 
       - name: Run benchmark
-        uses: CodSpeedHQ/action@658a901452bb54c799643e060733b7afe9121b8d # v4.14.0
+        uses: CodSpeedHQ/action@c4fd08a3a159bd0cc208da1e0edf32b8c47d75e5 # v5.4.0
         timeout-minutes: 30
         with:
-          mode: simulation
+          mode: ${{ matrix.mode }}
           run: cargo codspeed run ${{ matrix.component }}

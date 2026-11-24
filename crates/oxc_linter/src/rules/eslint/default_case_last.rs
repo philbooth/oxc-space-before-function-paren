@@ -82,6 +82,7 @@ declare_oxc_lint!(
     eslint,
     style,
     version = "0.0.16",
+    short_description = "Requires the `default` clause in `switch` statements to be the last one.",
 );
 
 impl Rule for DefaultCaseLast {
@@ -92,7 +93,7 @@ impl Rule for DefaultCaseLast {
 
         let cases = &switch.cases;
         let cases_without_last = &cases[..cases.len().saturating_sub(1)];
-        if let Some(default_clause) = cases_without_last.iter().find(|c| c.test.is_none()) {
+        if let Some(default_clause) = cases_without_last.iter().find(|c| c.is_default_case()) {
             ctx.diagnostic(default_case_last_diagnostic(default_clause.span));
         }
     }

@@ -10,11 +10,12 @@ mod code_actions;
 mod commands;
 mod error_with_position;
 mod lsp_file_system;
-mod options;
 mod server_linter;
 #[cfg(test)]
 mod tester;
 mod utils;
+
+pub mod options;
 
 /// Run the language server
 pub async fn run_lsp(
@@ -23,7 +24,7 @@ pub async fn run_lsp(
 ) {
     let version = {
         let mut version = env!("CARGO_PKG_VERSION").to_string();
-        if let Some(vp_version) = crate::vp_version() {
+        if let Some(vp_version) = oxc_config::vp_version() {
             let _ = write!(version, " (VP: {})", vp_version.to_string_lossy());
         }
         version

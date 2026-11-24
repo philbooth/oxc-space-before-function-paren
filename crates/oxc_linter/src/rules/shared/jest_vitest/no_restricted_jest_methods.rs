@@ -1,13 +1,20 @@
-use oxc_ast::AstKind;
-use oxc_diagnostics::OxcDiagnostic;
-use oxc_span::Span;
 use rustc_hash::FxHashMap;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
+use oxc_ast::{AstKind, ast::Expression};
+use oxc_diagnostics::OxcDiagnostic;
+use oxc_semantic::AstNode;
+use oxc_span::Span;
+use oxc_str::CompactStr;
+
 use crate::{
     context::LintContext,
-    utils::{JestFnKind, JestGeneralFnKind, PossibleJestNode, is_type_of_jest_fn_call},
+    rule::DefaultRuleConfig,
+    utils::{
+        JestFnKind, JestGeneralFnKind, PossibleJestNode, object_with_nullable_string_schema,
+        parse_general_jest_fn_call,
+    },
 };
 
 fn restricted_jest_method(method_name: &str, span: Span) -> OxcDiagnostic {
@@ -54,50 +61,57 @@ test('plays video', () => {
 
 #[derive(Debug, Default, Clone, JsonSchema, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct NoRestrictedJestMethodsConfig {
+pub struct NoRestrictedTestMethodsConfig {
     /// A mapping of restricted Jest method names to custom messages - or
     /// `null`, for a generic message.
-    pub restricted_jest_methods: FxHashMap<String, String>,
+    #[schemars(schema_with = "object_with_nullable_string_schema")]
+    #[serde(flatten)]
+    pub restricted_methods: FxHashMap<String, Option<CompactStr>>,
 }
 
-impl NoRestrictedJestMethodsConfig {
-    #[expect(clippy::unnecessary_wraps)]
+impl NoRestrictedTestMethodsConfig {
     pub fn from_configuration(value: &serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        let restricted_jest_methods = value
-            .get(0)
-            .and_then(serde_json::Value::as_object)
-            .map(Self::compile_restricted_jest_methods)
-            .unwrap_or_default();
-
-        Ok(NoRestrictedJestMethodsConfig { restricted_jest_methods })
+        DefaultRuleConfig::<Self>::from_value(value.clone()).map(DefaultRuleConfig::into_inner)
     }
-    pub fn run<'a>(&self, possible_jest_node: &PossibleJestNode<'a, '_>, ctx: &LintContext<'a>) {
-        let node = possible_jest_node.node;
+
+    pub fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
         let AstKind::CallExpression(call_expr) = node.kind() else {
             return;
         };
 
-        if !is_type_of_jest_fn_call(
-            call_expr,
-            possible_jest_node,
-            ctx,
-            &[
-                JestFnKind::General(JestGeneralFnKind::Jest),
-                JestFnKind::General(JestGeneralFnKind::Vitest),
-            ],
+        let Some(possible_jest_node) = PossibleJestNode::from_call_expression(node, call_expr, ctx)
+        else {
+            return;
+        };
+
+        let Some(jest_fn_call) = parse_general_jest_fn_call(call_expr, &possible_jest_node, ctx)
+        else {
+            return;
+        };
+
+        if !matches!(
+            jest_fn_call.kind,
+            JestFnKind::General(JestGeneralFnKind::Jest | JestGeneralFnKind::Vitest)
         ) {
             return;
         }
 
-        let Some(mem_expr) = call_expr.callee.as_member_expression() else {
+        let Some(member) = jest_fn_call.members.first() else {
             return;
         };
-        let Some(property_name) = mem_expr.static_property_name() else {
+
+        let Some(member_expr) = member.parent.and_then(Expression::as_member_expression) else {
             return;
         };
-        let Some((span, _)) = mem_expr.static_property_info() else {
+        if !matches!(member_expr.object(), Expression::Identifier(_)) {
+            return;
+        }
+
+        let Some(property_name) = member.name() else {
             return;
         };
+        let property_name = property_name.as_ref();
+        let span = member.span;
 
         if self.contains(property_name) {
             self.get_message(property_name).map_or_else(
@@ -105,32 +119,17 @@ impl NoRestrictedJestMethodsConfig {
                     ctx.diagnostic(restricted_jest_method(property_name, span));
                 },
                 |message| {
-                    if message.trim() == "" {
-                        ctx.diagnostic(restricted_jest_method(property_name, span));
-                    } else {
-                        ctx.diagnostic(restricted_jest_method_with_message(&message, span));
-                    }
+                    ctx.diagnostic(restricted_jest_method_with_message(&message, span));
                 },
             );
         }
     }
 
     fn contains(&self, key: &str) -> bool {
-        self.restricted_jest_methods.contains_key(key)
+        self.restricted_methods.contains_key(key)
     }
 
-    fn get_message(&self, name: &str) -> Option<String> {
-        self.restricted_jest_methods.get(name).cloned()
-    }
-
-    pub fn compile_restricted_jest_methods(
-        matchers: &serde_json::Map<String, serde_json::Value>,
-    ) -> FxHashMap<String, String> {
-        matchers
-            .iter()
-            .map(|(key, value)| {
-                (String::from(key), String::from(value.as_str().unwrap_or_default()))
-            })
-            .collect()
+    fn get_message(&self, name: &str) -> Option<CompactStr> {
+        self.restricted_methods.get(name).cloned().flatten()
     }
 }

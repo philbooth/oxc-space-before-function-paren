@@ -1,5 +1,6 @@
 use memchr::memchr;
 
+use oxc_data_structures::branch_hints::cold_path;
 use oxc_span::Span;
 use oxc_syntax::identifier::is_identifier_part;
 
@@ -54,7 +55,7 @@ impl<C: Config> Lexer<'_, C> {
     }
 
     pub(crate) fn next_jsx_child(&mut self) -> Token {
-        self.token.set_start(self.offset());
+        self.token_start = self.offset();
         let kind = self.read_jsx_child();
         self.finish_next(kind)
     }
@@ -110,11 +111,18 @@ impl<C: Config> Lexer<'_, C> {
     ///   `IdentifierStart`
     ///   `JSXIdentifier` `IdentifierPart`
     ///   `JSXIdentifier` [no `WhiteSpace` or Comment here] -
+    #[inline] // Every `JSXIdentifier` checks for `-`. Few continue past it.
     pub(crate) fn continue_lex_jsx_identifier(&mut self, start: u32) -> Option<Token> {
         if self.peek_byte() != Some(b'-') {
             return None;
         }
-        self.token.set_start(start);
+        Some(self.continue_lex_jsx_identifier_at_dash(start))
+    }
+
+    /// Continue the `JSXIdentifier` which starts at `start`, from the `-` at the current position.
+    fn continue_lex_jsx_identifier_at_dash(&mut self, start: u32) -> Token {
+        debug_assert_eq!(self.peek_byte(), Some(b'-'));
+        self.token_start = start;
         self.consume_char();
 
         // Consume bytes which are part of identifier tail
@@ -122,7 +130,7 @@ impl<C: Config> Lexer<'_, C> {
             lexer: self,
             table: NOT_ASCII_JSX_ID_CONTINUE_TABLE,
             handle_eof: {
-                return Some(self.finish_next_retokenized(Kind::Ident));
+                return self.finish_next_retokenized(Kind::Ident);
             },
         };
 
@@ -131,17 +139,16 @@ impl<C: Config> Lexer<'_, C> {
         if !next_byte.is_ascii() {
             // Unicode chars are rare in identifiers, so cold branch to keep common path for ASCII
             // as fast as possible
-            cold_branch(|| {
-                while let Some(c) = self.peek_char() {
-                    if c == '-' || is_identifier_part(c) {
-                        self.consume_char();
-                    } else {
-                        break;
-                    }
+            cold_path();
+            while let Some(c) = self.peek_char() {
+                if c == '-' || is_identifier_part(c) {
+                    self.consume_char();
+                } else {
+                    break;
                 }
-            });
+            }
         }
 
-        Some(self.finish_next_retokenized(Kind::Ident))
+        self.finish_next_retokenized(Kind::Ident)
     }
 }

@@ -1,19 +1,16 @@
 use std::borrow::Cow;
 
-use oxc_allocator::Allocator;
 use oxc_ast::Comment;
+use oxc_formatter_core::FormatSession;
 use oxc_jsdoc::JSDoc;
 use oxc_span::Span;
 
-use crate::FormatOptions;
-use crate::external_formatter::ExternalCallbacks;
-use crate::formatter::Formatter;
 use crate::formatter::prelude::*;
 use crate::options::{JsdocOptions, QuoteStyle};
-use crate::write;
+use crate::{JsFormatOptions, write};
 
 use super::{
-    imports::process_import_tags, line_buffer::LineBuffer,
+    embedded::snippet_options, imports::process_import_tags, line_buffer::LineBuffer,
     mdast_serialize::format_description_mdast, normalize::normalize_tag_kind,
     param_order::reorder_param_tags,
 };
@@ -28,8 +25,8 @@ pub enum FormattedJsdoc<'a> {
     MultiLine(&'a str),
 }
 
-impl<'a> Format<'a> for FormattedJsdoc<'a> {
-    fn fmt(&self, f: &mut Formatter<'_, 'a>) {
+impl<'a> Format<'a, JsFormatContext<'a>> for FormattedJsdoc<'a> {
+    fn fmt(&self, f: &mut JsFormatter<'_, 'a>) {
         match self {
             FormattedJsdoc::Empty => {}
             FormattedJsdoc::SingleLine(content) => {
@@ -56,14 +53,15 @@ const LINE_PREFIX_LEN: usize = 3;
 /// Holds the shared per-comment state for JSDoc formatting,
 /// reducing parameter passing across formatting functions.
 ///
-/// Uses two lifetimes: `'a` for the allocator (tied to output strings)
-/// and `'o` for options (only need to live as long as the formatter).
+/// Uses two lifetimes: `'a` for the arena (tied to output strings)
+/// and `'o` for the options / session references (only need to live as long as the formatter).
 pub(super) struct JsdocFormatter<'a, 'o> {
     pub(super) options: &'o JsdocOptions,
-    pub(super) format_options: &'o FormatOptions,
-    pub(super) type_format_options: FormatOptions,
-    pub(super) allocator: &'a Allocator,
-    pub(super) external_callbacks: Option<&'o ExternalCallbacks>,
+    pub(super) format_options: &'o JsFormatOptions,
+    pub(super) type_format_options: JsFormatOptions,
+    /// The parent JS run's session: arena, string embedder, and (for fenced
+    /// JS/TS snippets) the dispatcher for embeds inside the snippet.
+    pub(super) session: &'o FormatSession<'a>,
     pub(super) wrap_width: usize,
     pub(super) content_lines: LineBuffer,
 }
@@ -71,31 +69,23 @@ pub(super) struct JsdocFormatter<'a, 'o> {
 impl<'a, 'o> JsdocFormatter<'a, 'o> {
     fn new(
         options: &'o JsdocOptions,
-        format_options: &'o FormatOptions,
-        allocator: &'a Allocator,
+        format_options: &'o JsFormatOptions,
+        session: &'o FormatSession<'a>,
         available_width: usize,
-        external_callbacks: Option<&'o ExternalCallbacks>,
     ) -> Self {
+        // NOTE: `jsdocPrintWidth` (`jsdocPrintWidth ?? printWidth`) is not yet ported
         let wrap_width = available_width.saturating_sub(LINE_PREFIX_LEN);
         // Use commentContentPrintWidth (= wrap_width) as the line width for type
         // formatting, matching upstream's `formatType()` which passes
         // `commentContentPrintWidth` to Prettier's TS formatter. This lets the
         // formatter wrap complex types (object literals, function types) across
         // multiple lines when they exceed the available width.
-        let type_width = u16::try_from(wrap_width).unwrap_or(80).clamp(1, crate::LineWidth::MAX);
-        let type_format_options = FormatOptions {
-            line_width: crate::LineWidth::try_from(type_width).unwrap(),
-            jsdoc: None,
-            sort_imports: None,
-            sort_tailwindcss: None,
-            ..format_options.clone()
-        };
+        let type_format_options = snippet_options(format_options, wrap_width);
         Self {
             options,
             format_options,
             type_format_options,
-            allocator,
-            external_callbacks,
+            session,
             wrap_width,
             content_lines: LineBuffer::new(),
         }
@@ -142,7 +132,7 @@ impl<'a, 'o> JsdocFormatter<'a, 'o> {
                 continue;
             }
             if *normalized_kind == "description" {
-                let desc_content = tag.comment().parsed();
+                let desc_content = tag.comment().parsed_preserving_whitespace();
                 let desc_content = desc_content.trim();
                 if !desc_content.is_empty() {
                     if !merged_desc.is_empty() {
@@ -166,7 +156,7 @@ impl<'a, 'o> JsdocFormatter<'a, 'o> {
         if merged_desc.is_empty()
             && effective_tags.len() == 1
             && effective_tags[0].1 == "type"
-            && !content.contains('\n')
+            && !comment.is_multiline_block()
             && effective_tags[0].0.comment().parsed().trim().is_empty()
         {
             return None;
@@ -174,30 +164,26 @@ impl<'a, 'o> JsdocFormatter<'a, 'o> {
 
         // Format and emit the merged description
         if !merged_desc.is_empty() {
+            let tag_prefix = if self.options.description_tag { "@description " } else { "" };
             let desc = format_description_mdast(
                 &merged_desc,
                 self.wrap_width,
-                0,
+                tag_prefix.len(),
                 self.options.capitalize_descriptions,
-                Some(self.format_options),
-                Some(self.allocator),
-                self.external_callbacks,
+                self.format_options,
+                self.session,
             );
-            if self.options.description_tag {
-                // Emit as @description tag
-                let s = self.content_lines.begin_line();
-                s.push_str("@description ");
-                s.push_str(&desc);
-            } else {
-                self.content_lines.push(desc);
-            }
+            let s = self.content_lines.begin_line();
+            s.push_str(tag_prefix);
+            s.push_str(&desc);
         }
 
         // Reorder @param tags to match the function signature order
         reorder_param_tags(&mut effective_tags, comment, source_text);
 
         // Pre-process @import tags: merge by module, sort, format
-        let (mut import_lines, parsed_import_indices) = process_import_tags(&effective_tags);
+        let (mut import_lines, parsed_import_indices) =
+            process_import_tags(&effective_tags, self.quote_style());
         let has_imports = !import_lines.is_empty();
         let mut imports_emitted = false;
 
@@ -369,7 +355,7 @@ impl<'a, 'o> JsdocFormatter<'a, 'o> {
             crate::options::CommentLineStrategy::Multiline => false,
             crate::options::CommentLineStrategy::Keep => {
                 // Preserve original: only use single-line if original was single-line
-                second.is_none() && !content.contains('\n')
+                second.is_none() && !comment.is_multiline_block()
             }
         };
         if use_single_line {
@@ -381,7 +367,7 @@ impl<'a, 'o> JsdocFormatter<'a, 'o> {
             if tmp == content {
                 return None;
             }
-            let alloc_first = self.allocator.alloc_str(first);
+            let alloc_first = self.session.allocator().alloc_str(first);
             return Some(FormattedJsdoc::SingleLine(alloc_first));
         }
 
@@ -409,7 +395,7 @@ impl<'a, 'o> JsdocFormatter<'a, 'o> {
         }
 
         // Arena-allocate only the inner content (without /** */ wrapper)
-        let alloc_content = self.allocator.alloc_str(content_str);
+        let alloc_content = self.session.allocator().alloc_str(content_str);
         Some(FormattedJsdoc::MultiLine(alloc_content))
     }
 
@@ -499,12 +485,6 @@ impl<'a, 'o> JsdocFormatter<'a, 'o> {
     pub(super) fn quote_style(&self) -> QuoteStyle {
         self.format_options.quote_style
     }
-}
-
-/// Trim trailing whitespace from an owned `String` in place, avoiding a reallocation.
-pub(super) fn truncate_trim_end(s: &mut String) {
-    let trimmed_len = s.trim_end().len();
-    s.truncate(trimmed_len);
 }
 
 /// Join an iterator of string slices with a separator, avoiding an intermediate `Vec`.
@@ -1074,16 +1054,9 @@ pub fn format_jsdoc_comment<'a>(
     options: &JsdocOptions,
     source_text: &str,
     available_width: usize,
-    f: &Formatter<'_, 'a>,
+    f: &JsFormatter<'_, 'a>,
 ) -> Option<FormattedJsdoc<'a>> {
-    let external_callbacks = f.context().external_callbacks();
-    let fmt = JsdocFormatter::new(
-        options,
-        f.options(),
-        f.allocator(),
-        available_width,
-        Some(external_callbacks),
-    );
+    let fmt = JsdocFormatter::new(options, f.options(), f.session(), available_width);
     fmt.format(comment, source_text)
 }
 
@@ -1172,10 +1145,15 @@ mod tests {
         assert!(!should_remove_empty_tag("abstract"));
     }
 
-    fn fmt_type(type_str: &str) -> Option<String> {
+    fn fmt_type_with_opts(type_str: &str, opts: &JsFormatOptions) -> Option<String> {
         use crate::formatter::jsdoc::embedded::format_type_via_formatter;
         let allocator = oxc_allocator::Allocator::default();
-        format_type_via_formatter(type_str, &FormatOptions::default(), &allocator)
+        let session = FormatSession::new(&allocator, oxc_formatter_core::InputKind::Fragment);
+        format_type_via_formatter(type_str, opts, &session)
+    }
+
+    fn fmt_type(type_str: &str) -> Option<String> {
+        fmt_type_with_opts(type_str, &JsFormatOptions::default())
     }
 
     #[test]
@@ -1194,17 +1172,7 @@ mod tests {
     }
 
     fn fmt_type_width(type_str: &str, width: u16) -> Option<String> {
-        use crate::LineWidth;
-        use crate::formatter::jsdoc::embedded::format_type_via_formatter;
-        let allocator = oxc_allocator::Allocator::default();
-        let opts = FormatOptions {
-            line_width: LineWidth::try_from(width).unwrap(),
-            jsdoc: None,
-            sort_imports: None,
-            sort_tailwindcss: None,
-            ..FormatOptions::default()
-        };
-        format_type_via_formatter(type_str, &opts, &allocator)
+        fmt_type_with_opts(type_str, &snippet_options(&JsFormatOptions::default(), width.into()))
     }
 
     #[test]

@@ -10,10 +10,11 @@ use crate::{
     AstNode,
     context::LintContext,
     fixer::RuleFixer,
+    globals::HTML_TAG,
     rule::{DefaultRuleConfig, Rule},
     utils::{
         KEYBOARD_EVENT_HANDLERS, MOUSE_EVENT_HANDLERS, get_element_type,
-        get_string_literal_prop_value, has_jsx_prop, has_jsx_prop_ignore_case, is_disabled_element,
+        get_string_literal_prop_value, has_jsx_prop_ignore_case, is_disabled_element,
         is_hidden_from_screen_reader, is_interactive_element, is_interactive_role,
         is_non_interactive_element, is_non_interactive_role, is_presentation_role,
     },
@@ -91,14 +92,16 @@ declare_oxc_lint!(
     InteractiveSupportsFocus,
     jsx_a11y,
     correctness,
+    recommended,
     suggestion,
     config = InteractiveSupportsFocusConfig,
-    version = "next",
+    version = "1.63.0",
+    short_description = "Enforce that elements with interactive roles and interaction handlers (mouse or key press) must be focusable.",
 );
 
 impl Rule for InteractiveSupportsFocus {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        serde_json::from_value::<DefaultRuleConfig<Self>>(value).map(DefaultRuleConfig::into_inner)
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
     }
 
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
@@ -106,29 +109,41 @@ impl Rule for InteractiveSupportsFocus {
             return;
         };
 
-        let role_str =
-            has_jsx_prop_ignore_case(jsx_el, "role").and_then(get_string_literal_prop_value);
-        let element_type = get_element_type(ctx, jsx_el);
         let has_interactive_handler = EVENT_HANDLERS
             .iter()
             .flat_map(|handlers| handlers.iter())
-            .any(|handler| has_jsx_prop(jsx_el, handler).is_some());
-        let has_tab_index = has_jsx_prop_ignore_case(jsx_el, "tabIndex").is_some();
+            .any(|handler| has_jsx_prop_ignore_case(jsx_el, handler).is_some());
+        if !has_interactive_handler {
+            return;
+        }
 
-        if !has_interactive_handler
-            || is_disabled_element(jsx_el)
+        let Some(role) =
+            has_jsx_prop_ignore_case(jsx_el, "role").and_then(get_string_literal_prop_value)
+        else {
+            return;
+        };
+
+        if is_disabled_element(jsx_el)
             || is_hidden_from_screen_reader(ctx, jsx_el)
             || is_presentation_role(jsx_el)
+            || has_jsx_prop_ignore_case(jsx_el, "tabIndex").is_some()
         {
             return;
         }
 
-        let Some(role) = role_str else { return };
-        if !is_interactive_role(role)
-            || is_interactive_element(&element_type, jsx_el)
-            || is_non_interactive_role(role)
+        if !is_interactive_role(role) || is_non_interactive_role(role) {
+            return;
+        }
+
+        let element_type = get_element_type(ctx, jsx_el);
+
+        // Do not test unresolved custom components because their rendered DOM element is unknown.
+        if !HTML_TAG.contains(element_type.as_ref()) {
+            return;
+        }
+
+        if is_interactive_element(&element_type, jsx_el)
             || is_non_interactive_element(&element_type, jsx_el)
-            || has_tab_index
         {
             return;
         }
@@ -208,6 +223,8 @@ fn test() {
         (r#"<a onClick={() => void 0} href="http://x.y.z" tabIndex={0} />"#, None, None),
         (r#"<a onClick={() => void 0} href="http://x.y.z" role="button" />"#, None, None),
         (r"<TestComponent onClick={doFoo} />", None, None),
+        (r#"<HigherLevelComponent role="button" onClick={() => void 0} />"#, None, None),
+        (r#"<Foo.Bar role="button" onClick={() => void 0} />"#, None, None),
         (r#"<input onClick={() => void 0} type="hidden" />;"#, None, None),
         (r"<span onClick='submitForm();'>Submit</span>", None, None),
         (r"<span onClick='submitForm();' tabIndex={undefined}>Submit</span>", None, None),
@@ -289,6 +306,7 @@ fn test() {
         (r#"<div role="slider" onClick={() => void 0} />"#, None, None),
         (r#"<div role="tab" onClick={() => void 0} />"#, None, None),
         (r#"<div role="treeitem" onClick={() => void 0} />"#, None, None),
+        (r#"<div role="button" onclick={() => void 0} />"#, None, None),
     ];
 
     let fix_tabbable = vec![(

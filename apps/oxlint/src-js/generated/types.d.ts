@@ -25,7 +25,6 @@ export type Expression =
   | StringLiteral
   | TemplateLiteral
   | IdentifierReference
-  | MetaProperty
   | Super
   | ArrayExpression
   | ArrowFunctionExpression
@@ -49,6 +48,7 @@ export type Expression =
   | UpdateExpression
   | YieldExpression
   | PrivateInExpression
+  | MetaProperty
   | JSXElement
   | JSXFragment
   | TSAsExpression
@@ -82,7 +82,7 @@ export interface BindingIdentifier extends Span {
   decorators?: [];
   name: string;
   optional?: false;
-  typeAnnotation?: null;
+  typeAnnotation?: TSTypeAnnotation | null;
   parent: Node;
 }
 
@@ -128,7 +128,13 @@ export interface ObjectProperty extends Span {
   parent: Node;
 }
 
-export type PropertyKey = IdentifierName | PrivateIdentifier | Expression;
+export type PropertyKey =
+  | IdentifierName
+  | StringLiteral
+  | NumericLiteral
+  | BigIntLiteral
+  | PrivateIdentifier
+  | Expression;
 
 export type PropertyKind = "init" | "get" | "set";
 
@@ -613,7 +619,7 @@ export interface ObjectPattern extends Span {
   decorators?: [];
   properties: Array<BindingProperty | BindingRestElement>;
   optional?: false;
-  typeAnnotation?: null;
+  typeAnnotation?: TSTypeAnnotation | null;
   parent: Node;
 }
 
@@ -634,7 +640,7 @@ export interface ArrayPattern extends Span {
   decorators?: [];
   elements: Array<BindingPattern | BindingRestElement | null>;
   optional?: false;
-  typeAnnotation?: null;
+  typeAnnotation?: TSTypeAnnotation | null;
   parent: Node;
 }
 
@@ -643,7 +649,7 @@ export interface BindingRestElement extends Span {
   decorators?: [];
   argument: BindingPattern;
   optional?: false;
-  typeAnnotation?: null;
+  typeAnnotation?: TSTypeAnnotation | null;
   value?: null;
   parent: Node;
 }
@@ -673,7 +679,7 @@ export type FunctionType =
 export interface FormalParameterRest extends Span {
   type: "RestElement";
   argument: BindingPattern;
-  decorators?: [];
+  decorators?: Array<Decorator>;
   optional?: boolean;
   typeAnnotation?: TSTypeAnnotation | null;
   value?: null;
@@ -1484,6 +1490,8 @@ export interface TSTypePredicate extends Span {
 
 export type TSTypePredicateName = IdentifierName | TSThisType;
 
+export type TSModuleDeclarationKind = "module" | "namespace";
+
 export interface TSModuleDeclaration extends Span {
   type: "TSModuleDeclaration";
   id: BindingIdentifier | StringLiteral | TSQualifiedName;
@@ -1493,8 +1501,6 @@ export interface TSModuleDeclaration extends Span {
   global: false;
   parent: Node;
 }
-
-export type TSModuleDeclarationKind = "module" | "namespace";
 
 export interface TSGlobalDeclaration extends Span {
   type: "TSModuleDeclaration";

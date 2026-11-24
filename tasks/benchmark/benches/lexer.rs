@@ -7,7 +7,7 @@ use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
 use oxc_benchmark::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use oxc_parser::{
-    Parser,
+    ParseOptions, Parser,
     config::{LexerConfig, NoTokensLexerConfig},
     lexer::{Kind, Lexer},
 };
@@ -17,32 +17,7 @@ use oxc_tasks_common::{TestFile, TestFiles};
 fn bench_lexer(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("lexer");
 
-    // Lexer lacks awareness of JS grammar, so it gets confused by a few things without the parser
-    // driving it. So simplify the input for it, by replacing these syntaxes with plain strings.
-    // This ensures lexing completes without generating any errors, which is more realistic.
-    //
-    // It's unfortunate that this benchmark doesn't exercise the code paths for these syntaxes,
-    // but this is the closest we can get to a realistic benchmark of lexer in isolation.
-    let mut allocator = Allocator::default();
-    let files = TestFiles::minimal()
-        .files()
-        .iter()
-        .map(|file| {
-            let source_type = SourceType::from_path(&file.file_name).unwrap();
-
-            let source_text = clean(&file.source_text, source_type, &allocator);
-            allocator.reset();
-
-            TestFile {
-                url: file.url.clone(),
-                file_name: file.file_name.clone(),
-                source_text,
-                source_type,
-            }
-        })
-        .collect::<Vec<_>>();
-
-    for file in files {
+    for file in cleaned_test_files() {
         let id = BenchmarkId::from_parameter(&file.file_name);
         let source_text = file.source_text.as_str();
         let source_type = file.source_type;
@@ -60,27 +35,59 @@ fn bench_lexer(criterion: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(lexer, bench_lexer);
-criterion_main!(lexer);
+/// Get the test files, with source text cleaned.
+///
+/// The lexer lacks awareness of JS grammar, so it gets confused by a few things
+/// without the parser driving it. So simplify the input for it, by replacing these syntaxes
+/// with plain strings. This ensures lexing completes without generating any errors,
+/// which is more realistic.
+///
+/// It's unfortunate that the benchmark doesn't exercise the code paths for these syntaxes,
+/// but this is the closest we can get to a realistic benchmark of the lexer in isolation.
+fn cleaned_test_files() -> Vec<TestFile> {
+    let mut allocator = Allocator::default();
 
+    TestFiles::minimal()
+        .files()
+        .iter()
+        .map(|file| {
+            let source_type = file.source_type;
+            let source_text = clean(&file.source_text, source_type, &allocator);
+
+            allocator.reset();
+
+            TestFile {
+                url: file.url.clone(),
+                file_name: file.file_name.clone(),
+                source_text,
+                source_type,
+            }
+        })
+        .collect()
+}
+
+/// Lex the whole of `source_text`. Returns the number of errors.
+//
 // `#[inline(always)]` to ensure this is inlined into benchmark.
 // It's also used in `SourceCleaner` below.
 #[expect(clippy::inline_always)]
 #[inline(always)]
-fn lex_whole_file<'a, C: LexerConfig>(
-    allocator: &'a Allocator,
-    source_text: &'a str,
+fn lex_whole_file<C: LexerConfig>(
+    allocator: &Allocator,
+    source_text: &str,
     source_type: SourceType,
     config: C,
-) -> Lexer<'a, C> {
-    let mut lexer = Lexer::new_for_benchmarks(allocator, source_text, source_type, config);
-    if lexer.first_token().kind() != Kind::Eof {
-        // Use `next_token_for_benchmarks` instead of `next_token`, to work around problem
-        // where `next_token` wasn't inlined here.
-        // `next_token_for_benchmarks` is identical to `next_token`, but is marked `#[inline(always)]`.
-        while lexer.next_token_for_benchmarks().kind() != Kind::Eof {}
-    }
-    lexer
+) -> usize {
+    Lexer::scope(allocator, source_text, source_type, config, |mut lexer| {
+        if lexer.first_token().kind() != Kind::Eof {
+            // Use `next_token_for_benchmarks` instead of `next_token`, to work around problem
+            // where `next_token` wasn't inlined here.
+            // `next_token_for_benchmarks` is identical to `next_token`,
+            // but is marked `#[inline(always)]`.
+            while lexer.next_token_for_benchmarks().kind() != Kind::Eof {}
+        }
+        lexer.errors().len()
+    })
 }
 
 /// Clean source text.
@@ -96,11 +103,15 @@ fn lex_whole_file<'a, C: LexerConfig>(
 /// So replace these syntaxes with strings so that lexer can complete without error:
 /// * `RegExpLiteral`
 /// * `TemplateLiteral`
+/// * `TSTemplateLiteralType` (TypeScript type-level template literal, lexically identical
+///   to `TemplateLiteral` so the lexer cannot tell them apart without parser context)
 /// * `JSXText`
 fn clean<'a>(source_text: &'a str, source_type: SourceType, allocator: &'a Allocator) -> String {
     // Parse
-    let parser_ret = Parser::new(allocator, source_text, source_type).parse();
-    assert!(parser_ret.errors.is_empty());
+    let parser_ret = Parser::new(allocator, source_text, source_type)
+        .with_options(ParseOptions { enable_ident_hashes: false, ..ParseOptions::default() })
+        .parse();
+    assert!(parser_ret.diagnostics.is_empty());
     let program = parser_ret.program;
 
     // Visit AST and compile list of replacements
@@ -121,8 +132,9 @@ fn clean<'a>(source_text: &'a str, source_type: SourceType, allocator: &'a Alloc
     clean_source_text.push_str(&source_text[last_index..]);
 
     // Check lexer can lex it without any errors
-    let lexer = lex_whole_file(allocator, &clean_source_text, source_type, NoTokensLexerConfig);
-    assert!(lexer.errors().is_empty());
+    let error_count =
+        lex_whole_file(allocator, &clean_source_text, source_type, NoTokensLexerConfig);
+    assert_eq!(error_count, 0);
 
     clean_source_text
 }
@@ -164,6 +176,18 @@ impl<'a> Visit<'a> for SourceCleaner<'a> {
         self.replace(span, text);
     }
 
+    fn visit_ts_template_literal_type(&mut self, lit: &TSTemplateLiteralType<'a>) {
+        // TS type-level template literals (e.g. `${T}-${U}` in conditional/mapped types) are
+        // lexically identical to value-level template literals. Without parser context, the
+        // bench-mode lexer can swallow large spans as a single `TemplateHead` when adjacent
+        // type templates are separated by other type syntax. Replace with a string just like
+        // `visit_template_literal` does.
+        let span = lit.span;
+        let text = span.shrink(1).source_text(self.source_text);
+        let text = convert_to_string(&text.cow_replace('\n', " "));
+        self.replace(span, text);
+    }
+
     fn visit_jsx_text(&mut self, jsx_text: &JSXText<'a>) {
         let span = jsx_text.span;
         let text = span.source_text(self.source_text);
@@ -189,3 +213,6 @@ fn convert_to_string(text: &str) -> String {
 
     format!("{quote}{text}{quote}")
 }
+
+criterion_group!(lexer, bench_lexer);
+criterion_main!(lexer);

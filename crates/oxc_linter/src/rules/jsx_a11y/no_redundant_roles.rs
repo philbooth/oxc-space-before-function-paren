@@ -1,16 +1,25 @@
+use rustc_hash::FxHashMap;
+use schemars::JsonSchema;
+use serde::Deserialize;
+
 use oxc_ast::{
     AstKind,
-    ast::{JSXAttributeItem, JSXAttributeValue},
+    ast::{Expression, JSXAttributeItem, JSXAttributeValue, JSXOpeningElement},
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_span::Span;
+use oxc_str::{CompactStr, JSStr};
 
 use crate::{
     AstNode,
     context::LintContext,
-    rule::Rule,
-    utils::{get_element_type, has_jsx_prop_ignore_case},
+    globals::VALID_ARIA_ROLES,
+    rule::{DefaultRuleConfig, Rule},
+    utils::{
+        get_element_implicit_roles, get_element_type, get_prop_value,
+        get_string_literal_prop_value, has_jsx_prop_ignore_case, parse_jsx_value,
+    },
 };
 
 fn no_redundant_roles_diagnostic(span: Span, element: &str, role: &str) -> OxcDiagnostic {
@@ -21,8 +30,22 @@ fn no_redundant_roles_diagnostic(span: Span, element: &str, role: &str) -> OxcDi
     .with_label(span)
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct NoRedundantRoles;
+/// Redundant roles that are allowed by default unless overridden by the
+/// `allowedRedundantRoles` option, mirroring eslint-plugin-jsx-a11y's
+/// `DEFAULT_ROLE_EXCEPTIONS`.
+const DEFAULT_ROLE_EXCEPTIONS: &[(&str, &str)] = &[("nav", "navigation")];
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct NoRedundantRoles(Box<NoRedundantRolesConfig>);
+
+#[derive(Debug, Clone, Default, Deserialize, JsonSchema)]
+pub struct NoRedundantRolesConfig {
+    /// A mapping of element names to the redundant roles that are explicitly
+    /// allowed on them. Providing an entry overrides the default exceptions for
+    /// that element.
+    #[serde(default, flatten)]
+    pub allowed_redundant_roles: FxHashMap<CompactStr, Vec<CompactStr>>,
+}
 
 declare_oxc_lint!(
     /// ### What it does
@@ -39,61 +62,256 @@ declare_oxc_lint!(
     ///
     /// This rule applies for the following elements and their implicit roles:
     ///
-    /// - `<nav>`: `navigation`
     /// - `<button>`: `button`
-    /// - `<body>`: `document`
     ///
     /// Examples of **incorrect** code for this rule:
     /// ```jsx
-    /// <nav role="navigation"></nav>
     /// <button role="button"></button>
-    /// <body role="document"></body>
     /// ```
     ///
     /// Examples of **correct** code for this rule:
     /// ```jsx
-    /// <nav></nav>
     /// <button></button>
-    /// <body></body>
+    /// ```
+    ///
+    /// ### Options
+    ///
+    /// This rule takes an object whose keys are element names and whose values
+    /// are arrays of redundant roles to allow on that element. Providing an
+    /// entry overrides the default exceptions for that element.
+    ///
+    /// By default `role="navigation"` is allowed on `<nav>`. Additional roles
+    /// can be allowed, for example to keep explicit list semantics that some
+    /// browsers drop when `list-style: none` is applied:
+    ///
+    /// ```json
+    /// {
+    ///   "jsx-a11y/no-redundant-roles": ["error", { "ul": ["list"], "ol": ["list"], "li": ["listitem"] }]
+    /// }
     /// ```
     NoRedundantRoles,
     jsx_a11y,
     correctness,
+    recommended,
     fix,
+    config = NoRedundantRolesConfig,
     version = "0.2.1",
+    short_description = "Enforces that code does not include a redundant `role` property, in the case that it's identical to the implicit `role` property of the element type.",
 );
 
-fn get_default_role_exception(tag: &str) -> Option<&'static str> {
-    match tag {
-        "nav" => Some("navigation"),
-        "button" => Some("button"),
-        "body" => Some("document"),
-        _ => None,
-    }
-}
-
 impl Rule for NoRedundantRoles {
+    fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
+    }
+
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
         let AstKind::JSXOpeningElement(jsx_el) = node.kind() else {
             return;
         };
 
         let component = get_element_type(ctx, jsx_el);
-
         if let Some(JSXAttributeItem::Attribute(attr)) = has_jsx_prop_ignore_case(jsx_el, "role")
             && let Some(JSXAttributeValue::StringLiteral(role_values)) = &attr.value
+            && let Some(value) = role_values.value.as_str()
         {
-            let roles = role_values.value.split_whitespace().collect::<Vec<_>>();
-            for role in &roles {
-                let exceptions = get_default_role_exception(&component);
-                if exceptions.is_some_and(|set| set.contains(role)) {
-                    ctx.diagnostic_with_fix(
-                        no_redundant_roles_diagnostic(attr.span, &component, role),
-                        |fixer| fixer.delete_range(attr.span),
-                    );
+            // Browsers use only the first valid non-abstract ARIA role token
+            // in the `role` attribute (WAI-ARIA 1.2 §4.1). Later tokens are
+            // fallbacks and are ignored when the first token matches a role.
+            let Some(first_valid_role) =
+                value.split_whitespace().find(|role| is_valid_aria_role(role))
+            else {
+                return;
+            };
+
+            if let Some(implicit_role) =
+                get_redundant_implicit_role(&component, jsx_el, first_valid_role)
+                && !self.is_allowed_redundant_role(&component, implicit_role)
+            {
+                let diagnostic =
+                    no_redundant_roles_diagnostic(attr.span, &component, implicit_role);
+                // Only safe-fix the whole attribute when it consists of a
+                // single valid token. With multiple tokens, deleting the
+                // attribute could change the effective role by removing
+                // fallbacks that are not redundant.
+                if value.split_whitespace().count() == 1 {
+                    ctx.diagnostic_with_fix(diagnostic, |fixer| fixer.delete_range(attr.span));
+                } else {
+                    ctx.diagnostic(diagnostic);
                 }
             }
         }
+    }
+}
+
+/// Returns whether `role` is a non-abstract WAI-ARIA role name.
+///
+/// Matching is case-insensitive to stay consistent with how
+/// `get_redundant_implicit_role` compares explicit and implicit roles, and
+/// with `eslint-plugin-jsx-a11y`'s lowercased lookup.
+fn is_valid_aria_role(role: &str) -> bool {
+    VALID_ARIA_ROLES.contains(role)
+        || VALID_ARIA_ROLES.iter().any(|valid| valid.eq_ignore_ascii_case(role))
+}
+
+impl NoRedundantRoles {
+    /// A redundant `role` is allowed when the element has an explicit entry in
+    /// the `allowedRedundantRoles` option, or otherwise falls back to the
+    /// default exceptions.
+    fn is_allowed_redundant_role(&self, element: &str, role: &str) -> bool {
+        match self.0.allowed_redundant_roles.get(element) {
+            Some(roles) => roles.iter().any(|r| r == role),
+            None => DEFAULT_ROLE_EXCEPTIONS.iter().any(|&(el, r)| el == element && r == role),
+        }
+    }
+}
+
+fn get_redundant_implicit_role(
+    element: &str,
+    jsx_el: &JSXOpeningElement,
+    explicit_role: &str,
+) -> Option<&'static str> {
+    match element {
+        // Skip elements whose implicit role depends on ancestors and cannot
+        // be determined from a single `JSXOpeningElement`. Per ARIA in HTML
+        // (https://www.w3.org/TR/html-aria/), `<header>`/`<footer>` map to
+        // `banner`/`contentinfo` only when not nested in `article`, `aside`,
+        // `main`, `nav`, or `section`; otherwise their role is `generic`.
+        // `<main>` and `<address>` are similarly ancestor- or context-
+        // dependent. eslint-plugin-jsx-a11y omits these elements from its
+        // implicit-role lookup for the same reason. See #22743.
+        "header" | "footer" | "main" | "address" => None,
+        "a" | "area" => (explicit_role.eq_ignore_ascii_case("link")
+            && has_jsx_prop_ignore_case(jsx_el, "href").is_some())
+        .then_some("link"),
+        "body" => explicit_role.eq_ignore_ascii_case("document").then_some("document"),
+        "img" => get_img_implicit_role(jsx_el)
+            .filter(|implicit_role| explicit_role.eq_ignore_ascii_case(implicit_role)),
+        "input" => get_input_implicit_role(jsx_el, explicit_role),
+        "select" => {
+            let implicit_role = get_select_implicit_role(jsx_el);
+            explicit_role.eq_ignore_ascii_case(implicit_role).then_some(implicit_role)
+        }
+        _ => get_element_implicit_roles(element)
+            .into_iter()
+            .find(|implicit_role| explicit_role.eq_ignore_ascii_case(implicit_role)),
+    }
+}
+
+fn get_img_implicit_role(jsx_el: &JSXOpeningElement) -> Option<&'static str> {
+    if has_jsx_prop_ignore_case(jsx_el, "alt")
+        .and_then(get_string_literal_prop_value)
+        .is_some_and(str::is_empty)
+    {
+        return None;
+    }
+
+    if has_jsx_prop_ignore_case(jsx_el, "src")
+        .and_then(get_static_string_prop_value)
+        .is_some_and(|src| src.contains(".svg"))
+    {
+        return None;
+    }
+
+    Some("img")
+}
+
+fn get_select_implicit_role(jsx_el: &JSXOpeningElement) -> &'static str {
+    if has_jsx_prop_ignore_case(jsx_el, "multiple").is_some_and(jsx_prop_value_is_truthy)
+        || has_jsx_prop_ignore_case(jsx_el, "size")
+            .and_then(get_prop_value)
+            .is_some_and(|value| parse_jsx_value(value).is_ok_and(|size| size > 1.0))
+    {
+        "listbox"
+    } else {
+        "combobox"
+    }
+}
+
+fn get_static_string_prop_value<'a>(item: &JSXAttributeItem<'a>) -> Option<JSStr<'a>> {
+    match get_prop_value(item)? {
+        JSXAttributeValue::StringLiteral(lit) => Some(lit.value),
+        JSXAttributeValue::ExpressionContainer(container) => {
+            let Expression::StringLiteral(lit) = container.expression.as_expression()? else {
+                return None;
+            };
+            Some(lit.value)
+        }
+        _ => None,
+    }
+}
+
+fn jsx_prop_value_is_truthy(item: &JSXAttributeItem) -> bool {
+    match get_prop_value(item) {
+        None => true,
+        Some(JSXAttributeValue::StringLiteral(lit)) => !lit.value.is_empty(),
+        Some(JSXAttributeValue::ExpressionContainer(container)) => {
+            let Some(expression) = container.expression.as_expression() else {
+                return false;
+            };
+
+            match expression {
+                Expression::BooleanLiteral(lit) => lit.value,
+                Expression::StringLiteral(lit) => !lit.value.is_empty(),
+                Expression::NumericLiteral(lit) => lit.value != 0.0,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Returns the implicit ARIA role matched by the explicit role on an `<input>`.
+///
+/// Mirrors the HTML-AAM table for `input` and matches
+/// `eslint-plugin-jsx-a11y`'s behavior of returning `combobox` only when a
+/// `list` attribute is present.
+fn get_input_implicit_role(
+    jsx_el: &JSXOpeningElement<'_>,
+    explicit_role: &str,
+) -> Option<&'static str> {
+    let input_type = has_jsx_prop_ignore_case(jsx_el, "type")
+        .and_then(get_static_string_prop_value)
+        .and_then(JSStr::as_str)
+        .unwrap_or("text");
+    let has_list = has_jsx_prop_ignore_case(jsx_el, "list").is_some();
+
+    if input_type.eq_ignore_ascii_case("button")
+        || input_type.eq_ignore_ascii_case("image")
+        || input_type.eq_ignore_ascii_case("reset")
+        || input_type.eq_ignore_ascii_case("submit")
+    {
+        explicit_role.eq_ignore_ascii_case("button").then_some("button")
+    } else if input_type.eq_ignore_ascii_case("checkbox") {
+        explicit_role.eq_ignore_ascii_case("checkbox").then_some("checkbox")
+    } else if input_type.eq_ignore_ascii_case("radio") {
+        explicit_role.eq_ignore_ascii_case("radio").then_some("radio")
+    } else if input_type.eq_ignore_ascii_case("range") {
+        explicit_role.eq_ignore_ascii_case("slider").then_some("slider")
+    } else if input_type.eq_ignore_ascii_case("number") {
+        explicit_role.eq_ignore_ascii_case("spinbutton").then_some("spinbutton")
+    } else if input_type.eq_ignore_ascii_case("search") {
+        if explicit_role.eq_ignore_ascii_case("searchbox") {
+            Some("searchbox")
+        } else if has_list && explicit_role.eq_ignore_ascii_case("combobox") {
+            Some("combobox")
+        } else {
+            None
+        }
+    } else if input_type.eq_ignore_ascii_case("email")
+        || input_type.eq_ignore_ascii_case("tel")
+        || input_type.eq_ignore_ascii_case("url")
+        || input_type.eq_ignore_ascii_case("text")
+        || input_type.is_empty()
+    {
+        if explicit_role.eq_ignore_ascii_case("textbox") {
+            Some("textbox")
+        } else if has_list && explicit_role.eq_ignore_ascii_case("combobox") {
+            Some("combobox")
+        } else {
+            None
+        }
+    } else {
+        None
     }
 }
 
@@ -106,6 +324,8 @@ fn test() {
             "settings": { "jsx-a11y": {
                 "components": {
                     "Button": "button",
+                    "Link": "a",
+                    "Area": "area",
                 }
             } }
         })
@@ -118,14 +338,91 @@ fn test() {
         ("<button>Foo</button>", None, None),
         ("<button>role</button>", None, None),
         ("<nav />", None, None),
-        ("<body />", None, None),
+        ("<main />", None, None),
         ("<button role='main' />", None, None),
         ("<MyComponent role='button' />", None, None),
         ("<button role={`${foo}button`} />", None, None),
         ("<Button role={`${foo}button`} />", None, Some(settings())),
+        (r#"<select role="menu"><option>1</option><option>2</option></select>"#, None, None),
+        (
+            r#"<select role="menu" size={2}><option>1</option><option>2</option></select>"#,
+            None,
+            None,
+        ),
+        (
+            r#"<select role="menu" multiple><option>1</option><option>2</option></select>"#,
+            None,
+            None,
+        ),
+        // `nav` / `navigation` is allowed by default.
+        (r#"<nav role="navigation" />"#, None, None),
+        (r#"<select role="listbox" />"#, None, None),
+        (r#"<img alt="" role="img" />"#, None, None),
+        // Explicitly allowed redundant roles via the option.
+        (
+            r#"<ul role="list" />"#,
+            Some(serde_json::json!([{ "ul": ["list"], "ol": ["list"] }])),
+            None,
+        ),
+        (
+            r#"<ol role="list" />"#,
+            Some(serde_json::json!([{ "ul": ["list"], "ol": ["list"] }])),
+            None,
+        ),
+        (
+            r#"<dl role="list" />"#,
+            Some(serde_json::json!([{ "ul": ["list"], "ol": ["list"] }])),
+            None,
+        ),
+        (
+            r#"<img src="example.svg" role="img" />"#,
+            Some(serde_json::json!([{ "ul": ["list"], "ol": ["list"] }])),
+            None,
+        ),
+        (
+            r#"<svg role="img" />"#,
+            Some(serde_json::json!([{ "ul": ["list"], "ol": ["list"] }])),
+            None,
+        ),
+        (r#"<img src={"a\uD800.svg"} role="img" />"#, None, None),
+        (r#"<li role="listitem" />"#, Some(serde_json::json!([{ "li": ["listitem"] }])), None),
+        // Ancestor-dependent elements: implicit role cannot be determined
+        // from a single opening element, so do not flag. See #22743.
+        (r#"<header role="banner" />"#, None, None),
+        (r#"<header role="banner" aria-label="Editor topbar">Topbar</header>"#, None, None),
+        (r#"<footer role="contentinfo" />"#, None, None),
+        (r#"<main role="main" />"#, None, None),
+        (r#"<main role="main"><p>Content</p></main>"#, None, None),
+        (r#"<address role="group" />"#, None, None),
+        (r#"<a role="link" />"#, None, None),
+        (r#"<a role="link" aria-disabled="true" />"#, None, None),
+        (r#"<area role="link" />"#, None, None),
+        // <input>: combobox is implicit only when a `list` attribute is
+        // set; otherwise the implicit role is `textbox` (HTML-AAM §3.5.76).
+        (r#"<input role="combobox" />"#, None, None),
+        (r#"<input type="text" role="combobox" />"#, None, None),
+        (r#"<input type="search" role="combobox" />"#, None, None),
+        // type=checkbox: implicit role is `checkbox`, not `radio` etc.
+        (r#"<input type="checkbox" role="radio" />"#, None, None),
+        (r#"<input type="checkbox" role="textbox" />"#, None, None),
+        // unknown / non-listed input types should not be flagged.
+        (r#"<input type="password" role="textbox" />"#, None, None),
+        (r#"<area role="link" aria-disabled="true" />"#, None, None),
+        (r#"<a {...props} role="link" />"#, None, None),
+        (r#"<a hrefLang="en" role="link" />"#, None, None),
+        (r#"<Link role="link" />"#, None, Some(settings())),
+        (r#"<Area role="link" />"#, None, Some(settings())),
+        (r#"<a href="/" role="link" />"#, Some(serde_json::json!([{ "a": ["link"] }])), None),
+        (r#"<area href="/" role="link" />"#, Some(serde_json::json!([{ "area": ["link"] }])), None),
+        (r#"<button role="link button" />"#, None, None),
+        (r#"<button role="link  button">Docs</button>"#, None, None),
+        (r#"<button role="foo link button" />"#, None, None),
+        (r#"<button role="widget link button" />"#, None, None),
+        (r#"<button role="LINK button" />"#, None, None),
     ];
 
     let fail = vec![
+        (r#"<body role="DOCUMENT" />"#, None, None),
         ("<button role='button' />", None, None),
         ("<button role='button' data-foo='bar' />", None, None),
         ("<button role='button' data-role='bar' />", None, None),
@@ -134,9 +431,75 @@ fn test() {
         ("<button role='button'>Foo</button>", None, None),
         ("<button role='button'><p>Test</p></button>", None, None),
         ("<button role='button' title='button'></button>", None, None),
-        ("<body role='document' />", None, None),
-        ("<nav role='navigation' />", None, None),
         ("<Button role='button' />", None, Some(settings())),
+        (r#"<article role="article" />"#, None, None),
+        (r#"<aside role="complementary" />"#, None, None),
+        (r#"<form role="form" />"#, None, None),
+        (r#"<h1 role="heading" />"#, None, None),
+        (r#"<h2 role="heading" />"#, None, None),
+        (r#"<hr role="separator" />"#, None, None),
+        (r#"<img role="img" />"#, None, None),
+        (r#"<li role="listitem" />"#, None, None),
+        (r#"<ol role="list" />"#, None, None),
+        (r#"<ul role="list" />"#, None, None),
+        (r#"<select role="combobox" />"#, None, None),
+        (r#"<select role="combobox" size="" />"#, None, None),
+        (r#"<select role="combobox" size={1} />"#, None, None),
+        (r#"<select role="combobox" size="1" />"#, None, None),
+        (r#"<select role="combobox" size={null}></select>"#, None, None),
+        (r#"<select role="combobox" size={undefined}></select>"#, None, None),
+        (r#"<select role="combobox" multiple={undefined}></select>"#, None, None),
+        (r#"<select role="combobox" multiple={false}></select>"#, None, None),
+        (r#"<select role="combobox" multiple=""></select>"#, None, None),
+        (r#"<select role="listbox" size="3" />"#, None, None),
+        (r#"<select role="listbox" size={2} />"#, None, None),
+        (
+            r#"<select role="listbox" multiple><option>1</option><option>2</option></select>"#,
+            None,
+            None,
+        ),
+        (r#"<select role="listbox" multiple={true}></select>"#, None, None),
+        (r#"<table role="table" />"#, None, None),
+        (r#"<tbody role="rowgroup" />"#, None, None),
+        (r#"<td role="cell" />"#, None, None),
+        (r#"<textarea role="textbox" />"#, None, None),
+        (r#"<section role="region" />"#, None, None),
+        (r#"<dialog role="dialog" />"#, None, None),
+        (r#"<fieldset role="group" />"#, None, None),
+        (r#"<figure role="figure" />"#, None, None),
+        (r#"<meter role="meter" />"#, None, None),
+        (r#"<output role="status" />"#, None, None),
+        (r#"<p role="paragraph" />"#, None, None),
+        (r#"<progress role="progressbar" />"#, None, None),
+        (r#"<tr role="row" />"#, None, None),
+        // An option for a different element does not suppress this one.
+        (r#"<ul role="list" />"#, Some(serde_json::json!([{ "li": ["listitem"] }])), None),
+        // A user-provided option overrides the default exception for that element.
+        (r#"<nav role="navigation" />"#, Some(serde_json::json!([{ "nav": [] }])), None),
+        (r#"<a href="/" role="link" />"#, None, None),
+        (r#"<area href="/" role="link" />"#, None, None),
+        // Attribute-narrowed implicit roles for <input>:
+        (r#"<input list="opts" role="combobox" />"#, None, None),
+        (r#"<input type="search" list="opts" role="combobox" />"#, None, None),
+        (r#"<input type="checkbox" role="checkbox" />"#, None, None),
+        (r#"<input type={"checkbox"} role="checkbox" />"#, None, None),
+        (r#"<input type="radio" role="radio" />"#, None, None),
+        (r#"<input type="range" role="slider" />"#, None, None),
+        (r#"<input type="number" role="spinbutton" />"#, None, None),
+        (r#"<input type="search" role="searchbox" />"#, None, None),
+        (r#"<input type="text" role="textbox" />"#, None, None),
+        (r#"<input role="textbox" />"#, None, None),
+        (r#"<input type="email" list="opts" role="combobox" />"#, None, None),
+        (r#"<input type="button" role="button" />"#, None, None),
+        (r#"<input type="image" role="button" />"#, None, None),
+        (r#"<input type="reset" role="button" />"#, None, None),
+        (r#"<input type="submit" role="button" />"#, None, None),
+        (r#"<a href={url} role="link" />"#, None, None),
+        (r#"<area href="" role="link" />"#, None, None),
+        (r#"<Link href="/" role="link" />"#, None, Some(settings())),
+        (r#"<Area href="/" role="link" />"#, None, Some(settings())),
+        (r#"<button role="button link" />"#, None, None),
+        (r#"<button role="button foo" />"#, None, None),
     ];
 
     let fix = vec![
@@ -152,12 +515,20 @@ fn test() {
               Foo
              </button>",
         ),
-        ("<nav role='navigation' />", "<nav  />"),
-        ("<body role='document' />", "<body  />"),
-        (
-            "<body role='document'><p>Foobarbaz!! document body role</p></body>",
-            "<body ><p>Foobarbaz!! document body role</p></body>",
-        ),
+        // Note: prior fixtures for `<main role='main' />` and
+        // `<header role='banner' />` were removed because those roles are
+        // ancestor-dependent and no longer flagged. See #22743.
+        (r#"<input type="checkbox" role="checkbox" />"#, r#"<input type="checkbox"  />"#),
+        (r#"<input list="opts" role="combobox" />"#, r#"<input list="opts"  />"#),
+        (r#"<input type="submit" role="button" />"#, r#"<input type="submit"  />"#),
+        (r#"<a href="/" role="link" />"#, r#"<a href="/"  />"#),
+        (r#"<area href="/" role="link" />"#, r#"<area href="/"  />"#),
+        (r#"<a href={url} role="link" />"#, "<a href={url}  />"),
+        (r#"<area href="" role="link" />"#, r#"<area href=""  />"#),
+        (r#"<button role="button link" />"#, r#"<button role="button link" />"#),
+        (r#"<button role="button foo" />"#, r#"<button role="button foo" />"#),
+        (r#"<button role="foo button" />"#, r#"<button role="foo button" />"#),
+        (r#"<button role="  button  " />"#, "<button  />"),
     ];
 
     Tester::new(NoRedundantRoles::NAME, NoRedundantRoles::PLUGIN, pass, fail)

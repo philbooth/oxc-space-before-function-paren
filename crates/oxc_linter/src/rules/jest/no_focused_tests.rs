@@ -1,29 +1,40 @@
+use oxc_ast::AstKind;
 use oxc_macros::declare_oxc_lint;
+use oxc_semantic::AstNode;
 
 use crate::{
-    context::LintContext,
+    context::{ContextHost, LintContext},
     rule::Rule,
     rules::shared::no_focused_tests::{DOCUMENTATION, run},
-    utils::PossibleJestNode,
 };
 
 #[derive(Debug, Default, Clone)]
 pub struct NoFocusedTests;
 
-declare_oxc_lint!(NoFocusedTests, jest, correctness, fix, docs = DOCUMENTATION, version = "0.0.8",);
+declare_oxc_lint!(
+    NoFocusedTests,
+    jest,
+    correctness,
+    recommended,
+    suggestion,
+    docs = DOCUMENTATION,
+    version = "0.0.8",
+);
 
 impl Rule for NoFocusedTests {
-    fn run_on_jest_node<'a, 'c>(
-        &self,
-        jest_node: &PossibleJestNode<'a, 'c>,
-        ctx: &'c LintContext<'a>,
-    ) {
-        run(jest_node, ctx);
+    fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
+        let AstKind::CallExpression(_) = node.kind() else { return };
+        run(node, ctx);
+    }
+
+    fn should_run(&self, ctx: &ContextHost) -> bool {
+        ctx.frameworks().is_test()
     }
 }
 
 #[test]
 fn test() {
+    use crate::fixer::FixKind;
     use crate::tester::Tester;
 
     let pass = vec![
@@ -40,6 +51,9 @@ fn test() {
         ("test.each()()", None),
         ("test.each`table`()", None),
         ("test.concurrent()", None),
+        (r#"describe["\uD800"].only("a", () => {})"#, None),
+        (r#"describe[`\uDC00`].only("a", () => {})"#, None),
+        (r#"test.concurrent["a\uD800b"].only("a", () => {})"#, None),
     ];
 
     let fail = vec![
@@ -66,9 +80,14 @@ fn test() {
     ];
 
     let fix = vec![
-        ("describe.only('foo', () => {})", "describe('foo', () => {})", None),
-        ("describe['only']('foo', () => {})", "describe('foo', () => {})", None),
-        ("fdescribe('foo', () => {})", "describe('foo', () => {})", None),
+        ("describe.only('foo', () => {})", "describe('foo', () => {})", None, FixKind::Suggestion),
+        (
+            "describe['only']('foo', () => {})",
+            "describe('foo', () => {})",
+            None,
+            FixKind::Suggestion,
+        ),
+        ("fdescribe('foo', () => {})", "describe('foo', () => {})", None, FixKind::Suggestion),
     ];
 
     Tester::new(NoFocusedTests::NAME, NoFocusedTests::PLUGIN, pass, fail)

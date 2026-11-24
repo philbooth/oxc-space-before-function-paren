@@ -1,3 +1,4 @@
+use oxc_ast::AstKind;
 use oxc_macros::declare_oxc_lint;
 
 use crate::{
@@ -20,6 +21,9 @@ declare_oxc_lint!(
 );
 impl Rule for PreferMockReturnShorthand {
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
+        let AstKind::CallExpression(_) = node.kind() else {
+            return;
+        };
         run(node, ctx);
     }
 }
@@ -60,6 +64,15 @@ fn test() {
               }
               return 2;
             });",
+        "const state = { open: false }; aVariable.mockImplementation(() => (state.open = true));",
+        "const state = { open: false }; aVariable.mockImplementationOnce(() => { return state.open ||= true; });",
+        "const state = { open: false }; aVariable.mockImplementation(() => ((state.open = true) as boolean));",
+        "const state = { open: false }; aVariable.mockImplementation(function () { return (state.open = true); });",
+        "const state = { open: false }; aVariable.mockImplementation(() => ([state.open] = [true]));",
+        "const state = { count: 0 }; aVariable.mockImplementation(() => (state.count++ as number));",
+        "const state = { count: 0 }; aVariable.mockImplementation(() => [state.count++]);",
+        "const state = { open: false }; aVariable.mockImplementation(() => ({ value: (state.open = true) }));",
+        "const state = { open: false }; aVariable.mockImplementation(() => (true ? (state.open = true) : false));",
         "aVariable.mockImplementation(() => value++)",
         "aVariable.mockImplementationOnce(() => --value)",
         "const aValue = 0;

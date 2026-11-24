@@ -50,7 +50,9 @@ declare_oxc_lint!(
     NoImpliedEval(tsgolint),
     typescript,
     correctness,
+    recommended,
     version = "1.12.0",
+    short_description = "This rule disallows the use of eval-like methods.",
 );
 
 impl Rule for NoImpliedEval {}

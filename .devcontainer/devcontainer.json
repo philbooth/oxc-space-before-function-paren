@@ -7,7 +7,7 @@
   },
   "features": {
     "ghcr.io/devcontainers/features/sshd:1": {},
-    "ghcr.io/devcontainers/features/node:1": {},
+    "ghcr.io/devcontainers/features/node:2": {},
     "ghcr.io/devcontainers/features/github-cli:1": {
       "version": "latest"
     },
@@ -21,8 +21,7 @@
         "EditorConfig.EditorConfig",
         "tamasfe.even-better-toml",
         "eamodio.gitlens",
-        "nefrob.vscode-just-syntax",
-        "tekumara.typos-vscode"
+        "nefrob.vscode-just-syntax"
       ]
     }
   },

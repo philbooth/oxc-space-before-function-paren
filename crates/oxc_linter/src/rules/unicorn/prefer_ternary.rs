@@ -5,17 +5,18 @@ use serde::Deserialize;
 
 use oxc_ast::{
     AstKind,
-    ast::{AssignmentTarget, BinaryOperator, Expression, IfStatement, MemberExpression, Statement},
+    ast::{AssignmentTarget, Expression, IfStatement, MemberExpression, Statement},
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_span::{GetSpan, Span};
+use oxc_str::JSStr;
 
 use crate::{
     AstNode,
     context::LintContext,
     rule::{DefaultRuleConfig, Rule},
-    utils::{is_same_expression, is_same_member_expression},
+    utils::{is_same_expression, is_same_member_expression, static_string_value},
 };
 
 fn prefer_ternary_diagnostic(span: Span) -> OxcDiagnostic {
@@ -61,14 +62,16 @@ declare_oxc_lint!(
     PreferTernary,
     unicorn,
     style,
+    recommended,
     pending,
     config = PreferTernaryOption,
     version = "1.50.0",
+    short_description = "Prefers ternary expressions over simple `if`/`else` statements.",
 );
 
 impl Rule for PreferTernary {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        serde_json::from_value::<DefaultRuleConfig<Self>>(value).map(DefaultRuleConfig::into_inner)
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
     }
 
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
@@ -282,10 +285,10 @@ fn is_ternary_expression(expression: &Expression<'_>) -> bool {
     matches!(expression.get_inner_expression(), Expression::ConditionalExpression(_))
 }
 
-fn is_same_assignment_target(
-    left: &AssignmentTarget<'_>,
-    right: &AssignmentTarget<'_>,
-    ctx: &LintContext<'_>,
+fn is_same_assignment_target<'a>(
+    left: &AssignmentTarget<'a>,
+    right: &AssignmentTarget<'a>,
+    ctx: &LintContext<'a>,
 ) -> bool {
     if let (
         AssignmentTarget::AssignmentTargetIdentifier(left),
@@ -298,9 +301,10 @@ fn is_same_assignment_target(
     if let (Some(left_member), Some(right_member)) =
         (left.as_member_expression(), right.as_member_expression())
     {
-        if let (Some(left_name), Some(right_name)) =
-            (member_static_property_name(left_member), member_static_property_name(right_member))
-        {
+        if let (Some(left_name), Some(right_name)) = (
+            member_static_property_name(left_member, ctx),
+            member_static_property_name(right_member, ctx),
+        ) {
             return left_name == right_name
                 && is_same_expression(
                     left_member.object().get_inner_expression(),
@@ -318,31 +322,19 @@ fn is_same_assignment_target(
     }
 }
 
-fn member_static_property_name(member: &MemberExpression<'_>) -> Option<String> {
+fn member_static_property_name<'a>(
+    member: &MemberExpression<'a>,
+    ctx: &LintContext<'a>,
+) -> Option<JSStr<'a>> {
     if let Some(name) = member.static_property_name() {
-        return Some(name.to_string());
+        return Some(name);
     }
 
     let MemberExpression::ComputedMemberExpression(computed) = member else {
         return None;
     };
 
-    static_string_value(computed.expression.get_inner_expression())
-}
-
-fn static_string_value(expression: &Expression<'_>) -> Option<String> {
-    match expression {
-        Expression::StringLiteral(literal) => Some(literal.value.to_string()),
-        Expression::TemplateLiteral(literal) => {
-            literal.single_quasi().map(|quasi| quasi.to_string())
-        }
-        Expression::BinaryExpression(binary) if binary.operator == BinaryOperator::Addition => {
-            let left = static_string_value(binary.left.get_inner_expression())?;
-            let right = static_string_value(binary.right.get_inner_expression())?;
-            Some(format!("{left}{right}"))
-        }
-        _ => None,
-    }
+    static_string_value(computed.expression.get_inner_expression(), ctx.allocator())
 }
 
 #[test]
@@ -361,6 +353,9 @@ fn test() {
             }",
             None,
         ),
+        // Different lone surrogates are different names.
+        (r#"if (test) { obj["\uD800"] = a; } else { obj["\uDC00"] = b; }"#, None),
+        (r#"if (test) { obj["\uD83D\uDE00"] = a; } else { obj["\uD83D"] = b; }"#, None),
         (
             "function unicorn() {
                 if(test){
@@ -619,6 +614,10 @@ fn test() {
             }",
             None,
         ),
+        // Computed member names are compared by their JavaScript value.
+        (r#"if (test) { obj["\uD800"] = a; } else { obj["\uD800"] = b; }"#, None),
+        (r#"if (test) { obj["\uD800" + "x"] = a; } else { obj[`\uD800x`] = b; }"#, None),
+        (r#"if (test) { obj["\uD83D" + "\uDE00"] = a; } else { obj["\uD83D\uDE00"] = b; }"#, None),
         (
             "async function unicorn() {
                 if(test){
@@ -1331,16 +1330,6 @@ fn test() {
             }", "function unicorn() {
                 /* comment cause wrong indention */ const error = test ? a : b;
              throw error;
-            }", None),
-("function unicorn() {
-                                                    if (test) {
-                                                        throw a;
-                                                    } else {
-                                                        throw b;
-                                                    }
-            }", "function unicorn() {
-                                                    const error = test ? a : b;
-                                                    throw error;
             }", None),
 ("async function unicorn() {
                 if (test) {

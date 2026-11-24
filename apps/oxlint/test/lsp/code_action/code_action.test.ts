@@ -10,6 +10,7 @@ describe("LSP code actions", () => {
       ["fix/test.ts", "typescript"],
       ["suggestion/test.ts", "typescript"],
       ["js-plugin-fix/test.js", "javascript"],
+      ["js-plugin-fix/non-zero-offset.js", "javascript"],
       ["js-plugin-suggestion/test.js", "javascript"],
     ])("should handle %s", async (path, languageId) => {
       expect(await fixFixture(FIXTURES_DIR, path, languageId)).toMatchSnapshot();
@@ -48,6 +49,29 @@ describe("LSP code actions", () => {
           {
             diagnostics: [],
             only: [kind],
+          },
+        ),
+      ).toMatchSnapshot();
+    });
+  });
+
+  describe("rulesCustomization", () => {
+    it("should hide rule fix in `source.fixAll.oxc` when rulesCustomization disables this rule", async () => {
+      expect(
+        await fixFixture(
+          FIXTURES_DIR,
+          "rules_customization/test.ts",
+          "typescript",
+          {
+            rulesCustomization: {
+              "no-debugger": {
+                autofix: false,
+              },
+            },
+          },
+          {
+            diagnostics: [],
+            only: ["source.fixAll.oxc"],
           },
         ),
       ).toMatchSnapshot();

@@ -1,13 +1,9 @@
 use cow_utils::CowUtils;
-use oxc_allocator::Allocator;
-use oxc_ast::{
-    AstBuilder, AstKind,
-    ast::{Argument, CallExpression, Expression},
-};
+use oxc_ast::{AstKind, ast::Argument};
 use oxc_codegen::CodegenOptions;
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
-use oxc_span::{GetSpan, SPAN, Span};
+use oxc_span::{GetSpan, Span};
 use oxc_syntax::identifier::is_identifier_name;
 
 use crate::{
@@ -15,6 +11,7 @@ use crate::{
     context::LintContext,
     fixer::{RuleFix, RuleFixer},
     rule::Rule,
+    utils::call_uses_optional_chain,
 };
 
 fn set(span: Span) -> OxcDiagnostic {
@@ -35,6 +32,13 @@ fn remove(span: Span) -> OxcDiagnostic {
 
 #[derive(Debug, Default, Clone)]
 pub struct PreferDomNodeDataset;
+
+enum AttributeMethod {
+    Set,
+    Get,
+    Remove,
+    Has,
+}
 
 declare_oxc_lint!(
     /// ### What it does
@@ -59,8 +63,10 @@ declare_oxc_lint!(
     PreferDomNodeDataset,
     unicorn,
     pedantic,
+    recommended,
     conditional_fix,
     version = "0.0.18",
+    short_description = "Use `.dataset` on DOM elements over `getAttribute(…)`, `.setAttribute(…)`, `.removeAttribute(…)` and `.hasAttribute(…)`.",
 );
 
 impl Rule for PreferDomNodeDataset {
@@ -80,17 +86,26 @@ impl Rule for PreferDomNodeDataset {
         let Some((span, method_name)) = member_expr.static_property_info() else {
             return;
         };
+        let Some(method_name) = method_name.as_str() else { return };
 
-        match method_name {
+        let method = match method_name {
             "setAttribute" => {
                 if call_expr.arguments.len() != 2 {
                     return;
                 }
+                AttributeMethod::Set
             }
-            "removeAttribute" | "hasAttribute" => {
+            "removeAttribute" => {
                 if call_expr.arguments.len() != 1 {
                     return;
                 }
+                AttributeMethod::Remove
+            }
+            "hasAttribute" => {
+                if call_expr.arguments.len() != 1 {
+                    return;
+                }
+                AttributeMethod::Has
             }
             "getAttribute" => {
                 if call_expr.arguments.len() != 1 {
@@ -104,20 +119,24 @@ impl Rule for PreferDomNodeDataset {
                 {
                     return;
                 }
+                AttributeMethod::Get
             }
             _ => return,
-        }
+        };
 
         let Argument::StringLiteral(string_lit) = &call_expr.arguments[0] else {
             return;
         };
 
-        let Some(dataset_property_name) = strip_data_prefix(&string_lit.value) else {
+        let value = string_lit.value;
+        if !value.starts_with("data-") && !value.starts_with("DATA-") {
             return;
-        };
+        }
+        // The fix writes the rest of the name as text, so it is skipped for a lone surrogate.
+        let dataset_property_name = value.as_str().and_then(strip_data_prefix);
 
-        match method_name {
-            "setAttribute" => {
+        match method {
+            AttributeMethod::Set => {
                 ctx.diagnostic_with_fix(set(span), |fixer| {
                     if call_uses_optional_chain(call_expr) {
                         return fixer.noop();
@@ -126,6 +145,9 @@ impl Rule for PreferDomNodeDataset {
                         return fixer.noop();
                     }
 
+                    let Some(dataset_property_name) = dataset_property_name else {
+                        return fixer.noop();
+                    };
                     let dataset_property_name_camel = dash_to_camel_case(dataset_property_name);
                     let object_span = member_expr.object().span();
 
@@ -140,8 +162,15 @@ impl Rule for PreferDomNodeDataset {
                     )
                 });
             }
-            "getAttribute" => {
+            AttributeMethod::Get => {
                 ctx.diagnostic_with_fix(get(span), |fixer| {
+                    if call_expr.optional {
+                        return fixer.noop();
+                    }
+
+                    let Some(dataset_property_name) = dataset_property_name else {
+                        return fixer.noop();
+                    };
                     let dataset_property_name_camel = dash_to_camel_case(dataset_property_name);
                     let object_span = member_expr.object().span();
 
@@ -149,16 +178,24 @@ impl Rule for PreferDomNodeDataset {
                         fixer,
                         call_expr.span,
                         object_span,
+                        member_expr.optional(),
                         &dataset_property_name_camel,
                         ctx,
                     )
                 });
             }
-            "removeAttribute" => {
+            AttributeMethod::Remove => {
                 ctx.diagnostic_with_fix(remove(string_lit.span), |fixer| {
+                    if call_expr.optional {
+                        return fixer.noop();
+                    }
                     if !is_value_not_usable(node, ctx) {
                         return fixer.noop();
                     }
+
+                    let Some(dataset_property_name) = dataset_property_name else {
+                        return fixer.noop();
+                    };
                     let dataset_property_name_camel = dash_to_camel_case(dataset_property_name);
                     let object_span = member_expr.object().span();
 
@@ -166,17 +203,21 @@ impl Rule for PreferDomNodeDataset {
                         fixer,
                         call_expr.span,
                         object_span,
+                        member_expr.optional(),
                         &dataset_property_name_camel,
                         ctx,
                     )
                 });
             }
-            "hasAttribute" => {
+            AttributeMethod::Has => {
                 ctx.diagnostic_with_fix(has(span), |fixer| {
                     if call_uses_optional_chain(call_expr) {
                         return fixer.noop();
                     }
 
+                    let Some(dataset_property_name) = dataset_property_name else {
+                        return fixer.noop();
+                    };
                     let dataset_property_name_camel = dash_to_camel_case(dataset_property_name);
                     let object_span = member_expr.object().span();
 
@@ -189,7 +230,6 @@ impl Rule for PreferDomNodeDataset {
                     )
                 });
             }
-            _ => unreachable!(),
         }
     }
 }
@@ -234,33 +274,9 @@ fn is_value_not_usable(node: &AstNode, ctx: &LintContext) -> bool {
     false
 }
 
-fn call_uses_optional_chain(call_expr: &CallExpression) -> bool {
-    call_expr.optional || expression_uses_optional_chain(&call_expr.callee)
-}
-
-fn expression_uses_optional_chain(expr: &Expression) -> bool {
-    let expr = expr.get_inner_expression();
-
-    if matches!(expr, Expression::ChainExpression(_)) {
-        return true;
-    }
-
-    if let Some(member_expr) = expr.as_member_expression() {
-        return member_expr.optional() || expression_uses_optional_chain(member_expr.object());
-    }
-
-    if let Expression::CallExpression(call_expr) = expr {
-        return call_expr.optional || expression_uses_optional_chain(&call_expr.callee);
-    }
-
-    false
-}
-
 fn to_string_literal_text(fixer: RuleFixer, text: &str) -> String {
     let mut codegen = fixer.codegen().with_options(CodegenOptions::default());
-    let alloc = Allocator::default();
-    let ast = AstBuilder::new(&alloc);
-    codegen.print_expression(&ast.expression_string_literal(SPAN, ast.str(text), None));
+    codegen.print_string(text);
     codegen.into_source_text()
 }
 
@@ -290,12 +306,14 @@ fn fix_to_dataset_access(
     fixer: RuleFixer,
     call_span: Span,
     object_span: Span,
+    optional: bool,
     property_name: &str,
     ctx: &LintContext,
 ) -> RuleFix {
     let object_text = ctx.source_range(object_span);
+    let access = if optional { "?." } else { "." };
     let property_access = dataset_property_text(fixer, property_name);
-    let fixed = format!("{object_text}.dataset{property_access}");
+    let fixed = format!("{object_text}{access}dataset{property_access}");
     fixer.replace(call_span, fixed)
 }
 
@@ -303,12 +321,14 @@ fn fix_to_dataset_delete(
     fixer: RuleFixer,
     call_span: Span,
     object_span: Span,
+    optional: bool,
     property_name: &str,
     ctx: &LintContext,
 ) -> RuleFix {
     let object_text = ctx.source_range(object_span);
+    let access = if optional { "?." } else { "." };
     let property_access = dataset_property_text(fixer, property_name);
-    let fixed = format!("delete {object_text}.dataset{property_access}");
+    let fixed = format!("delete {object_text}{access}dataset{property_access}");
     fixer.replace(call_span, fixed)
 }
 
@@ -410,6 +430,7 @@ fn test() {
         r#"element.setAttribute("DATA-Foo-bar", "🦄");"#,
         r#"element.setAttribute('data-a"b', "zaz");"#,
         r#"optional?.element.setAttribute("data-unicorn", "🦄");"#,
+        r#"element.optional?.setAttribute("data-unicorn", "🦄");"#,
         r#"console.log(element.setAttribute("data-unicorn", "🦄"))"#,
         r"element.removeAttribute('data-unicorn');",
         r#"element.removeAttribute("data-unicorn");"#,
@@ -426,6 +447,7 @@ fn test() {
         r##"element.querySelector("#selector").removeAttribute("data-AllowAccess");"##,
         r#"element.removeAttribute("data-");"#,
         r#"optional?.element.removeAttribute("data-unicorn");"#,
+        r#"element.optional?.removeAttribute("data-unicorn");"#,
         r#"element.removeAttribute("data-unicorn")?.property"#,
         r"element.hasAttribute('data-unicorn');",
         r#"element.hasAttribute("data-unicorn");"#,
@@ -441,6 +463,7 @@ fn test() {
         r##"element.querySelector("#selector").hasAttribute("data-AllowAccess");"##,
         r#"element.hasAttribute('data-a"b');"#,
         r#"optional?.element.hasAttribute("data-unicorn");"#,
+        r#"element.optional?.hasAttribute("data-unicorn");"#,
         r#"element.hasAttribute("data-unicorn").toString()"#,
         r"element.getAttribute('data-unicorn');",
         r#"element.getAttribute("data-unicorn");"#,
@@ -456,8 +479,11 @@ fn test() {
         r##"element.querySelector("#selector").getAttribute("data-AllowAccess");"##,
         r#"element.getAttribute('data-a"b');"#,
         r#"optional?.element.getAttribute("data-unicorn");"#,
+        r#"element.optional?.getAttribute("data-unicorn");"#,
+        r#"element.optional?.getAttribute("data-unicorn")?.length;"#,
         r#"element.getAttribute("data-unicorn").toString()"#,
         r#"(await promise).getAttribute("data-foo")"#,
+        r#"el.setAttribute("data-\uD800", "x");"#,
     ];
 
     let fix = vec![
@@ -490,6 +516,10 @@ fn test() {
             r#"optional?.element.setAttribute("data-unicorn", "🦄");"#,
             r#"optional?.element.setAttribute("data-unicorn", "🦄");"#,
         ),
+        (
+            r#"element.optional?.setAttribute("data-unicorn", "🦄");"#,
+            r#"element.optional?.setAttribute("data-unicorn", "🦄");"#,
+        ),
         (r"element.removeAttribute('data-unicorn');", r"delete element.dataset.unicorn;"),
         (r#"element.removeAttribute("data-unicorn");"#, r"delete element.dataset.unicorn;"),
         (r#"element.removeAttribute("data-unicorn",);"#, r"delete element.dataset.unicorn;"),
@@ -509,6 +539,14 @@ fn test() {
         (
             r#"optional?.element.removeAttribute("data-unicorn");"#,
             r"delete optional?.element.dataset.unicorn;",
+        ),
+        (
+            r#"element.optional?.removeAttribute("data-unicorn");"#,
+            r"delete element.optional?.dataset.unicorn;",
+        ),
+        (
+            r#"element.removeAttribute?.("data-unicorn");"#,
+            r#"element.removeAttribute?.("data-unicorn");"#,
         ),
         (r"element.hasAttribute('data-unicorn');", r#"Object.hasOwn(element.dataset, "unicorn");"#),
         (
@@ -545,6 +583,10 @@ fn test() {
             r#"optional?.element.hasAttribute("data-unicorn");"#,
         ),
         (
+            r#"element.optional?.hasAttribute("data-unicorn");"#,
+            r#"element.optional?.hasAttribute("data-unicorn");"#,
+        ),
+        (
             r#"element.hasAttribute("data-unicorn").toString()"#,
             r#"Object.hasOwn(element.dataset, "unicorn").toString()"#,
         ),
@@ -568,10 +610,23 @@ fn test() {
             r"optional?.element.dataset.unicorn;",
         ),
         (
+            r#"element.optional?.getAttribute("data-unicorn");"#,
+            r"element.optional?.dataset.unicorn;",
+        ),
+        (
+            r#"element.optional?.getAttribute("data-unicorn")?.length;"#,
+            r"element.optional?.dataset.unicorn?.length;",
+        ),
+        (
+            r#"element.getAttribute?.("data-unicorn");"#,
+            r#"element.getAttribute?.("data-unicorn");"#,
+        ),
+        (
             r#"element.getAttribute("data-unicorn").toString()"#,
             r"element.dataset.unicorn.toString()",
         ),
         (r#"(await promise).getAttribute("data-foo")"#, r"(await promise).dataset.foo"),
+        (r#"el.setAttribute("data-\uD800", "x");"#, r#"el.setAttribute("data-\uD800", "x");"#),
     ];
 
     Tester::new(PreferDomNodeDataset::NAME, PreferDomNodeDataset::PLUGIN, pass, fail)

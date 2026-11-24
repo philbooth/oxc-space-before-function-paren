@@ -1,46 +1,143 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, collections::hash_map::Entry};
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
-use oxc_ast::{Comment, CommentKind, ast::Program};
+use oxc_ast::{
+    Comment, CommentKind,
+    ast::{Expression, Program},
+};
+use oxc_span::GetSpan;
 use oxc_syntax::line_terminator::LineTerminatorSplitter;
 
 use crate::{Codegen, LegalComment, options::CommentOptions};
 
-pub type CommentsMap = FxHashMap</* attached_to */ u32, Vec<Comment>>;
+type CommentList = SmallVec<[Comment; 1]>;
+
+pub type CommentsMap = FxHashMap</* attached_to */ u32, CommentList>;
+
+/// Whether a comment remains meaningful if its original AST anchor is removed.
+fn preserve_when_orphaned(comment: &Comment) -> bool {
+    comment.is_legal() || comment.is_coverage_ignore_file()
+}
+
+/// Whether [`Codegen::print_comments`] breaks the line between two adjacent comments.
+fn breaks_line_between(prev: &Comment, comment: &Comment) -> bool {
+    breaks_line_after(prev) || comment.preceded_by_newline() || comment.is_legal()
+}
+
+/// Whether [`Codegen::print_comments`] breaks the line after a group ending with `last`.
+fn breaks_line_after(last: &Comment) -> bool {
+    last.is_line() || last.followed_by_newline()
+}
+
+/// Whether [`Codegen::print_comments`] would end a line with a comment the parser does not
+/// always keep leading, in which case the group starts on a new line instead
+/// (a no-op when it already does).
+///
+/// After code on the same line, the parser attaches such a comment to the preceding token
+/// as a trailing comment, which is never printed, so the next pass would drop it:
+/// `a ? b : /* c */ /*! legal */ d` must not print `a ? b : /* c */\n/*! legal */ d`.
+fn would_strand_comments(comments: &[Comment]) -> bool {
+    // The comments before the first line break.
+    let first_line =
+        match comments.windows(2).position(|pair| breaks_line_between(&pair[0], &pair[1])) {
+            Some(i) => &comments[..=i],
+            None if comments.last().is_some_and(breaks_line_after) => comments,
+            None => return false,
+        };
+    // Legal and property-key comments always stay leading.
+    // Pure and no-side-effects comments do too, but never reach `print_comments`.
+    first_line.iter().any(|c| !c.is_legal() && !c.is_property_key_annotation())
+}
+
+/// A `pife`-marked arrow or function expression prints its leading comments
+/// inside its own `(` wrap, so operand emission sites must not consume them.
+fn is_pife_function(expression: &Expression<'_>) -> bool {
+    match expression {
+        Expression::ArrowFunctionExpression(arrow) => arrow.pife,
+        Expression::FunctionExpression(function) => function.pife,
+        _ => false,
+    }
+}
+
+/// Which annotation kind an emission site expects to recover from
+/// [`Codegen::annotation_comments`].
+///
+/// `@__PURE__` / `#__PURE__` on a `CallExpression` or `NewExpression`, and
+/// `@__NO_SIDE_EFFECTS__` / `#__NO_SIDE_EFFECTS__` on a function declaration or
+/// expression, are not interchangeable: downstream tree-shakers only honor
+/// each on its corresponding node kind. The filter prevents
+/// [`Codegen::print_annotation_comment`] from emitting one kind where the
+/// other was expected when both share an `attached_to`.
+#[derive(Clone, Copy)]
+pub enum AnnotationKind {
+    Pure,
+    NoSideEffects,
+}
+
+impl AnnotationKind {
+    #[inline]
+    fn matches(self, comment: &Comment) -> bool {
+        match self {
+            Self::Pure => comment.is_pure(),
+            Self::NoSideEffects => comment.is_no_side_effects(),
+        }
+    }
+
+    /// Canonical literal to emit when no verbatim source is available.
+    /// `newline_after = true` is used at statement-level emission sites
+    /// (function declarations, exports), `false` at inline emission sites
+    /// (call / new / function expressions).
+    #[inline]
+    fn canonical(self, newline_after: bool) -> &'static str {
+        match (self, newline_after) {
+            (Self::Pure, false) => "/* @__PURE__ */ ",
+            (Self::Pure, true) => "/* @__PURE__ */\n",
+            (Self::NoSideEffects, false) => "/* @__NO_SIDE_EFFECTS__ */ ",
+            (Self::NoSideEffects, true) => "/* @__NO_SIDE_EFFECTS__ */\n",
+        }
+    }
+}
 
 impl Codegen<'_> {
     pub(crate) fn build_comments(&mut self, comments: &[Comment]) {
         if self.options.comments == CommentOptions::disabled() {
             return;
         }
+        // Each retained comment can create at most one map entry. Reserving
+        // this upper bound avoids incremental map growth while preprocessing.
+        self.comments.reserve(comments.len());
         for comment in comments {
-            // Omit pure comments because they are handled separately.
+            // Stash pure / no-side-effects comments by `attached_to` so the
+            // emission site can recover the verbatim source text instead of
+            // falling back to the canonical literal (rolldown#9408).
+            // Best-effort: when several annotation comments share an
+            // `attached_to`, only the last survives; the emission site falls
+            // back to the canonical literal for the dropped ones.
             if comment.is_pure() || comment.is_no_side_effects() {
+                if comment.is_leading() && self.options.print_annotation_comment() {
+                    self.annotation_comments.insert(comment.attached_to, comment.clone());
+                }
                 continue;
             }
+
             let mut add = false;
             if comment.is_leading() {
-                if comment.is_legal() && self.options.print_legal_comment() {
-                    add = true;
-                }
-                if comment.is_jsdoc() && self.options.print_jsdoc_comment() {
-                    add = true;
-                }
-                if comment.is_annotation() && self.options.print_annotation_comment() {
-                    add = true;
-                }
-                if comment.is_normal() && self.options.print_normal_comment() {
-                    add = true;
-                }
+                add = (comment.is_legal() && self.options.print_legal_comment())
+                    || (comment.is_jsdoc() && self.options.print_jsdoc_comment())
+                    || (comment.is_annotation() && self.options.print_annotation_comment())
+                    || (comment.is_normal() && self.options.print_normal_comment());
             }
+
             if add {
-                if comment.is_legal()
-                    && let Err(idx) = self.legal_comment_keys.binary_search(&comment.attached_to)
+                self.has_property_key_annotations |= comment.is_property_key_annotation();
+                if preserve_when_orphaned(comment)
+                    && let Err(idx) = self.orphan_comment_keys.binary_search(&comment.attached_to)
                 {
-                    self.legal_comment_keys.insert(idx, comment.attached_to);
+                    self.orphan_comment_keys.insert(idx, comment.attached_to);
                 }
-                self.comments.entry(comment.attached_to).or_default().push(*comment);
+                self.comments.entry(comment.attached_to).or_default().push(comment.clone());
             }
         }
     }
@@ -49,13 +146,59 @@ impl Codegen<'_> {
         self.comments.contains_key(&start)
     }
 
+    /// Emit a pure / no-side-effects annotation comment for the AST node at
+    /// `start`, falling back to the canonical literal when no verbatim source
+    /// can be recovered.
+    ///
+    /// The fallback covers four cases:
+    /// - no annotation comment is stashed at `start`,
+    /// - the stashed comment's kind doesn't match the emission site (e.g. a
+    ///   `@__NO_SIDE_EFFECTS__` slot being queried by a `CallExpression`
+    ///   site that needs `@__PURE__`),
+    /// - the comment is a line comment but the site can't break the line, or
+    /// - source text is unavailable (e.g. the [`Codegen::print_expression`]
+    ///   path that skips [`Codegen::build_comments`]).
+    ///
+    /// Export sites pass `self.span.start` and only recover verbatim when the
+    /// annotation precedes the `export` keyword. The rarer
+    /// `export /* @__NO_SIDE_EFFECTS__ */ function …` form (annotation between
+    /// `export` and `function`) attaches to the inner function's span and
+    /// falls back to canonical here.
+    pub(crate) fn print_annotation_comment(
+        &mut self,
+        start: u32,
+        kind: AnnotationKind,
+        newline_after: bool,
+    ) {
+        // `entry` probes the map once, and the comment is moved out of it rather than cloned.
+        // `entry` reserves capacity when the key is absent, which allocates if the map is empty,
+        // so check for that first. `annotation_comments` being empty is a common case.
+        if self.source_text.is_some()
+            && !self.annotation_comments.is_empty()
+            && let Entry::Occupied(entry) = self.annotation_comments.entry(start)
+            && kind.matches(entry.get())
+            // Inline line comments would swallow the rest of the line
+            && (!entry.get().is_line() || newline_after)
+        {
+            let comment = entry.remove();
+            self.print_comment(&comment);
+            if newline_after {
+                self.print_hard_newline();
+            } else {
+                self.print_str(" ");
+            }
+            return;
+        }
+        self.print_str(kind.canonical(newline_after));
+    }
+
     pub(crate) fn print_leading_comments(&mut self, start: u32) {
         if let Some(comments) = self.comments.remove(&start) {
             self.print_comments(&comments);
         }
     }
 
-    pub(crate) fn get_comments(&mut self, start: u32) -> Option<Vec<Comment>> {
+    pub(crate) fn get_comments(&mut self, start: u32) -> Option<CommentList> {
         if self.comments.is_empty() {
             return None;
         }
@@ -69,43 +212,160 @@ impl Codegen<'_> {
         }
     }
 
-    /// Whether a legal-comment orphan with `attached_to < end` is still
-    /// pending. Used by block emitters to keep an empty body multi-line.
+    /// Print leading comments at `start` and glue the next token to them: after a
+    /// group ending in a newline (line comment / `followed_by_newline`), print the
+    /// indent — mid-expression callers have no statement machinery to do it, and an
+    /// unindented next token renders differently once the parser re-anchors the
+    /// comments to it (codegen would no longer be idempotent). Otherwise consume the
+    /// pending indent-as-space so the token glues with a single space.
     #[inline]
-    pub(crate) fn has_legal_orphans_before(&self, end: u32) -> bool {
-        self.legal_comment_keys
+    pub(crate) fn print_leading_comments_anchored_to_self(&mut self, start: u32) {
+        if let Some(comments) = self.get_comments(start) {
+            self.print_comments_anchored_to_self(&comments);
+        }
+    }
+
+    /// [`Self::print_leading_comments_anchored_to_self`] for comments already taken from the map.
+    fn print_comments_anchored_to_self(&mut self, comments: &[Comment]) {
+        self.print_comments(comments);
+        if self.last_byte() == Some(b'\n') {
+            self.print_indent();
+        } else {
+            self.consume_pending_indent_space();
+        }
+    }
+
+    /// Print a property-key annotation attached directly to a string or template literal.
+    #[inline]
+    pub(crate) fn print_property_key_annotation(&mut self, start: u32) {
+        if !self.has_property_key_annotations {
+            return;
+        }
+        if self
+            .comments
+            .get(&start)
+            .is_some_and(|comments| comments.iter().any(Comment::is_property_key_annotation))
+        {
+            self.print_leading_comments_anchored_to_self(start);
+        }
+    }
+
+    /// Print comments attached to an expression that survives codegen.
+    ///
+    /// Probes the parenthesized layers too: `a || /* c */ (x)` anchors the
+    /// comment at the `(`, `a || (/* c */ x)` at `x` — an operand printer only
+    /// sees one node, so the walk happens here for every emission site.
+    pub(crate) fn print_leading_comments_before_expression(&mut self, expression: &Expression<'_>) {
+        self.print_comments_through_parens(expression, |_| true);
+    }
+
+    /// Print an expression's comment group only when it contains an annotation
+    /// comment, probing parenthesized layers like
+    /// [`Self::print_leading_comments_before_expression`].
+    ///
+    /// This is the variant for emission sites that mutating consumers move
+    /// statements into (the minifier merges `if(a)x;if(b)x;` into
+    /// `if(a||(b,..))x`; rolldown finalizes moved nodes with their original
+    /// spans). Comments are anchored by source position, so a dissolved
+    /// statement's leading normal-comment group can coincide with the moved
+    /// operand's span start — printing it there misplaces statement-level
+    /// trivia inside an expression and is not idempotent
+    /// (`test_normal_comment_before_logical_rhs_not_printed` documents the
+    /// falsifier). Annotations are the one comment kind with expression-level
+    /// meaning, so they still pass through.
+    pub(crate) fn print_annotation_comments_before_expression(
+        &mut self,
+        expression: &Expression<'_>,
+    ) {
+        self.print_comments_through_parens(expression, |comments| {
+            comments.iter().any(Comment::is_annotation)
+        });
+    }
+
+    /// Print the comment groups of `expression` and its parenthesized layers that `keep` accepts,
+    /// as one group.
+    ///
+    /// The layers print back to back (`/* a */ (/* b */ x)` prints `/* a */ /* b */ x`),
+    /// so they need one layout: a line break between two groups would leave the outer one
+    /// at the end of a line after code, see [`would_strand_comments`].
+    fn print_comments_through_parens(
+        &mut self,
+        mut expression: &Expression<'_>,
+        keep: impl Fn(&CommentList) -> bool,
+    ) {
+        if self.comments.is_empty() {
+            return;
+        }
+        let mut merged = CommentList::new();
+        while !is_pife_function(expression) {
+            let start = expression.span().start;
+            if self.comments.get(&start).is_some_and(&keep) {
+                let group = self.comments.remove(&start).unwrap();
+                if merged.is_empty() {
+                    merged = group;
+                } else {
+                    merged.extend(group);
+                }
+            }
+            let Expression::ParenthesizedExpression(paren) = expression else { break };
+            expression = &paren.expression;
+        }
+        if !merged.is_empty() {
+            self.print_comments_anchored_to_self(&merged);
+        }
+    }
+
+    /// Whether an orphan comment with `attached_to < end` is still pending.
+    /// Used by block emitters to keep an empty body multi-line.
+    #[inline]
+    pub(crate) fn has_orphan_comments_before(&self, end: u32) -> bool {
+        self.orphan_comment_keys
             .iter()
             .take_while(|&&k| k < end)
             .any(|k| self.comments.contains_key(k))
     }
 
-    /// Drain pending legal-comment orphans with `attached_to < end` and emit
-    /// them in source order. Called at every statement boundary so legal
-    /// comments survive when their original anchor was removed by DCE.
+    /// Drain pending orphan comments with `attached_to < end` and emit them in
+    /// source order. Called at every statement boundary so legal and file-level
+    /// coverage comments survive when their original anchor was removed by an
+    /// upstream pass.
     #[inline]
-    pub(crate) fn print_legal_orphans_before(&mut self, end: u32) {
-        if self.legal_comment_keys.is_empty() {
+    pub(crate) fn print_orphan_comments_before(&mut self, end: u32) {
+        if self.orphan_comment_keys.is_empty() {
             return;
         }
-        let idx = self.legal_comment_keys.partition_point(|&k| k < end);
+        let idx = self.orphan_comment_keys.partition_point(|&k| k < end);
         if idx == 0 {
             return;
         }
         // Concatenate across keys so `print_comments` sees one sequence;
         // per-key calls would leak `print_next_indent_as_space` and produce
         // stray leading spaces.
-        let mut legals: Vec<Comment> = Vec::new();
+        let mut orphans: Vec<Comment> = Vec::new();
         let comments = &mut self.comments;
-        for k in self.legal_comment_keys.drain(..idx) {
+        for k in self.orphan_comment_keys.drain(..idx) {
             let Some(entry) = comments.get_mut(&k) else { continue };
-            debug_assert!(entry.iter().any(|c| c.is_legal()));
-            legals.extend(entry.extract_if(.., |c| c.is_legal()));
+            debug_assert!(entry.iter().any(preserve_when_orphaned));
+            entry.retain(|comment| {
+                if preserve_when_orphaned(comment) {
+                    orphans.push(comment.clone());
+                    false
+                } else {
+                    true
+                }
+            });
             if entry.is_empty() {
                 comments.remove(&k);
             }
         }
-        if !legals.is_empty() {
-            self.print_comments(&legals);
+        if let Some(last) = orphans.last_mut() {
+            // Orphans aren't in their original position, so the source's
+            // `followed_by_newline` hint no longer applies. Force it on so
+            // `print_comments` emits a trailing newline instead of setting
+            // `print_next_indent_as_space` — otherwise the next indent (often
+            // before `}`) collapses to a space and pass 2 stops matching.
+            last.set_followed_by_newline(true);
+            self.print_comments(&orphans);
         }
     }
 
@@ -150,7 +410,7 @@ impl Codegen<'_> {
             return;
         };
 
-        if first.preceded_by_newline() {
+        if first.preceded_by_newline() || would_strand_comments(comments) {
             // Skip printing newline if this comment is already on a newline.
             if let Some(b) = self.last_byte() {
                 match b {
@@ -162,40 +422,28 @@ impl Codegen<'_> {
                     }
                 }
             }
-        } else {
+        } else if !self.consume_pending_indent_space()
+            && matches!(self.last_byte(), None | Some(b'\n'))
+        {
+            // Only indent at a line start. Mid-line emission sites (`a ?? /* c */ b`,
+            // `key: /* c */ value`, `${/* c */ expr}`) would otherwise get a full
+            // indent injected mid-line, growing indentation on every codegen pass.
             self.print_indent();
         }
         self.print_comment(first);
 
-        if let Some((last, middle)) = rest.split_last() {
-            for comment in middle {
-                if comment.preceded_by_newline() {
-                    self.print_hard_newline();
-                    self.print_indent();
-                } else if comment.is_legal() {
-                    self.print_hard_newline();
-                } else {
-                    self.print_soft_space();
-                }
-                self.print_comment(comment);
-            }
-
-            if last.preceded_by_newline() {
+        let mut prev = first;
+        for comment in rest {
+            if breaks_line_between(prev, comment) {
                 self.print_hard_newline();
                 self.print_indent();
-            } else if last.is_legal() {
-                self.print_hard_newline();
             } else {
                 self.print_soft_space();
             }
-            self.print_comment(last);
-
-            if last.is_line() || last.followed_by_newline() {
-                self.print_hard_newline();
-            } else {
-                self.print_next_indent_as_space = true;
-            }
-        } else if first.is_line() || first.followed_by_newline() {
+            self.print_comment(comment);
+            prev = comment;
+        }
+        if breaks_line_after(prev) {
             self.print_hard_newline();
         } else {
             self.print_next_indent_as_space = true;
@@ -208,8 +456,25 @@ impl Codegen<'_> {
         };
         let comment_source = comment.span.source_text(source_text);
         match comment.kind {
-            CommentKind::Line | CommentKind::SingleLineBlock => {
+            CommentKind::Line | CommentKind::HtmlOpen | CommentKind::SingleLineBlock => {
                 self.print_str_escaping_script_close_tag(comment_source);
+            }
+            CommentKind::HtmlClose => {
+                // `-->` is only a comment at the start of a line, allowing indentation.
+                // Annotation emission can place it after code even without minification.
+                let is_mid_line = self
+                    .code()
+                    .as_bytes()
+                    .iter()
+                    .rfind(|&&byte| !matches!(byte, b' ' | b'\t'))
+                    .is_some_and(|&byte| byte != b'\n');
+                let text = if is_mid_line {
+                    self.print_str("//");
+                    comment.content_span().source_text(source_text)
+                } else {
+                    comment_source
+                };
+                self.print_str_escaping_script_close_tag(text);
             }
             CommentKind::MultiLineBlock => {
                 for line in LineTerminatorSplitter::new(comment_source) {
@@ -258,7 +523,7 @@ impl Codegen<'_> {
                 text = Cow::Owned(buffer);
             }
             if set.insert(text) {
-                comments.push(*comment);
+                comments.push(comment.clone());
             }
         }
 

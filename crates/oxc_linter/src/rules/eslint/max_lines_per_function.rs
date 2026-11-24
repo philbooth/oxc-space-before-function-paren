@@ -3,7 +3,6 @@ use std::ops::Deref;
 use oxc_ast::AstKind;
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
-use oxc_semantic::Semantic;
 use oxc_span::{GetSpan, Span};
 use schemars::JsonSchema;
 use serde::Deserialize;
@@ -11,7 +10,7 @@ use serde_json::Value;
 
 use crate::{
     AstNode,
-    ast_util::{get_function_name_with_kind, iter_outer_expressions},
+    ast_util::{get_function_name_with_kind, is_iife},
     context::LintContext,
     rule::{DefaultRuleConfig, Rule},
     utils::count_comment_lines,
@@ -19,8 +18,8 @@ use crate::{
 
 fn max_lines_per_function_diagnostic(
     name: &str,
-    count: usize,
-    max: usize,
+    count: u32,
+    max: u32,
     span: Span,
 ) -> OxcDiagnostic {
     OxcDiagnostic::warn(format!(
@@ -34,7 +33,7 @@ fn max_lines_per_function_diagnostic(
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct MaxLinesPerFunctionConfig {
     /// Maximum number of lines allowed in a function.
-    max: usize,
+    max: u32,
     /// Skip lines containing just comments.
     skip_comments: bool,
     /// Skip lines made up purely of whitespace.
@@ -46,7 +45,7 @@ pub struct MaxLinesPerFunctionConfig {
     iifes: bool,
 }
 
-const DEFAULT_MAX_LINES_PER_FUNCTION: usize = 50;
+const DEFAULT_MAX_LINES_PER_FUNCTION: u32 = 50;
 
 impl Default for MaxLinesPerFunctionConfig {
     fn default() -> Self {
@@ -68,6 +67,14 @@ impl Deref for MaxLinesPerFunction {
     fn deref(&self) -> &Self::Target {
         &self.0
     }
+}
+
+#[derive(Debug, JsonSchema, Deserialize)]
+#[serde(untagged)]
+#[expect(unused)]
+enum MaxLinesPerFunctionConfigEnum {
+    Number(u32),
+    Object(MaxLinesPerFunctionConfig),
 }
 
 declare_oxc_lint!(
@@ -118,8 +125,9 @@ declare_oxc_lint!(
     MaxLinesPerFunction,
     eslint,
     pedantic,
-    config = MaxLinesPerFunctionConfig,
+    config = MaxLinesPerFunctionConfigEnum,
     version = "0.15.12",
+    short_description = "Enforce a maximum number of lines of code in a function.",
 );
 
 impl Rule for MaxLinesPerFunction {
@@ -128,7 +136,7 @@ impl Rule for MaxLinesPerFunction {
         if let Some(max) = config
             .and_then(Value::as_number)
             .and_then(serde_json::Number::as_u64)
-            .and_then(|v| usize::try_from(v).ok())
+            .and_then(|v| u32::try_from(v).ok())
         {
             Ok(Self(Box::new(MaxLinesPerFunctionConfig {
                 max,
@@ -137,11 +145,11 @@ impl Rule for MaxLinesPerFunction {
                 iifes: false,
             })))
         } else {
-            serde_json::from_value::<DefaultRuleConfig<Self>>(value)
-                .map(DefaultRuleConfig::into_inner)
+            DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
         }
     }
 
+    #[expect(clippy::cast_possible_truncation)] // the length of lines can't be over u32::MAX, because the source code is already limited by u32::MAX.
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
         match node.kind() {
             AstKind::Function(f) if f.is_function_declaration() => {}
@@ -172,21 +180,12 @@ impl Rule for MaxLinesPerFunction {
             if code.ends_with('\n') { newlines } else { newlines + 1 }
         };
 
-        let final_lines = lines_in_function.saturating_sub(comment_lines);
+        let final_lines = lines_in_function.saturating_sub(comment_lines) as u32;
         if final_lines > self.max {
             let name = get_function_name_with_kind(node, ctx.nodes().parent_node(node.id()));
             ctx.diagnostic(max_lines_per_function_diagnostic(&name, final_lines, self.max, span));
         }
     }
-}
-
-fn is_iife<'a>(node: &AstNode<'a>, semantic: &Semantic<'a>) -> bool {
-    let Some(AstKind::CallExpression(call)) =
-        iter_outer_expressions(semantic.nodes(), node.id()).next()
-    else {
-        return false;
-    };
-    call.callee.span().contains_inclusive(node.span())
 }
 
 #[test]
@@ -390,7 +389,7 @@ fn test() {
         ),
     ];
 
-    let repeat_60 = format!("() => {{{}}}", &"foo\n".repeat(60));
+    let repeat_60 = format!("() => {{{}}}", "foo\n".repeat(60));
 
     let fail = vec![
         (
@@ -416,16 +415,6 @@ fn test() {
             Some(serde_json::json!([1])),
         ),
         (&repeat_60, Some(serde_json::json!([{}]))),
-        (
-            "function name() {
-            var x = 5;
-
-
-
-            var x = 2;
-            }",
-            Some(serde_json::json!([{ "max": 6, "skipComments": false, "skipBlankLines": false }])),
-        ),
         (
             "function name() {
             var x = 5;

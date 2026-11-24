@@ -61,6 +61,7 @@ declare_oxc_lint!(
     style,
     conditional_fix,
     version = "0.7.0",
+    short_description = "Disallow `parseInt()` and `Number.parseInt()` in favor of binary, octal, and hexadecimal literals.",
 );
 
 impl Rule for PreferNumericLiterals {
@@ -134,7 +135,7 @@ fn check_arguments<'a>(call_expr: &CallExpression<'a>, ctx: &LintContext<'a>) {
     }
 
     let radix_arg = &call_expr.arguments[1];
-    let Expression::NumericLiteral(numeric_lit) = &radix_arg.to_expression() else {
+    let Some(Expression::NumericLiteral(numeric_lit)) = radix_arg.as_expression() else {
         return;
     };
 
@@ -168,7 +169,7 @@ fn is_fixable(
         return Err("".into());
     };
 
-    if string_argument.is_empty() {
+    if string_argument.is_empty() || string_argument.starts_with(['+', '-']) {
         return Err("".into());
     }
 
@@ -180,7 +181,7 @@ fn is_fixable(
 
 fn get_string_argument(call_expr: &CallExpression) -> Option<String> {
     if let Argument::StringLiteral(ident) = &call_expr.arguments[0] {
-        return Some(ident.value.to_string());
+        return ident.value.as_str().map(str::to_owned);
     } else if let Argument::TemplateLiteral(temp) = &call_expr.arguments[0] {
         if temp.quasis.is_empty() {
             return None;
@@ -221,6 +222,8 @@ fn test() {
         "parseInt(`11`, 16n);",       // { "ecmaVersion": 2020 },
         "parseInt(1n, 2);",           // { "ecmaVersion": 2020 },
         r#"class C { #parseInt; foo() { Number.#parseInt("111110111", 2); } }"#, // { "ecmaVersion": 2022 }
+        "parseInt('ff', ...x);",
+        "Number.parseInt('ff', ...x);",
     ];
 
     let fail = vec![
@@ -350,4 +353,46 @@ fn test() {
     Tester::new(PreferNumericLiterals::NAME, PreferNumericLiterals::PLUGIN, pass, fail)
         .expect_fix(fix)
         .test_and_snapshot();
+}
+
+#[test]
+fn signed_arguments_have_no_fix() {
+    use crate::tester::Tester;
+
+    let fail = vec![
+        r"parseInt('+11', 2);",
+        r"parseInt('-11', 2);",
+        r"parseInt(`+11`, 2);",
+        r"parseInt(`-11`, 2);",
+        r"parseInt('+17', 8);",
+        r"parseInt('-17', 8);",
+        r"parseInt(`+17`, 8);",
+        r"parseInt(`-17`, 8);",
+        r"parseInt('+ff', 16);",
+        r"parseInt('-ff', 16);",
+        r"parseInt(`+ff`, 16);",
+        r"parseInt(`-ff`, 16);",
+        r"Number.parseInt('+11', 2);",
+        r"Number.parseInt('-11', 2);",
+        r"Number.parseInt(`+11`, 2);",
+        r"Number.parseInt(`-11`, 2);",
+        r"Number.parseInt('+17', 8);",
+        r"Number.parseInt('-17', 8);",
+        r"Number.parseInt(`+17`, 8);",
+        r"Number.parseInt(`-17`, 8);",
+        r"Number.parseInt('+ff', 16);",
+        r"Number.parseInt('-ff', 16);",
+        r"Number.parseInt(`+ff`, 16);",
+        r"Number.parseInt(`-ff`, 16);",
+        r#"parseInt("-0", 2);"#,
+        r#"parseInt("+0", 2);"#,
+        r#"parseInt(" -ff", 16);"#,
+        r#"parseInt("+ff ", 16);"#,
+        r#"parseInt("\t-ff", 16);"#,
+        r#"parseInt("\x2dff", 16);"#,
+    ];
+    let fix = fail.iter().map(|source| (*source, *source, None)).collect();
+    Tester::new(PreferNumericLiterals::NAME, PreferNumericLiterals::PLUGIN, vec![], fail)
+        .expect_fix(fix)
+        .test();
 }

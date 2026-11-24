@@ -2,10 +2,10 @@ use std::borrow::Cow;
 
 use bitflags::bitflags;
 use oxc_ast::{
-    AstKind,
+    AstKind, StaticPropertyName,
     ast::{
-        Expression, FormalParameter, IdentifierName, IdentifierReference, MethodDefinition,
-        MethodDefinitionKind, ObjectProperty, PropertyKind, TSAccessibility,
+        Expression, FormalParameter, Function, IdentifierName, IdentifierReference,
+        MethodDefinition, MethodDefinitionKind, ObjectProperty, PropertyKind, TSAccessibility,
     },
 };
 use oxc_diagnostics::OxcDiagnostic;
@@ -20,13 +20,13 @@ use crate::{
     rule::{DefaultRuleConfig, Rule},
 };
 
-fn no_empty_function_diagnostic<S: AsRef<str>>(
+fn no_empty_function_diagnostic<S: std::fmt::Display>(
     span: Span,
     fn_kind: &str,
     fn_name: Option<S>,
 ) -> OxcDiagnostic {
     let message = match fn_name {
-        Some(name) => Cow::Owned(format!("Unexpected empty {fn_kind} `{}`", name.as_ref())),
+        Some(name) => Cow::Owned(format!("Unexpected empty {fn_kind} `{name}`")),
         None => Cow::Borrowed("Unexpected empty function"),
     };
     OxcDiagnostic::warn(message)
@@ -303,11 +303,12 @@ declare_oxc_lint!(
     suggestion,
     config = NoEmptyFunctionConfig,
     version = "0.3.3",
+    short_description = "Disallows the usage of empty functions.",
 );
 
 impl Rule for NoEmptyFunction {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        let config = serde_json::from_value::<DefaultRuleConfig<NoEmptyFunctionConfig>>(value)
+        let config = DefaultRuleConfig::<NoEmptyFunctionConfig>::from_value(value)
             .map(DefaultRuleConfig::into_inner)?;
         Ok(NoEmptyFunction::from(config))
     }
@@ -324,7 +325,11 @@ impl Rule for NoEmptyFunction {
             return;
         };
         ctx.diagnostic_with_suggestion(
-            no_empty_function_diagnostic(fb.span, kind, fn_name),
+            no_empty_function_diagnostic(
+                fb.span,
+                kind,
+                fn_name.as_ref().map(StaticPropertyName::display),
+            ),
             |fixer| {
                 fixer
                     .replace(Span::new(fb.span.start + 1, fb.span.end - 1), " /* empty */ ")
@@ -335,10 +340,10 @@ impl Rule for NoEmptyFunction {
 }
 
 #[derive(Default, Debug, Clone)]
-struct ViolationInfo<'a>(pub Option<(&'static str, Option<Cow<'a, str>>)>);
-impl<'a> From<(&'static str, Option<Cow<'a, str>>)> for ViolationInfo<'a> {
-    fn from(value: (&'static str, Option<Cow<'a, str>>)) -> Self {
-        debug_assert!(!value.0.is_empty());
+struct ViolationInfo<'a>(pub Option<(&'static str, Option<StaticPropertyName<'a>>)>);
+impl<'a> From<(&'static str, Option<StaticPropertyName<'a>>)> for ViolationInfo<'a> {
+    fn from(value: (&'static str, Option<StaticPropertyName<'a>>)) -> Self {
+        debug_assert_ne!(value.0, "");
         Self(Some(value))
     }
 }
@@ -349,31 +354,32 @@ impl NoEmptyFunction {
         node: &AstNode<'a>,
         ctx: &LintContext<'a>,
     ) -> ViolationInfo<'a> {
-        for parent in ctx.nodes().ancestor_kinds(node.id()) {
-            match parent {
+        let nodes = ctx.nodes();
+        let mut parent = nodes.parent_node(node.id());
+        loop {
+            match parent.kind() {
                 AstKind::Function(f) => {
                     if let Some(name) = f.name() {
-                        let is_generator = f.generator;
-                        let is_async = f.r#async;
-
-                        if is_generator && self.allow.contains(Allowed::GeneratorFunctions) {
-                            return ViolationInfo::default();
-                        }
-                        if is_async && self.allow.contains(Allowed::AsyncFunctions) {
-                            return ViolationInfo::default();
-                        }
-                        if !is_generator && !is_async && self.allow.contains(Allowed::Function) {
+                        if self.is_allowed_function_expression(f) {
                             return ViolationInfo::default();
                         }
 
-                        let kind = if is_async {
+                        let kind = if f.r#async {
                             "async function"
-                        } else if is_generator {
+                        } else if f.generator {
                             "generator function"
                         } else {
                             "function"
                         };
-                        return (kind, Some(name.into())).into();
+                        return (kind, Some(StaticPropertyName::from(name))).into();
+                    }
+                    if f.is_expression()
+                        && self.is_allowed_function_expression(f)
+                        && Self::is_plain_function_expression_container(
+                            nodes.parent_kind(parent.id()),
+                        )
+                    {
+                        return ViolationInfo::default();
                     }
                 }
                 AstKind::ArrowFunctionExpression(arrow) => {
@@ -386,7 +392,7 @@ impl NoEmptyFunction {
                 }
                 AstKind::IdentifierName(IdentifierName { name, .. })
                 | AstKind::IdentifierReference(IdentifierReference { name, .. }) => {
-                    return ("function", Some(Cow::Borrowed(name.as_str()))).into();
+                    return ("function", Some(StaticPropertyName::from(*name))).into();
                 }
                 AstKind::PropertyDefinition(prop) => {
                     if self.allow_decorated_function() && !prop.decorators.is_empty() {
@@ -422,13 +428,7 @@ impl NoEmptyFunction {
                     if let Some(init) = &decl.init {
                         match init.get_inner_expression() {
                             Expression::FunctionExpression(function)
-                                if (function.r#async
-                                    && self.allow.contains(Allowed::AsyncFunctions)
-                                    || function.generator
-                                        && self.allow.contains(Allowed::GeneratorFunctions)
-                                    || !function.r#async
-                                        && !function.generator
-                                        && self.allow.contains(Allowed::Function)) =>
+                                if self.is_allowed_function_expression(function) =>
                             {
                                 return ViolationInfo::default();
                             }
@@ -442,15 +442,16 @@ impl NoEmptyFunction {
                             _ => {}
                         }
                     }
-                    return ("function", decl.id.get_identifier_name().map(Into::into)).into();
+                    return (
+                        "function",
+                        decl.id.get_identifier_name().map(StaticPropertyName::from),
+                    )
+                        .into();
                 }
                 _ => return ("function", None).into(),
             }
+            parent = nodes.parent_node(parent.id());
         }
-        #[cfg(debug_assertions)]
-        unreachable!();
-        #[cfg(not(debug_assertions))]
-        ("function", None).into()
     }
 
     fn is_allowed_method(&self, method: &MethodDefinition) -> bool {
@@ -507,16 +508,25 @@ impl NoEmptyFunction {
                     }
                     self.allow.contains(Allowed::Methods)
                 } else {
-                    if function.r#async && self.allow.contains(Allowed::AsyncFunctions)
-                        || function.generator && self.allow.contains(Allowed::GeneratorFunctions)
-                    {
-                        return true;
-                    }
-                    !function.r#async
-                        && !function.generator
-                        && self.allow.contains(Allowed::Function)
+                    self.is_allowed_function_expression(function)
                 }
             }
+        }
+    }
+
+    fn is_allowed_function_expression(&self, function: &Function) -> bool {
+        function.r#async && self.allow.contains(Allowed::AsyncFunctions)
+            || function.generator && self.allow.contains(Allowed::GeneratorFunctions)
+            || !function.r#async && !function.generator && self.allow.contains(Allowed::Function)
+    }
+
+    fn is_plain_function_expression_container(parent: AstKind) -> bool {
+        match parent {
+            AstKind::MethodDefinition(_) => false,
+            AstKind::ObjectProperty(property) => {
+                property.kind == PropertyKind::Init && !property.method
+            }
+            _ => true,
         }
     }
 
@@ -1080,6 +1090,17 @@ fn test() {
             "class A extends B { override foo() {} }",
             Some(serde_json::json!([{ "allow": ["overrideMethods", "methods"] }])),
         ),
+        (
+            "
+            const x = function () {};
+            function fetchData(callback = function () {}) {
+                callback();
+            }
+            button.onclick = function () {};
+            setTimeout(function () {}, 1000);
+            ",
+            Some(serde_json::json!([{ "allow": ["functions"] }])),
+        ),
     ];
 
     let fail = vec![
@@ -1129,7 +1150,6 @@ fn test() {
         ("class Person { otherMethod(name: string) {} }", None),
         ("class Foo { private constructor() {} }", None),
         ("class Foo { protected constructor() {} }", None),
-        ("function foo() {}", None),
         (
             "
         class Foo {

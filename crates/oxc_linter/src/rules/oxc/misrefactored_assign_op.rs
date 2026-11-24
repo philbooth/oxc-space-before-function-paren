@@ -53,8 +53,10 @@ declare_oxc_lint!(
     MisrefactoredAssignOp,
     oxc,
     suspicious,
+    recommended,
     suggestion,
     version = "0.1.1",
+    short_description = "Checks for `a op= a op b` or `a op= b op a` patterns.",
 );
 
 impl Rule for MisrefactoredAssignOp {
@@ -126,18 +128,9 @@ fn assignment_target_eq_expr<'a>(
                     false
                 }
             }
-            SimpleAssignmentTarget::TSAsExpression(ts_expr) => {
-                is_same_expression(&ts_expr.expression, right_expr, ctx)
-            }
-            SimpleAssignmentTarget::TSSatisfiesExpression(ts_expr) => {
-                is_same_expression(&ts_expr.expression, right_expr, ctx)
-            }
-            SimpleAssignmentTarget::TSNonNullExpression(ts_expr) => {
-                is_same_expression(&ts_expr.expression, right_expr, ctx)
-            }
-            SimpleAssignmentTarget::TSTypeAssertion(ts_expr) => {
-                is_same_expression(&ts_expr.expression, right_expr, ctx)
-            }
+            _ => simple_assignment_target
+                .get_expression()
+                .is_some_and(|expression| is_same_expression(expression, right_expr, ctx)),
         };
     }
 

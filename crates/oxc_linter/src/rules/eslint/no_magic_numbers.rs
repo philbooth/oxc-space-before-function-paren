@@ -1,6 +1,6 @@
 use oxc_ast::{
     AstKind,
-    ast::{AssignmentTarget, Expression, VariableDeclarationKind},
+    ast::{AssignmentTarget, BigIntLiteral, Expression, NumericLiteral},
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
@@ -10,7 +10,7 @@ use oxc_syntax::operator::UnaryOperator;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::{AstNode, context::LintContext, rule::Rule};
+use crate::{AstNode, ast_util::variable_declaration_kind, context::LintContext, rule::Rule};
 
 enum NoMagicNumberReportReason {
     MustUseConst,
@@ -41,13 +41,14 @@ impl std::ops::Deref for NoMagicNumbers {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
 pub enum NoMagicNumbersNumber {
     Float(f64),
     BigInt(String),
 }
 
 #[derive(Debug, Default, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct NoMagicNumbersConfig {
     /// An array of numbers to ignore if used as magic numbers. Can include floats or BigInt strings.
     ignore: Vec<NoMagicNumbersNumber>,
@@ -93,7 +94,7 @@ impl TryFrom<&serde_json::Value> for NoMagicNumbersConfig {
                     ignore: object
                         .get("ignore")
                         .and_then(serde_json::Value::as_array)
-                        .map(|v| {
+                        .map_or_default(|v| {
                             v.iter()
                                 .map(|v| {
                                     if v.is_number() {
@@ -103,8 +104,7 @@ impl TryFrom<&serde_json::Value> for NoMagicNumbersConfig {
                                     }
                                 })
                                 .collect()
-                        })
-                        .unwrap_or_default(),
+                        }),
                     ignore_array_indexes: get_bool_property(object, "ignoreArrayIndexes"),
                     ignore_default_values: get_bool_property(object, "ignoreDefaultValues"),
                     ignore_class_field_initial_values: get_bool_property(
@@ -245,6 +245,7 @@ declare_oxc_lint!(
     pending, // TODO: enforceConst, probably copy from https://github.com/oxc-project/oxc/pull/5144
     config = NoMagicNumbersConfig,
     version = "0.9.3",
+    short_description = "Disallow magic numbers.",
 );
 
 #[derive(Debug)]
@@ -254,13 +255,27 @@ struct InternConfig<'a> {
     raw: String,
 }
 
+#[derive(Clone, Copy)]
+enum NumberLiteral<'a> {
+    Number(&'a NumericLiteral<'a>),
+    BigInt(&'a BigIntLiteral<'a>),
+}
+
 impl InternConfig<'_> {
-    pub fn from<'a>(node: &'a AstNode<'a>, parent_node: &'a AstNode<'a>) -> InternConfig<'a> {
-        let is_unary = matches!(parent_node.kind(), AstKind::UnaryExpression(_));
+    pub fn from<'a>(
+        literal: NumberLiteral<'a>,
+        node: &'a AstNode<'a>,
+        parent_node: &'a AstNode<'a>,
+    ) -> InternConfig<'a> {
+        let is_unary = matches!(
+            parent_node.kind(),
+            AstKind::UnaryExpression(unary)
+                if matches!(unary.operator, UnaryOperator::UnaryNegation | UnaryOperator::UnaryPlus)
+        );
         let is_negative = matches!(parent_node.kind(), AstKind::UnaryExpression(unary) if unary.operator == UnaryOperator::UnaryNegation);
 
-        match node.kind() {
-            AstKind::NumericLiteral(numeric) => {
+        match literal {
+            NumberLiteral::Number(numeric) => {
                 if is_negative {
                     InternConfig {
                         node: parent_node,
@@ -275,7 +290,7 @@ impl InternConfig<'_> {
                     }
                 }
             }
-            AstKind::BigIntLiteral(bigint) => {
+            NumberLiteral::BigInt(bigint) => {
                 if is_negative {
                     let big_int_string = format!("-{}n", bigint.value);
                     InternConfig {
@@ -292,12 +307,6 @@ impl InternConfig<'_> {
                     }
                 }
             }
-            _ => {
-                unreachable!(
-                    "expected AstKind BigIntLiteral or NumericLiteral, got {:?}",
-                    node.kind().debug_name()
-                )
-            }
         }
     }
 }
@@ -308,13 +317,14 @@ impl Rule for NoMagicNumbers {
     }
 
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
-        match node.kind() {
-            AstKind::NumericLiteral(_) | AstKind::BigIntLiteral(_) => {}
+        let literal = match node.kind() {
+            AstKind::NumericLiteral(numeric) => NumberLiteral::Number(numeric),
+            AstKind::BigIntLiteral(bigint) => NumberLiteral::BigInt(bigint),
             _ => return,
-        }
+        };
 
         let nodes = ctx.nodes();
-        let config = InternConfig::from(node, nodes.parent_node(node.id()));
+        let config = InternConfig::from(literal, node, nodes.parent_node(node.id()));
 
         if self.is_skippable(&config, nodes) {
             return;
@@ -323,7 +333,7 @@ impl Rule for NoMagicNumbers {
         let parent_kind = nodes.parent_kind(config.node.id());
         let span = config.node.kind().span();
 
-        let Some(reason) = self.get_report_reason(&parent_kind) else {
+        let Some(reason) = self.get_report_reason(&parent_kind, ctx) else {
             return;
         };
 
@@ -515,11 +525,14 @@ impl NoMagicNumbers {
 
     fn get_report_reason<'a>(
         &self,
-        parent_kind: &'a AstKind<'a>,
+        parent_kind: &AstKind<'a>,
+        ctx: &LintContext<'a>,
     ) -> Option<NoMagicNumberReportReason> {
         match parent_kind {
             AstKind::VariableDeclarator(declarator) => {
-                if self.enforce_const && declarator.kind != VariableDeclarationKind::Const {
+                if self.enforce_const
+                    && !variable_declaration_kind(declarator, ctx.nodes())?.is_const()
+                {
                     return Some(NoMagicNumberReportReason::MustUseConst);
                 }
 
@@ -729,6 +742,8 @@ fn test() {
 			      ",
             Some(serde_json::json!([{ "ignoreTypeIndexes": true, "ignore": [0, 3] }])),
         ),
+        ("exports.c = -7;", None),
+        ("exports.d = +9;", None),
     ];
 
     let fail = vec![
@@ -946,6 +961,10 @@ fn test() {
             "type Foo = { bar: Bar[((1 & -2) | 3) | 4] };",
             Some(serde_json::json!([{ "ignoreNumericLiteralTypes": true }])),
         ),
+        ("exports.a = void 0;", None),
+        ("exports.b = ~5;", None),
+        ("exports.c = !3;", None),
+        ("var x = typeof 4;", None),
     ];
 
     Tester::new(NoMagicNumbers::NAME, NoMagicNumbers::PLUGIN, pass, fail).test_and_snapshot();

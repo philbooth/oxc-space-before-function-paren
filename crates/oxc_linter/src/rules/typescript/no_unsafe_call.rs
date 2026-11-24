@@ -51,7 +51,9 @@ declare_oxc_lint!(
     NoUnsafeCall(tsgolint),
     typescript,
     pedantic,
+    recommended,
     version = "1.12.0",
+    short_description = "This rule disallows calling a value with type `any`.",
 );
 
 impl Rule for NoUnsafeCall {}

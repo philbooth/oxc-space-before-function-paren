@@ -5,49 +5,19 @@
 
 use std::cell::Cell;
 
-use oxc_allocator::{Allocator, CloneIn};
+use oxc_allocator::{Allocator, CloneIn, CloneInSemanticIds};
 
-use crate::number::*;
 use crate::operator::*;
-
-impl<'new_alloc> CloneIn<'new_alloc> for NumberBase {
-    type Cloned = NumberBase;
-
-    #[inline(always)]
-    fn clone_in(&self, allocator: &'new_alloc Allocator) -> Self::Cloned {
-        *self
-    }
-
-    #[inline(always)]
-    fn clone_in_with_semantic_ids(&self, allocator: &'new_alloc Allocator) -> Self::Cloned {
-        *self
-    }
-}
-
-impl<'new_alloc> CloneIn<'new_alloc> for BigintBase {
-    type Cloned = BigintBase;
-
-    #[inline(always)]
-    fn clone_in(&self, allocator: &'new_alloc Allocator) -> Self::Cloned {
-        *self
-    }
-
-    #[inline(always)]
-    fn clone_in_with_semantic_ids(&self, allocator: &'new_alloc Allocator) -> Self::Cloned {
-        *self
-    }
-}
 
 impl<'new_alloc> CloneIn<'new_alloc> for AssignmentOperator {
     type Cloned = AssignmentOperator;
 
     #[inline(always)]
-    fn clone_in(&self, allocator: &'new_alloc Allocator) -> Self::Cloned {
-        *self
-    }
-
-    #[inline(always)]
-    fn clone_in_with_semantic_ids(&self, allocator: &'new_alloc Allocator) -> Self::Cloned {
+    fn clone_in_impl(
+        &self,
+        _with_semantic_ids: CloneInSemanticIds,
+        allocator: &'new_alloc Allocator,
+    ) -> Self::Cloned {
         *self
     }
 }
@@ -56,12 +26,11 @@ impl<'new_alloc> CloneIn<'new_alloc> for BinaryOperator {
     type Cloned = BinaryOperator;
 
     #[inline(always)]
-    fn clone_in(&self, allocator: &'new_alloc Allocator) -> Self::Cloned {
-        *self
-    }
-
-    #[inline(always)]
-    fn clone_in_with_semantic_ids(&self, allocator: &'new_alloc Allocator) -> Self::Cloned {
+    fn clone_in_impl(
+        &self,
+        _with_semantic_ids: CloneInSemanticIds,
+        allocator: &'new_alloc Allocator,
+    ) -> Self::Cloned {
         *self
     }
 }
@@ -70,12 +39,11 @@ impl<'new_alloc> CloneIn<'new_alloc> for LogicalOperator {
     type Cloned = LogicalOperator;
 
     #[inline(always)]
-    fn clone_in(&self, allocator: &'new_alloc Allocator) -> Self::Cloned {
-        *self
-    }
-
-    #[inline(always)]
-    fn clone_in_with_semantic_ids(&self, allocator: &'new_alloc Allocator) -> Self::Cloned {
+    fn clone_in_impl(
+        &self,
+        _with_semantic_ids: CloneInSemanticIds,
+        allocator: &'new_alloc Allocator,
+    ) -> Self::Cloned {
         *self
     }
 }
@@ -84,12 +52,11 @@ impl<'new_alloc> CloneIn<'new_alloc> for UnaryOperator {
     type Cloned = UnaryOperator;
 
     #[inline(always)]
-    fn clone_in(&self, allocator: &'new_alloc Allocator) -> Self::Cloned {
-        *self
-    }
-
-    #[inline(always)]
-    fn clone_in_with_semantic_ids(&self, allocator: &'new_alloc Allocator) -> Self::Cloned {
+    fn clone_in_impl(
+        &self,
+        _with_semantic_ids: CloneInSemanticIds,
+        allocator: &'new_alloc Allocator,
+    ) -> Self::Cloned {
         *self
     }
 }
@@ -98,12 +65,11 @@ impl<'new_alloc> CloneIn<'new_alloc> for UpdateOperator {
     type Cloned = UpdateOperator;
 
     #[inline(always)]
-    fn clone_in(&self, allocator: &'new_alloc Allocator) -> Self::Cloned {
-        *self
-    }
-
-    #[inline(always)]
-    fn clone_in_with_semantic_ids(&self, allocator: &'new_alloc Allocator) -> Self::Cloned {
+    fn clone_in_impl(
+        &self,
+        _with_semantic_ids: CloneInSemanticIds,
+        allocator: &'new_alloc Allocator,
+    ) -> Self::Cloned {
         *self
     }
 }

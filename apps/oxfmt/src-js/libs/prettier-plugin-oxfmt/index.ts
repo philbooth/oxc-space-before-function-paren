@@ -1,17 +1,19 @@
 /**
  * Prettier plugin that uses `oxc_formatter` for (j|t)s-in-xxx part.
  *
- * When Prettier formats Vue/HTML (which can embed JS/TS code inside) files,
+ * When Prettier formats Svelte/Astro (which can embed JS/TS code inside) files,
  * it calls the `embed()` function for each block.
  *
  * By default, it uses the `babel` or `typescript` parser and `estree` printer.
  * Therefore, by overriding these internally, we can use `oxc_formatter` instead.
- * e.g. Now it's possible to apply our builtin sort-imports for JS/TS code inside Vue `<script>`.
+ * e.g. Now it's possible to apply our builtin sort-imports for JS/TS code inside Svelte `<script>`.
  */
 
 import { textToDoc } from "./text-to-doc";
 import type { Parser, Printer, Doc, SupportOptions } from "prettier";
 
+// NOTE: Custom options must be declared here,
+// or Prettier's normalization drops them before they reach `textToDoc()`.
 export const options: SupportOptions = {
   _oxfmtPluginOptionsJson: {
     category: "JavaScript",

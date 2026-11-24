@@ -1,11 +1,11 @@
-use oxc_allocator::Vec;
+use oxc_allocator::ArenaVec;
 use oxc_ast::ast::{JSXChild, JSXElement, JSXExpression, JSXExpressionContainer, JSXFragment};
 use oxc_span::{GetSpan, Span};
 
 use crate::{
-    ast_nodes::{AstNode, AstNodes},
+    ast_nodes::{AstNode, AstNodeKind, AstNodes},
     best_fitting, format_args,
-    formatter::{Formatter, prelude::*, trivia::FormatTrailingComments},
+    formatter::{prelude::*, trivia::FormatTrailingComments},
     parentheses::NeedsParentheses,
     print::jsx::{FormatChildrenResult, FormatOpeningElement},
     utils::{
@@ -20,8 +20,8 @@ use super::{FormatJsxChildList, JsxChildListLayout};
 /// Union type for JSX elements and fragments that have children
 #[derive(Debug, Clone)]
 pub enum AnyJsxTagWithChildren<'a, 'b> {
-    Element(&'b AstNode<'a, JSXElement<'a>>),
-    Fragment(&'b AstNode<'a, JSXFragment<'a>>),
+    Element(&'b AstNode<'b, 'a, JSXElement<'a>>),
+    Fragment(&'b AstNode<'b, 'a, JSXFragment<'a>>),
 }
 
 impl<'a> AnyJsxTagWithChildren<'a, '_> {
@@ -32,17 +32,16 @@ impl<'a> AnyJsxTagWithChildren<'a, '_> {
         }
     }
 
-    fn format_leading_comments(&self, f: &mut Formatter<'_, 'a>) {
+    fn format_leading_comments(&self, f: &mut JsFormatter<'_, 'a>) {
         match self {
             Self::Element(element) => element.format_leading_comments(f),
             Self::Fragment(fragment) => fragment.format_leading_comments(f),
         }
     }
 
-    fn format_trailing_comments(&self, f: &mut Formatter<'_, 'a>) {
-        let trailing_comments = if let AstNodes::ArrowFunctionExpression(arrow) =
-            self.parent().parent().parent()
-            && arrow.expression
+    fn format_trailing_comments(&self, f: &mut JsFormatter<'_, 'a>) {
+        let trailing_comments = if let AstNodes::ArrowFunctionExpression(arrow) = self.parent()
+            && arrow.is_expression()
         {
             f.context().comments().comments_before(arrow.span.end)
         } else if let AstNodes::ConditionalExpression(conditional) = self.parent() {
@@ -63,6 +62,16 @@ impl<'a> AnyJsxTagWithChildren<'a, '_> {
             } else {
                 f.context().comments().end_of_line_comments_after(self.span().end)
             }
+        } else if matches!(
+            self.parent(),
+            AstNodes::TemplateLiteral(_) | AstNodes::TSTemplateLiteralType(_)
+        ) {
+            // For a JSX element inside `${...}`,
+            // the trailing comments must stop at the closing `}` of the interpolation.
+            // The default `get_trailing_comments` logic uses the next sibling's `span.start` as boundary,
+            // which can incorrectly pull in the next interpolation's leading comment
+            // when consecutive `${...}` chunks are present.
+            f.context().comments().comments_before_character(self.span().end, b'}')
         } else {
             // Fall back to default trailing comments behavior
             return match self {
@@ -75,7 +84,7 @@ impl<'a> AnyJsxTagWithChildren<'a, '_> {
 
     /// Checks if a JSX Element should be wrapped in parentheses. Returns a [WrapState] which
     /// indicates when the element should be wrapped in parentheses.
-    pub fn get_wrap_state(&self) -> WrapState {
+    pub fn get_wrap_state(&self, f: &JsFormatter<'_, 'a>) -> WrapState {
         let parent = self.parent();
         // Call site has ensures that only non-nested JSX elements are passed.
         debug_assert!(!matches!(parent, AstNodes::JSXElement(_) | AstNodes::JSXFragment(_)));
@@ -84,43 +93,26 @@ impl<'a> AnyJsxTagWithChildren<'a, '_> {
             AstNodes::ArrayExpression(_)
             | AstNodes::JSXAttribute(_)
             | AstNodes::JSXExpressionContainer(_)
-            | AstNodes::ConditionalExpression(_) => WrapState::NoWrap,
-            AstNodes::StaticMemberExpression(member) => {
-                if member.optional {
-                    WrapState::NoWrap
-                } else {
-                    WrapState::WrapOnBreak
-                }
-            }
+            | AstNodes::ConditionalExpression(_)
+            | AstNodes::ExpressionStatement(_) => WrapState::NoWrap,
+            // An embedded expression's root
+            parent if f.context().is_embedded_root(parent) => WrapState::NoWrap,
             // It is a argument of a call expression
             AstNodes::CallExpression(call) if call.is_argument_span(self.span()) => {
                 WrapState::NoWrap
             }
             AstNodes::NewExpression(new) if new.is_argument_span(self.span()) => WrapState::NoWrap,
-            AstNodes::ExpressionStatement(stmt) => {
-                // `() => <div></div>`
-                //        ^^^^^^^^^^^
-                if stmt.is_arrow_function_body() {
-                    WrapState::WrapOnBreak
-                } else {
-                    WrapState::NoWrap
-                }
-            }
-            AstNodes::ComputedMemberExpression(member) => {
-                if member.optional {
-                    WrapState::NoWrap
-                } else {
-                    WrapState::WrapOnBreak
-                }
-            }
+            // Concise arrow body: `() => <div></div>`
+            #[expect(clippy::match_same_arms)]
+            AstNodes::ArrowFunctionExpression(_) => WrapState::WrapOnBreak,
             _ => WrapState::WrapOnBreak,
         }
     }
 }
 
-impl<'a> Format<'a> for AnyJsxTagWithChildren<'a, '_> {
-    fn fmt(&self, f: &mut Formatter<'_, 'a>) {
-        let is_suppressed = f.comments().is_suppressed(self.span().start);
+impl<'a> Format<'a, JsFormatContext<'a>> for AnyJsxTagWithChildren<'a, '_> {
+    fn fmt(&self, f: &mut JsFormatter<'_, 'a>) {
+        let is_suppressed = f.comments().is_span_suppressed(self.span());
 
         let format_tag = format_with(|f| {
             if is_suppressed {
@@ -157,7 +149,7 @@ impl<'a> Format<'a> for AnyJsxTagWithChildren<'a, '_> {
                     let children = self.children();
                     let format_children = FormatJsxChildList::default()
                         .with_options(list_layout)
-                        .fmt_children(children, f);
+                        .fmt_children(&children, f);
 
                     match format_children {
                         FormatChildrenResult::SingleChild(child) => {
@@ -186,7 +178,7 @@ impl<'a> Format<'a> for AnyJsxTagWithChildren<'a, '_> {
             return write!(f, [format_tag]);
         }
 
-        let wrap = self.get_wrap_state();
+        let wrap = self.get_wrap_state(f);
         match wrap {
             WrapState::NoWrap => {
                 write!(
@@ -242,14 +234,9 @@ impl<'a> Format<'a> for AnyJsxTagWithChildren<'a, '_> {
 /// // As JSX attribute:
 /// <Tooltip title={[].map(name => (<Foo>{name}</Foo>))} />;
 /// ```
-pub fn should_expand(mut parent: &AstNodes<'_>) -> bool {
-    if let AstNodes::ExpressionStatement(stmt) = parent {
-        // If the parent is a JSXExpressionContainer, we need to check its parent
-        // to determine if it should expand.
-        parent = stmt.grand_parent();
-    }
+pub fn should_expand(parent: &AstNodes<'_, '_>) -> bool {
     let maybe_jsx_expression_container = match parent {
-        AstNodes::ArrowFunctionExpression(arrow) if arrow.expression => match arrow.parent() {
+        AstNodes::ArrowFunctionExpression(arrow) if arrow.is_expression() => match arrow.parent() {
             AstNodes::CallExpression(call) => call.parent(),
             _ => return false,
         },
@@ -262,13 +249,11 @@ pub fn should_expand(mut parent: &AstNodes<'_>) -> bool {
 }
 
 impl<'a, 'b> AnyJsxTagWithChildren<'a, 'b> {
-    fn fmt_opening(&self, f: &mut Formatter<'_, 'a>) {
+    fn fmt_opening(&self, f: &mut JsFormatter<'_, 'a>) {
         match self {
             Self::Element(element) => {
                 let is_self_closing = element.closing_element().is_none();
-                let opening_formatter =
-                    FormatOpeningElement::new(element.opening_element(), is_self_closing);
-                write!(f, opening_formatter);
+                write!(f, FormatOpeningElement::new(&element.opening_element(), is_self_closing));
             }
             Self::Fragment(fragment) => {
                 write!(f, fragment.opening_fragment());
@@ -276,7 +261,7 @@ impl<'a, 'b> AnyJsxTagWithChildren<'a, 'b> {
         }
     }
 
-    fn fmt_closing(&self, f: &mut Formatter<'_, 'a>) {
+    fn fmt_closing(&self, f: &mut JsFormatter<'_, 'a>) {
         match self {
             Self::Element(element) => {
                 write!(f, element.closing_element());
@@ -287,21 +272,21 @@ impl<'a, 'b> AnyJsxTagWithChildren<'a, 'b> {
         }
     }
 
-    fn children(&self) -> &'b AstNode<'a, Vec<'a, JSXChild<'a>>> {
+    fn children(&self) -> AstNode<'b, 'a, ArenaVec<'a, JSXChild<'a>>> {
         match self {
             Self::Element(element) => element.children(),
             Self::Fragment(fragment) => fragment.children(),
         }
     }
 
-    fn parent(&self) -> &'b AstNodes<'a> {
+    fn parent(&self) -> &'b AstNodes<'b, 'a> {
         match self {
             Self::Element(element) => element.parent(),
             Self::Fragment(fragment) => fragment.parent(),
         }
     }
 
-    fn needs_parentheses(&self, f: &Formatter<'_, 'a>) -> bool {
+    fn needs_parentheses(&self, f: &JsFormatter<'_, 'a>) -> bool {
         match self {
             Self::Element(element) => element.needs_parentheses(f),
             Self::Fragment(fragment) => fragment.needs_parentheses(f),
@@ -317,15 +302,16 @@ impl<'a, 'b> AnyJsxTagWithChildren<'a, 'b> {
                 // Safe because of length check above
                 let child = children.first().unwrap();
 
-                match child.as_ast_nodes() {
-                    AstNodes::JSXText(text) => {
+                match child.as_kind() {
+                    AstNodeKind::JSXText(text) => {
                         if is_meaningful_jsx_text(&text.value) {
                             ElementLayout::Default
                         } else {
                             ElementLayout::NoChildren
                         }
                     }
-                    AstNodes::JSXExpressionContainer(expression) => match &expression.expression {
+                    AstNodeKind::JSXExpressionContainer(expression) => match &expression.expression
+                    {
                         JSXExpression::TemplateLiteral(_) => ElementLayout::Template(expression),
                         JSXExpression::TaggedTemplateExpression(_) => {
                             ElementLayout::Template(expression)
@@ -361,7 +347,7 @@ pub enum ElementLayout<'a, 'b> {
     ///   } that will eventually break across multiple lines ${(40 / 3) * 45}`}
     /// </div>;
     /// ```
-    Template(&'b AstNode<'a, JSXExpressionContainer<'a>>),
+    Template(AstNode<'b, 'a, JSXExpressionContainer<'a>>),
 
     /// Default layout used for all elements that have children and [ElementLayout::Template] does not apply.
     ///

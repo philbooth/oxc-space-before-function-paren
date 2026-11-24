@@ -5,7 +5,7 @@ use oxc_ast::{
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_span::{GetSpan, Span};
-use oxc_str::CompactStr;
+use oxc_str::{CompactStr, JSStr};
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -21,9 +21,10 @@ fn no_callback_in_promise_diagnostic(span: Span) -> OxcDiagnostic {
 pub struct NoCallbackInPromise(Box<NoCallbackInPromiseConfig>);
 
 #[derive(Debug, Clone, JsonSchema, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct NoCallbackInPromiseConfig {
     /// List of callback function names to check for within Promise `then` and `catch` methods.
+    #[serde(skip)]
     callbacks: Vec<CompactStr>,
     /// List of callback function names to allow within Promise `then` and `catch` methods.
     exceptions: Vec<CompactStr>,
@@ -85,8 +86,10 @@ declare_oxc_lint!(
     NoCallbackInPromise,
     promise,
     correctness,
+    recommended,
     config = NoCallbackInPromiseConfig,
     version = "0.10.0",
+    short_description = "Disallows calling a callback function (`cb()`) inside a `Promise.prototype.then()` or `Promise.prototype.catch()`.",
 );
 
 const TIMEOUT_WHITELIST: [&str; 4] =
@@ -154,7 +157,6 @@ impl NoCallbackInPromise {
         // Check if the parent is a CallExpression with then/catch
         let parent = ctx.nodes().parent_node(node.id());
         if let Some(call_expr) = parent.kind().as_call_expression() {
-            // Check if this function is one of the arguments
             let is_argument = call_expr
                 .arguments
                 .iter()
@@ -171,7 +173,8 @@ impl NoCallbackInPromise {
             call_expr
                 .callee
                 .as_member_expression()
-                .and_then(MemberExpression::static_property_name),
+                .and_then(MemberExpression::static_property_name)
+                .and_then(JSStr::as_str),
             Some("then" | "catch")
         )
     }

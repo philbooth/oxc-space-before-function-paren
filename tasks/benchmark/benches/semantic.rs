@@ -1,7 +1,7 @@
 use oxc_allocator::Allocator;
 use oxc_benchmark::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use oxc_parser::Parser;
-use oxc_semantic::SemanticBuilder;
+use oxc_semantic::{SemanticBuilder, Stats};
 use oxc_tasks_common::TestFiles;
 
 fn bench_semantic(criterion: &mut Criterion) {
@@ -24,14 +24,17 @@ fn bench_semantic(criterion: &mut Criterion) {
                 let program = Parser::new(&allocator, source_text, source_type).parse().program;
                 let program = black_box(program);
 
+                // Collect stats outside the measured section to time semantic analysis alone.
+                let stats = Stats::count(&program);
+
                 runner.run(|| {
                     // We drop `Semantic` inside this closure as drop time is part of cost of using this API.
                     // We return `errors` to be dropped outside of the measured section, as usually
-                    // code would have no errors. One of our benchmarks `cal.com.tsx` has a lot of errors,
-                    // but that's atypical, so don't want to include it in benchmark time.
-                    let ret = SemanticBuilder::new().with_check_syntax_error(true).build(&program);
+                    // real-world code has no errors, so allocating and dropping them is atypical and
+                    // we don't want to include it in benchmark time.
+                    let ret = SemanticBuilder::new_compiler().with_stats(stats).build(&program);
                     let ret = black_box(ret);
-                    ret.errors
+                    ret.diagnostics
                 });
             });
         });

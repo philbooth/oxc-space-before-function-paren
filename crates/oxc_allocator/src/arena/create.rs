@@ -74,7 +74,7 @@ const _: () = {
 ///
 /// The available capacity will be slightly smaller.
 /// 16 KiB covers the majority of real-world JS/TS files.
-const FIRST_ALLOCATION_GOAL: usize = 16 * 1024;
+pub(super) const FIRST_ALLOCATION_GOAL: usize = 16 * 1024;
 
 const _: () = {
     assert!(FIRST_ALLOCATION_GOAL.is_power_of_two());
@@ -308,7 +308,6 @@ impl<const MIN_ALIGN: usize> Arena<MIN_ALIGN> {
             cursor_ptr: Cell::new(cursor_ptr),
             current_chunk_footer_ptr: Cell::new(chunk_footer_ptr),
             start_ptr: Cell::new(start_ptr),
-            can_grow: true,
             #[cfg(all(feature = "track_allocations", not(feature = "disable_track_allocations")))]
             stats: AllocationStats::default(),
         }
@@ -410,6 +409,12 @@ impl<const MIN_ALIGN: usize> Arena<MIN_ALIGN> {
         debug_assert!(size >= requested_layout.size());
         debug_assert!(size > 0);
 
+        // Mark the upcoming allocation as a chunk operation, so the allocation-tracking
+        // task can exclude it from its heap metrics. Must be set immediately before the
+        // `alloc` call, with no allocations in between.
+        #[cfg(all(feature = "track_allocations", not(feature = "disable_track_allocations")))]
+        crate::tracking::start_chunk_operation();
+
         // Allocate memory for the chunk.
         // SAFETY: `layout` has non-zero size.
         let start_ptr = unsafe { alloc::alloc(layout) };
@@ -435,6 +440,7 @@ impl<const MIN_ALIGN: usize> Arena<MIN_ALIGN> {
                 layout,
                 previous_chunk_footer_ptr: Cell::new(previous_chunk_footer_ptr),
                 cursor_ptr: Cell::new(cursor_ptr),
+                is_fixed_size: false,
             });
         }
 

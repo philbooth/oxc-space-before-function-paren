@@ -50,8 +50,10 @@ declare_oxc_lint!(
     NoUnnecessarySliceEnd,
     unicorn,
     pedantic,
+    recommended,
     fix,
     version = "0.16.10",
+    short_description = "Disallows unnecessarily passing a second argument to `slice(...)`, for cases where it would not change the result.",
 );
 
 impl Rule for NoUnnecessarySliceEnd {
@@ -159,7 +161,6 @@ fn test() {
         ("foo.slice?.(1, foo.length)"),
         ("foo.slice()"),
         ("foo.slice(1)"),
-        ("foo.slice()"),
         ("foo.slice(1, foo.length - 1)"),
         ("foo.slice(1, foo.length, extraArgument)"),
         ("foo.slice(...[1], foo.length)"),

@@ -70,9 +70,11 @@ declare_oxc_lint!(
     RelativeUrlStyle,
     unicorn,
     style,
+    recommended,
     fix_suggestion,
     config = RelativeUrlStyleConfig,
     version = "1.44.0",
+    short_description = "Enforce consistent relative URL style.",
 );
 
 const DOT_SLASH: &str = "./";
@@ -80,7 +82,7 @@ const TEST_URL_BASES: [&str; 2] = ["https://example.com/a/b/", "https://example.
 
 impl Rule for RelativeUrlStyle {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        serde_json::from_value::<DefaultRuleConfig<Self>>(value).map(DefaultRuleConfig::into_inner)
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
     }
 
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
@@ -92,7 +94,7 @@ impl Rule for RelativeUrlStyle {
             return;
         }
 
-        if new_expr.arguments.last().is_some_and(oxc_ast::ast::Argument::is_spread) {
+        if new_expr.arguments.last().is_some_and(Argument::is_spread) {
             return;
         }
 
@@ -102,7 +104,9 @@ impl Rule for RelativeUrlStyle {
 
         match first_arg {
             Argument::StringLiteral(str_lit) => {
-                let url = str_lit.value.as_str();
+                let Some(url) = str_lit.value.as_str() else {
+                    return;
+                };
 
                 match self.0 {
                     RelativeUrlStyleConfig::Never => {
@@ -115,8 +119,7 @@ impl Rule for RelativeUrlStyle {
                         if can_remove_dot_slash(raw, new_expr) {
                             ctx.diagnostic_with_fix(never_diagnostic(str_lit.span), |fixer| {
                                 let dot_slash_start = str_lit.span.start + 1;
-                                let dot_slash_span =
-                                    Span::new(dot_slash_start, dot_slash_start + 2);
+                                let dot_slash_span = Span::sized(dot_slash_start, 2);
                                 fixer
                                     .delete_range(dot_slash_span)
                                     .with_message("Remove leading `./`")
@@ -148,7 +151,7 @@ impl Rule for RelativeUrlStyle {
                 if first_quasi.value.raw.starts_with(DOT_SLASH) {
                     ctx.diagnostic_with_suggestion(never_diagnostic(template_lit.span), |fixer| {
                         let dot_slash_start = template_lit.span.start + 1;
-                        let dot_slash_span = Span::new(dot_slash_start, dot_slash_start + 2);
+                        let dot_slash_span = Span::sized(dot_slash_start, 2);
                         fixer.delete_range(dot_slash_span).with_message("Remove leading `./`")
                     });
                 }
@@ -165,7 +168,9 @@ fn can_add_dot_slash(url: &str, new_expr: &NewExpression) -> bool {
     }
 
     if let Some(Argument::StringLiteral(base_lit)) = new_expr.arguments.get(1) {
-        let base = base_lit.value.as_str();
+        let Some(base) = base_lit.value.as_str() else {
+            return false;
+        };
         if is_safe_to_add_dot_slash(url, &[base]) {
             return true;
         }
@@ -180,7 +185,9 @@ fn can_remove_dot_slash(url: &str, new_expr: &NewExpression) -> bool {
     }
 
     if let Some(Argument::StringLiteral(base_lit)) = new_expr.arguments.get(1) {
-        let base = base_lit.value.as_str();
+        let Some(base) = base_lit.value.as_str() else {
+            return false;
+        };
         if is_safe_to_remove_dot_slash(url, &[base]) {
             return true;
         }
@@ -222,6 +229,11 @@ fn test() {
     use crate::tester::Tester;
 
     let pass = vec![
+        // A URL or base with a lone surrogate is not checked.
+        (r#"new URL("./a\uD800", "https://x.com/")"#, None),
+        (r#"new URL("a\uD800", "https://x.com/")"#, Some(serde_json::json!(["always"]))),
+        (r#"new URL("./foo", "https://x.com/\uD800/")"#, None),
+        (r#"new URL("foo", "https://x.com/\uD800/")"#, Some(serde_json::json!(["always"]))),
         // Default "never" option
         (r#"URL("./foo", base)"#, None),
         (r#"new URL(...["./foo"], base)"#, None),

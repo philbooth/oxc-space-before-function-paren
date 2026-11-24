@@ -158,7 +158,6 @@ source: crates/oxc_linter/src/tester.rs
    ·             ───────────────
  8 │         }
    ╰────
-  help: Move the shared code outside the `if` statement to reduce code duplication
 
   ⚠ oxc(branches-sharing-code): All `if` blocks contain the same code at the start
     ╭─[branches_sharing_code.tsx:2:9]
@@ -170,22 +169,6 @@ source: crates/oxc_linter/src/tester.rs
     ·             ─────────────────────
   4 │             doA();
   5 │         } else if (otherFlag) {
-  6 │             console.log('start');
-    ·             ─────────────────────
-  7 │             doB();
-  8 │         } else {
-  9 │             console.log('start');
-    ·             ─────────────────────
- 10 │             doC();
-    ╰────
-  help: Move the shared code outside the `if` statement to reduce code duplication
-
-  ⚠ oxc(branches-sharing-code): All `if` blocks contain the same code at the start
-    ╭─[branches_sharing_code.tsx:5:16]
-  4 │             doA();
-  5 │         } else if (otherFlag) {
-    ·                ─┬
-    ·                 ╰── `if` statement declared here
   6 │             console.log('start');
     ·             ─────────────────────
   7 │             doB();
@@ -216,18 +199,33 @@ source: crates/oxc_linter/src/tester.rs
     ╰────
   help: Move the shared code outside the `if` statement to reduce code duplication
 
+  ⚠ oxc(branches-sharing-code): All `if` blocks contain the same code at the end
+   ╭─[branches_sharing_code.tsx:3:13]
+ 2 │         function f(flag, use, C) {
+ 3 │             if (flag) {
+   ·             ─┬
+   ·              ╰── `if` statement declared here
+ 4 │                 class C {}
+ 5 │                 use(C);
+   ·                 ───────
+ 6 │             } else {
+ 7 │                 class C { m() {} }
+ 8 │                 use(C);
+   ·                 ───────
+ 9 │             }
+   ╰────
+
   ⚠ oxc(branches-sharing-code): All `if` blocks contain the same code at the start
-    ╭─[branches_sharing_code.tsx:5:16]
-  4 │             return 1;
-  5 │         } else if (x === 2) {
-    ·                ─┬
-    ·                 ╰── `if` statement declared here
-  6 │             setup();
-    ·             ────────
-  7 │             return 2;
-  8 │         } else {
-  9 │             setup();
-    ·             ────────
- 10 │             return 3;
-    ╰────
-  help: Move the shared code outside the `if` statement to reduce code duplication
+   ╭─[branches_sharing_code.tsx:3:13]
+ 2 │         function g(flag, use) {
+ 3 │             if (flag) {
+   ·             ─┬
+   ·              ╰── `if` statement declared here
+ 4 │                 use(() => f());
+   ·                 ───────────────
+ 5 │                 first();
+ 6 │             } else {
+ 7 │                 use(() => f());
+   ·                 ───────────────
+ 8 │                 function f() {}
+   ╰────

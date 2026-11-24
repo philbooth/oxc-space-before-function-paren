@@ -50,6 +50,7 @@ fn bench_estree(criterion: &mut Criterion) {
                 let mut program = Parser::new(&allocator, source_text, source_type)
                     .with_options(ParseOptions {
                         parse_regular_expression: true,
+                        enable_ident_hashes: false,
                         ..ParseOptions::default()
                     })
                     .parse()
@@ -57,10 +58,9 @@ fn bench_estree(criterion: &mut Criterion) {
 
                 runner.run(|| {
                     let span_converter = Utf8ToUtf16::new(program.source_text);
-                    span_converter.convert_program(&mut program);
-                    span_converter.convert_comments(&mut program.comments);
+                    span_converter.convert_program_and_comments(&mut program);
 
-                    black_box(program.to_estree_ts_json_with_fixes(false));
+                    black_box(program.to_estree_json_with_fixes(true, false));
                     program
                 });
             });
@@ -92,6 +92,7 @@ fn bench_estree_tokens(criterion: &mut Criterion) {
                 let ret = Parser::new(&allocator, source_text, source_type)
                     .with_options(ParseOptions {
                         parse_regular_expression: true,
+                        enable_ident_hashes: false,
                         ..ParseOptions::default()
                     })
                     .with_config(config)

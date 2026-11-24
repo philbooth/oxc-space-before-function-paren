@@ -4,22 +4,75 @@
  */
 
 export type ArrowParensConfig = "always" | "avoid";
+/**
+ * A set of glob patterns.
+ * Patterns are matched against paths relative to the configuration file's directory.
+ */
+export type GlobSet = string[];
+export type Language =
+  | "javascript"
+  | "jsx"
+  | "typescript"
+  | "tsx"
+  | "json"
+  | "jsonc"
+  | "json5"
+  | "css"
+  | "scss"
+  | "less"
+  | "graphql"
+  | "yaml"
+  | "markdown"
+  | "toml"
+  | "html"
+  | "angular-html"
+  | "vue"
+  | "svelte"
+  | "astro"
+  | "handlebars"
+  | "mdx";
+export type AstroUserConfig = boolean | AstroConfig;
+export type AstroCompressHtmlConfig = "jsx" | "html" | "none";
 export type EmbeddedLanguageFormattingConfig = "auto" | "off";
 export type EndOfLineConfig = "lf" | "crlf" | "cr";
+export type OperatorPositionConfig = "start" | "end";
 export type HtmlWhitespaceSensitivityConfig = "css" | "strict" | "ignore";
 export type JsdocUserConfig = boolean | JsdocConfig;
+export type CommentLineStrategyConfig = "singleLine" | "multiline" | "keep";
+export type LineWrappingStyleConfig = "greedy" | "balance";
 export type ObjectWrapConfig = "preserve" | "collapse";
 export type ProseWrapConfig = "always" | "never" | "preserve";
 export type QuotePropsConfig = "as-needed" | "consistent" | "preserve";
 export type SortImportsUserConfig = boolean | SortImportsConfig;
+/**
+ * Modifier matching the import characteristics in `customGroups` (see `sortImports.groups` for semantics).
+ */
+export type ImportModifierConfig = "side_effect" | "type" | "value" | "default" | "wildcard" | "named";
+/**
+ * Selector matching the import kind in `customGroups` (see `sortImports.groups` for semantics).
+ */
+export type ImportSelectorConfig =
+  | "type"
+  | "side_effect_style"
+  | "side_effect"
+  | "style"
+  | "index"
+  | "sibling"
+  | "parent"
+  | "subpath"
+  | "internal"
+  | "builtin"
+  | "external"
+  | "import";
 export type SortGroupItemConfig = NewlinesBetweenMarker | string | string[];
 export type SortOrderConfig = "asc" | "desc";
 export type SortPackageJsonUserConfig = boolean | SortPackageJsonConfig;
 export type SortTailwindcssUserConfig = boolean | SortTailwindcssConfig;
+export type SvelteUserConfig = boolean | SvelteConfig;
 export type TrailingCommaConfig = "all" | "es5" | "none";
 
 /**
- * Configuration options for the Oxfmt.
+ * Configuration options for Oxfmt.
  *
  * Most options are the same as Prettier's options, but not all of them.
  * In addition, some options are our own extensions.
@@ -28,27 +81,61 @@ export interface Oxfmtrc {
   /**
    * Include parentheses around a sole arrow function parameter.
    *
+   * - Languages: JS, JSX, TS, TSX
    * - Default: `"always"`
    */
   arrowParens?: ArrowParensConfig;
   /**
-   * Put the `>` of a multi-line HTML (HTML, JSX, Vue, Angular) element at the end of the last line,
-   * instead of being alone on the next line (does not apply to self closing elements).
+   * Format matched files as the given language, instead of detecting it from the file name.
+   * e.g. Angular templates named `*.html`, or `*.wxml` files formatted as HTML.
+   * When a file matches multiple associations, the later one takes precedence (array order matters).
    *
+   * - Default: `[]`
+   */
+  associations?: OxfmtAssociationConfig[];
+  /**
+   * Options for `prettier-plugin-astro`.
+   *
+   * Pass `true` or an object to enable `.astro` file formatting, `false` to disable (handy in overrides).
+   * Setting `true` resets to defaults, dropping options inherited from a parent scope.
+   *
+   * NOTE: `prettier-plugin-astro` requires the `@astrojs/compiler-rs` package at runtime.
+   * Oxfmt does NOT bundle it, so install it in your project, otherwise formatting fails.
+   *
+   * - Languages: Astro
+   * - Default: Disabled
+   */
+  astro?: AstroUserConfig;
+  /**
+   * Put the `>` of a multi-line element at the end of the last line,
+   * instead of being alone on the next line (does not apply to self-closing elements).
+   *
+   * - Languages: JSX, TSX, HTML, Angular, Vue, MJML, Svelte, Astro
    * - Default: `false`
    */
   bracketSameLine?: boolean;
   /**
    * Print spaces between brackets in object literals.
    *
+   * - Languages: JS, JSX, TS, TSX, JSON, JSONC, JSON5, GraphQL, YAML
    * - Default: `true`
    */
   bracketSpacing?: boolean;
   /**
-   * Control whether to format embedded parts (For example, CSS-in-JS, or JS-in-Vue, etc.) in the file.
+   * Control whether to format embedded parts in the file.
+   * For example:
+   * - CSS-in-JS: template literal
+   * - JS-in-Vue: `<script>` block
+   * - JS-in-Markdown: code fence
+   * - YAML-in-CSS/Markdown: front matter
    *
-   * NOTE: XXX-in-JS support is incomplete.
+   * With `"off"`, these parts are kept as-is.
    *
+   * NOTE: Some languages behave differently.
+   * For Svelte, formatting fails with `"off"`, a limitation of `prettier-plugin-svelte`.
+   * For Astro, the frontmatter is still formatted, but by Prettier instead of Oxfmt (use `astro.skipFrontmatter` to keep it as-is).
+   *
+   * - Languages: JS, JSX, TS, TSX, CSS, SCSS, Less, HTML, Vue, Angular, Svelte, Astro, Markdown, MDX
    * - Default: `"auto"`
    */
   embeddedLanguageFormatting?: EmbeddedLanguageFormattingConfig;
@@ -57,19 +144,30 @@ export interface Oxfmtrc {
    *
    * NOTE: `"auto"` is not supported.
    *
+   * - Languages: All
    * - Default: `"lf"`
    * - Overrides `.editorconfig.end_of_line`
    */
   endOfLine?: EndOfLineConfig;
   /**
-   * Specify the global whitespace sensitivity for HTML, Vue, Angular, and Handlebars.
+   * When expressions wrap lines, print operators at the start of new lines (`"start"`)
+   * or at the end of previous lines (`"end"`).
    *
+   * - Languages: JS, JSX, TS, TSX
+   * - Default: `"end"`
+   */
+  experimentalOperatorPosition?: OperatorPositionConfig;
+  /**
+   * Specify the global whitespace sensitivity.
+   *
+   * - Languages: HTML, Angular, Vue, Handlebars, Svelte
    * - Default: `"css"`
    */
   htmlWhitespaceSensitivity?: HtmlWhitespaceSensitivityConfig;
   /**
    * Ignore files matching these glob patterns.
-   * Patterns are based on the location of the Oxfmt configuration file.
+   * Patterns use gitignore-style matching, rooted at the directory containing the configuration file.
+   * Files outside that directory cannot be matched; patterns containing `..` are rejected as a configuration error.
    *
    * - Default: `[]`
    */
@@ -77,6 +175,7 @@ export interface Oxfmtrc {
   /**
    * Whether to insert a final newline at the end of the file.
    *
+   * - Languages: All
    * - Default: `true`
    * - Overrides `.editorconfig.insert_final_newline`
    */
@@ -84,18 +183,19 @@ export interface Oxfmtrc {
   /**
    * Enable JSDoc comment formatting.
    *
-   * When enabled, JSDoc comments are normalized and reformatted:
-   * tag aliases are canonicalized, descriptions are capitalized,
+   * Normalizes JSDoc comments: tag aliases are canonicalized, descriptions are capitalized,
    * long lines are wrapped, and short comments are collapsed to single-line.
    *
-   * Pass `true` or an object to enable with defaults, or omit/set `false` to disable.
+   * Pass `true` or an object to enable, `false` to disable.
    *
+   * - Languages: JS, JSX, TS, TSX
    * - Default: Disabled
    */
   jsdoc?: JsdocUserConfig;
   /**
    * Use single quotes instead of double quotes in JSX.
    *
+   * - Languages: JSX, TSX
    * - Default: `false`
    */
   jsxSingleQuote?: boolean;
@@ -105,6 +205,7 @@ export interface Oxfmtrc {
    * By default, formats objects as multi-line if there is a newline prior to the first property.
    * Authors can use this heuristic to contextually improve readability, though it has some downsides.
    *
+   * - Languages: JS, JSX, TS, TSX, JSON, JSONC, JSON5
    * - Default: `"preserve"`
    */
   objectWrap?: ObjectWrapConfig;
@@ -120,6 +221,7 @@ export interface Oxfmtrc {
    *
    * If you don't want line wrapping when formatting Markdown, you can set the `proseWrap` option to disable it.
    *
+   * - Languages: All
    * - Default: `100`
    * - Overrides `.editorconfig.max_line_length`
    */
@@ -127,28 +229,34 @@ export interface Oxfmtrc {
   /**
    * How to wrap prose.
    *
-   * By default, formatter will not change wrapping in markdown text since some services use a linebreak-sensitive renderer, e.g. GitHub comments and BitBucket.
-   * To wrap prose to the print width, change this option to "always".
-   * If you want to force all prose blocks to be on a single line and rely on editor/viewer soft wrapping instead, you can use "never".
+   * - `"always"`: Wrap prose to the print width
+   * - `"never"`: Put each prose block on a single line, relying on editor/viewer soft wrapping
+   * - `"preserve"`: Keep wrapping as-is
    *
+   * By default, wrapping is preserved, since some services use a linebreak-sensitive renderer (e.g. GitHub comments, BitBucket).
+   *
+   * - Languages: Markdown, MDX, YAML
    * - Default: `"preserve"`
    */
   proseWrap?: ProseWrapConfig;
   /**
    * Change when properties in objects are quoted.
    *
+   * - Languages: JS, JSX, TS, TSX
    * - Default: `"as-needed"`
    */
   quoteProps?: QuotePropsConfig;
   /**
    * Print semicolons at the ends of statements.
    *
+   * - Languages: JS, JSX, TS, TSX
    * - Default: `true`
    */
   semi?: boolean;
   /**
-   * Enforce single attribute per line in HTML, Vue, and JSX.
+   * Enforce single attribute per line.
    *
+   * - Languages: JSX, TSX, HTML, Angular, Vue, MJML, Svelte, Astro
    * - Default: `false`
    */
   singleAttributePerLine?: boolean;
@@ -157,6 +265,7 @@ export interface Oxfmtrc {
    *
    * For JSX, you can set the `jsxSingleQuote` option.
    *
+   * - Languages: JS, JSX, TS, TSX, CSS, Less, SCSS, Markdown, MDX, YAML, Handlebars, Svelte, Astro
    * - Default: `false`
    * - Overrides `.editorconfig.quote_type`
    */
@@ -164,39 +273,59 @@ export interface Oxfmtrc {
   /**
    * Sort import statements.
    *
-   * Using the similar algorithm as [eslint-plugin-perfectionist/sort-imports](https://perfectionist.dev/rules/sort-imports).
-   * For details, see each field's documentation.
+   * Uses a similar algorithm to [eslint-plugin-perfectionist/sort-imports](https://perfectionist.dev/rules/sort-imports).
    *
-   * Pass `true` or an object to enable with defaults, or omit/set `false` to disable.
+   * Pass `true` or an object to enable, `false` to disable.
    *
+   * - Languages: JS, JSX, TS, TSX
    * - Default: Disabled
    */
   sortImports?: SortImportsUserConfig;
   /**
    * Sort `package.json` keys.
    *
-   * The algorithm is NOT compatible with [prettier-plugin-sort-packagejson](https://github.com/matzkoh/prettier-plugin-packagejson).
-   * But we believe it is clearer and easier to navigate.
-   * For details, see each field's documentation.
+   * The order is NOT compatible with [prettier-plugin-packagejson](https://github.com/matzkoh/prettier-plugin-packagejson),
+   * but we believe it is clearer and easier to navigate.
    *
+   * - Languages: JSON (`package.json` only)
    * - Default: `true`
    */
   sortPackageJson?: SortPackageJsonUserConfig;
   /**
    * Sort Tailwind CSS classes.
    *
-   * Using the same algorithm as [prettier-plugin-tailwindcss](https://github.com/tailwindlabs/prettier-plugin-tailwindcss).
-   * Option names omit the `tailwind` prefix used in the original plugin (e.g., `config` instead of `tailwindConfig`).
-   * For details, see each field's documentation.
+   * Uses the same algorithm as [prettier-plugin-tailwindcss](https://github.com/tailwindlabs/prettier-plugin-tailwindcss).
+   * Option names omit the `tailwind` prefix used in the original plugin (e.g. `config` instead of `tailwindConfig`).
    *
-   * Pass `true` or an object to enable with defaults, or omit/set `false` to disable.
+   * Pass `true` or an object to enable, `false` to disable.
    *
+   * - Languages: JS, JSX, TS, TSX, HTML, Vue, Angular, Handlebars, CSS, SCSS, Less, Svelte, Astro
    * - Default: Disabled
    */
   sortTailwindcss?: SortTailwindcssUserConfig;
   /**
+   * Insert a space before function parentheses.
+   *
+   * - Default: `false`
+   */
+  spaceBeforeFunctionParen?: boolean;
+  /**
+   * Options for `prettier-plugin-svelte`.
+   *
+   * Pass `true` or an object to enable `.svelte` file formatting, `false` to disable (handy in overrides).
+   * Setting `true` resets to defaults, dropping options inherited from a parent scope.
+   *
+   * NOTE: `prettier-plugin-svelte` requires the `svelte` package (`svelte/compiler`) at runtime.
+   * Oxfmt does NOT bundle it, so install it in your project, otherwise formatting fails.
+   *
+   * - Languages: Svelte
+   * - Default: Disabled
+   */
+  svelte?: SvelteUserConfig;
+  /**
    * Specify the number of spaces per indentation-level.
    *
+   * - Languages: All
    * - Default: `2`
    * - Overrides `.editorconfig.indent_size` (falls back to `.editorconfig.tab_width`)
    */
@@ -206,12 +335,14 @@ export interface Oxfmtrc {
    *
    * A single-line array, for example, never gets trailing commas.
    *
+   * - Languages: JS, JSX, TS, TSX, JSONC, JSON5, TOML, CSS, Less, SCSS, YAML
    * - Default: `"all"`
    */
   trailingComma?: TrailingCommaConfig;
   /**
    * Indent lines with tabs instead of spaces.
    *
+   * - Languages: All
    * - Default: `false`
    * - Overrides `.editorconfig.indent_style`
    */
@@ -219,9 +350,48 @@ export interface Oxfmtrc {
   /**
    * Whether or not to indent the code inside `<script>` and `<style>` tags in Vue files.
    *
+   * - Languages: Vue
    * - Default: `false`
    */
   vueIndentScriptAndStyle?: boolean;
+  [k: string]: unknown;
+}
+export interface OxfmtAssociationConfig {
+  /**
+   * Glob patterns to exclude from this association.
+   */
+  excludeFiles?: GlobSet;
+  /**
+   * Glob patterns to match files for this association.
+   */
+  files: GlobSet;
+  /**
+   * The language to format matched files as, named by its Shiki id (as in Markdown code fences).
+   */
+  language: Language;
+  [k: string]: unknown;
+}
+export interface AstroConfig {
+  /**
+   * Whether to normalize matching identifier attributes to shorthand or explicit form.
+   * When unset, the form that was written stays as-is.
+   *
+   * - Default: Unset
+   */
+  allowShorthand?: boolean;
+  /**
+   * Mirror of Astro's `compressHTML` config.
+   * Tells the formatter which whitespace the compiler will collapse.
+   *
+   * - Default: `"jsx"`
+   */
+  compressHTML?: AstroCompressHtmlConfig;
+  /**
+   * Whether to skip formatting the frontmatter.
+   *
+   * - Default: `false`
+   */
+  skipFrontmatter?: boolean;
   [k: string]: unknown;
 }
 export interface JsdocConfig {
@@ -246,13 +416,15 @@ export interface JsdocConfig {
   /**
    * How to format comment blocks.
    *
-   * - `"singleLine"` — Convert to single-line `/** content * /` when possible.
-   * - `"multiline"` — Always use multi-line format.
-   * - `"keep"` — Preserve original formatting.
+   * - `"singleLine"`: Convert to single-line `/** content * /` when possible
+   * - `"multiline"`: Always use multi-line format
+   * - `"keep"`: Preserve original formatting
+   *
+   * By default, comments are collapsed to a single line when possible.
    *
    * - Default: `"singleLine"`
    */
-  commentLineStrategy?: string;
+  commentLineStrategy?: CommentLineStrategyConfig;
   /**
    * Emit `@description` tag instead of inline description.
    *
@@ -274,12 +446,14 @@ export interface JsdocConfig {
   /**
    * Strategy for wrapping description lines at print width.
    *
-   * - `"greedy"` — Always re-wrap text to fit within print width.
-   * - `"balance"` — Preserve original line breaks if all lines fit within print width.
+   * - `"greedy"`: Always re-wrap text to fit within print width
+   * - `"balance"`: Preserve original line breaks if all lines fit within print width
+   *
+   * By default, description lines are always re-wrapped.
    *
    * - Default: `"greedy"`
    */
-  lineWrappingStyle?: string;
+  lineWrappingStyle?: LineWrappingStyleConfig;
   /**
    * Use fenced code blocks (```` ``` ````) instead of 4-space indentation for code without a language tag.
    *
@@ -304,14 +478,14 @@ export interface OxfmtOverrideConfig {
   /**
    * Glob patterns to exclude from this override.
    */
-  excludeFiles?: string[];
+  excludeFiles?: GlobSet;
   /**
    * Glob patterns to match files for this override.
-   * All patterns are relative to the Oxfmt configuration file.
    */
-  files: string[];
+  files: GlobSet;
   /**
    * Format options to apply for matched files.
+   * Accepts the same options as the top-level format options.
    */
   options?: FormatConfig;
   [k: string]: unknown;
@@ -320,27 +494,53 @@ export interface FormatConfig {
   /**
    * Include parentheses around a sole arrow function parameter.
    *
+   * - Languages: JS, JSX, TS, TSX
    * - Default: `"always"`
    */
   arrowParens?: ArrowParensConfig;
   /**
-   * Put the `>` of a multi-line HTML (HTML, JSX, Vue, Angular) element at the end of the last line,
-   * instead of being alone on the next line (does not apply to self closing elements).
+   * Options for `prettier-plugin-astro`.
    *
+   * Pass `true` or an object to enable `.astro` file formatting, `false` to disable (handy in overrides).
+   * Setting `true` resets to defaults, dropping options inherited from a parent scope.
+   *
+   * NOTE: `prettier-plugin-astro` requires the `@astrojs/compiler-rs` package at runtime.
+   * Oxfmt does NOT bundle it, so install it in your project, otherwise formatting fails.
+   *
+   * - Languages: Astro
+   * - Default: Disabled
+   */
+  astro?: AstroUserConfig;
+  /**
+   * Put the `>` of a multi-line element at the end of the last line,
+   * instead of being alone on the next line (does not apply to self-closing elements).
+   *
+   * - Languages: JSX, TSX, HTML, Angular, Vue, MJML, Svelte, Astro
    * - Default: `false`
    */
   bracketSameLine?: boolean;
   /**
    * Print spaces between brackets in object literals.
    *
+   * - Languages: JS, JSX, TS, TSX, JSON, JSONC, JSON5, GraphQL, YAML
    * - Default: `true`
    */
   bracketSpacing?: boolean;
   /**
-   * Control whether to format embedded parts (For example, CSS-in-JS, or JS-in-Vue, etc.) in the file.
+   * Control whether to format embedded parts in the file.
+   * For example:
+   * - CSS-in-JS: template literal
+   * - JS-in-Vue: `<script>` block
+   * - JS-in-Markdown: code fence
+   * - YAML-in-CSS/Markdown: front matter
    *
-   * NOTE: XXX-in-JS support is incomplete.
+   * With `"off"`, these parts are kept as-is.
    *
+   * NOTE: Some languages behave differently.
+   * For Svelte, formatting fails with `"off"`, a limitation of `prettier-plugin-svelte`.
+   * For Astro, the frontmatter is still formatted, but by Prettier instead of Oxfmt (use `astro.skipFrontmatter` to keep it as-is).
+   *
+   * - Languages: JS, JSX, TS, TSX, CSS, SCSS, Less, HTML, Vue, Angular, Svelte, Astro, Markdown, MDX
    * - Default: `"auto"`
    */
   embeddedLanguageFormatting?: EmbeddedLanguageFormattingConfig;
@@ -349,19 +549,30 @@ export interface FormatConfig {
    *
    * NOTE: `"auto"` is not supported.
    *
+   * - Languages: All
    * - Default: `"lf"`
    * - Overrides `.editorconfig.end_of_line`
    */
   endOfLine?: EndOfLineConfig;
   /**
-   * Specify the global whitespace sensitivity for HTML, Vue, Angular, and Handlebars.
+   * When expressions wrap lines, print operators at the start of new lines (`"start"`)
+   * or at the end of previous lines (`"end"`).
    *
+   * - Languages: JS, JSX, TS, TSX
+   * - Default: `"end"`
+   */
+  experimentalOperatorPosition?: OperatorPositionConfig;
+  /**
+   * Specify the global whitespace sensitivity.
+   *
+   * - Languages: HTML, Angular, Vue, Handlebars, Svelte
    * - Default: `"css"`
    */
   htmlWhitespaceSensitivity?: HtmlWhitespaceSensitivityConfig;
   /**
    * Whether to insert a final newline at the end of the file.
    *
+   * - Languages: All
    * - Default: `true`
    * - Overrides `.editorconfig.insert_final_newline`
    */
@@ -369,18 +580,19 @@ export interface FormatConfig {
   /**
    * Enable JSDoc comment formatting.
    *
-   * When enabled, JSDoc comments are normalized and reformatted:
-   * tag aliases are canonicalized, descriptions are capitalized,
+   * Normalizes JSDoc comments: tag aliases are canonicalized, descriptions are capitalized,
    * long lines are wrapped, and short comments are collapsed to single-line.
    *
-   * Pass `true` or an object to enable with defaults, or omit/set `false` to disable.
+   * Pass `true` or an object to enable, `false` to disable.
    *
+   * - Languages: JS, JSX, TS, TSX
    * - Default: Disabled
    */
   jsdoc?: JsdocUserConfig;
   /**
    * Use single quotes instead of double quotes in JSX.
    *
+   * - Languages: JSX, TSX
    * - Default: `false`
    */
   jsxSingleQuote?: boolean;
@@ -390,6 +602,7 @@ export interface FormatConfig {
    * By default, formats objects as multi-line if there is a newline prior to the first property.
    * Authors can use this heuristic to contextually improve readability, though it has some downsides.
    *
+   * - Languages: JS, JSX, TS, TSX, JSON, JSONC, JSON5
    * - Default: `"preserve"`
    */
   objectWrap?: ObjectWrapConfig;
@@ -398,6 +611,7 @@ export interface FormatConfig {
    *
    * If you don't want line wrapping when formatting Markdown, you can set the `proseWrap` option to disable it.
    *
+   * - Languages: All
    * - Default: `100`
    * - Overrides `.editorconfig.max_line_length`
    */
@@ -405,28 +619,34 @@ export interface FormatConfig {
   /**
    * How to wrap prose.
    *
-   * By default, formatter will not change wrapping in markdown text since some services use a linebreak-sensitive renderer, e.g. GitHub comments and BitBucket.
-   * To wrap prose to the print width, change this option to "always".
-   * If you want to force all prose blocks to be on a single line and rely on editor/viewer soft wrapping instead, you can use "never".
+   * - `"always"`: Wrap prose to the print width
+   * - `"never"`: Put each prose block on a single line, relying on editor/viewer soft wrapping
+   * - `"preserve"`: Keep wrapping as-is
    *
+   * By default, wrapping is preserved, since some services use a linebreak-sensitive renderer (e.g. GitHub comments, BitBucket).
+   *
+   * - Languages: Markdown, MDX, YAML
    * - Default: `"preserve"`
    */
   proseWrap?: ProseWrapConfig;
   /**
    * Change when properties in objects are quoted.
    *
+   * - Languages: JS, JSX, TS, TSX
    * - Default: `"as-needed"`
    */
   quoteProps?: QuotePropsConfig;
   /**
    * Print semicolons at the ends of statements.
    *
+   * - Languages: JS, JSX, TS, TSX
    * - Default: `true`
    */
   semi?: boolean;
   /**
-   * Enforce single attribute per line in HTML, Vue, and JSX.
+   * Enforce single attribute per line.
    *
+   * - Languages: JSX, TSX, HTML, Angular, Vue, MJML, Svelte, Astro
    * - Default: `false`
    */
   singleAttributePerLine?: boolean;
@@ -435,6 +655,7 @@ export interface FormatConfig {
    *
    * For JSX, you can set the `jsxSingleQuote` option.
    *
+   * - Languages: JS, JSX, TS, TSX, CSS, Less, SCSS, Markdown, MDX, YAML, Handlebars, Svelte, Astro
    * - Default: `false`
    * - Overrides `.editorconfig.quote_type`
    */
@@ -442,39 +663,59 @@ export interface FormatConfig {
   /**
    * Sort import statements.
    *
-   * Using the similar algorithm as [eslint-plugin-perfectionist/sort-imports](https://perfectionist.dev/rules/sort-imports).
-   * For details, see each field's documentation.
+   * Uses a similar algorithm to [eslint-plugin-perfectionist/sort-imports](https://perfectionist.dev/rules/sort-imports).
    *
-   * Pass `true` or an object to enable with defaults, or omit/set `false` to disable.
+   * Pass `true` or an object to enable, `false` to disable.
    *
+   * - Languages: JS, JSX, TS, TSX
    * - Default: Disabled
    */
   sortImports?: SortImportsUserConfig;
   /**
    * Sort `package.json` keys.
    *
-   * The algorithm is NOT compatible with [prettier-plugin-sort-packagejson](https://github.com/matzkoh/prettier-plugin-packagejson).
-   * But we believe it is clearer and easier to navigate.
-   * For details, see each field's documentation.
+   * The order is NOT compatible with [prettier-plugin-packagejson](https://github.com/matzkoh/prettier-plugin-packagejson),
+   * but we believe it is clearer and easier to navigate.
    *
+   * - Languages: JSON (`package.json` only)
    * - Default: `true`
    */
   sortPackageJson?: SortPackageJsonUserConfig;
   /**
    * Sort Tailwind CSS classes.
    *
-   * Using the same algorithm as [prettier-plugin-tailwindcss](https://github.com/tailwindlabs/prettier-plugin-tailwindcss).
-   * Option names omit the `tailwind` prefix used in the original plugin (e.g., `config` instead of `tailwindConfig`).
-   * For details, see each field's documentation.
+   * Uses the same algorithm as [prettier-plugin-tailwindcss](https://github.com/tailwindlabs/prettier-plugin-tailwindcss).
+   * Option names omit the `tailwind` prefix used in the original plugin (e.g. `config` instead of `tailwindConfig`).
    *
-   * Pass `true` or an object to enable with defaults, or omit/set `false` to disable.
+   * Pass `true` or an object to enable, `false` to disable.
    *
+   * - Languages: JS, JSX, TS, TSX, HTML, Vue, Angular, Handlebars, CSS, SCSS, Less, Svelte, Astro
    * - Default: Disabled
    */
   sortTailwindcss?: SortTailwindcssUserConfig;
   /**
+   * Insert a space before function parentheses.
+   *
+   * - Default: `false`
+   */
+  spaceBeforeFunctionParen?: boolean;
+  /**
+   * Options for `prettier-plugin-svelte`.
+   *
+   * Pass `true` or an object to enable `.svelte` file formatting, `false` to disable (handy in overrides).
+   * Setting `true` resets to defaults, dropping options inherited from a parent scope.
+   *
+   * NOTE: `prettier-plugin-svelte` requires the `svelte` package (`svelte/compiler`) at runtime.
+   * Oxfmt does NOT bundle it, so install it in your project, otherwise formatting fails.
+   *
+   * - Languages: Svelte
+   * - Default: Disabled
+   */
+  svelte?: SvelteUserConfig;
+  /**
    * Specify the number of spaces per indentation-level.
    *
+   * - Languages: All
    * - Default: `2`
    * - Overrides `.editorconfig.indent_size` (falls back to `.editorconfig.tab_width`)
    */
@@ -484,12 +725,14 @@ export interface FormatConfig {
    *
    * A single-line array, for example, never gets trailing commas.
    *
+   * - Languages: JS, JSX, TS, TSX, JSONC, JSON5, TOML, CSS, Less, SCSS, YAML
    * - Default: `"all"`
    */
   trailingComma?: TrailingCommaConfig;
   /**
    * Indent lines with tabs instead of spaces.
    *
+   * - Languages: All
    * - Default: `false`
    * - Overrides `.editorconfig.indent_style`
    */
@@ -497,6 +740,7 @@ export interface FormatConfig {
   /**
    * Whether or not to indent the code inside `<script>` and `<style>` tags in Vue files.
    *
+   * - Languages: Vue
    * - Default: `false`
    */
   vueIndentScriptAndStyle?: boolean;
@@ -506,54 +750,55 @@ export interface SortImportsConfig {
   /**
    * Define your own groups for matching very specific imports.
    *
-   * The `customGroups` list is ordered: The first definition that matches an element will be used.
-   * Custom groups have a higher priority than any predefined group.
+   * The first matching definition is used, and custom groups take precedence over predefined groups.
+   * To give a predefined group precedence, define an equivalent custom group and put it first.
    *
-   * If you want a predefined group to take precedence over a custom group,
-   * you must write a custom group definition that does the same as what the predefined group does, and put it first in the list.
+   * When multiple conditions (`elementNamePattern`, `selector`, `modifiers`) are specified,
+   * all of them must match.
    *
-   * If you specify multiple conditions like `elementNamePattern`, `selector`, and `modifiers`,
-   * all conditions must be met for an import to match the custom group (AND logic).
+   * NOTE: Predefined group names (e.g. `side_effect`, `external`) and `unknown` are reserved and cannot be used as `groupName`.
    *
    * - Default: `[]`
    */
   customGroups?: CustomGroupItemConfig[];
   /**
-   * Specifies a list of predefined import groups for sorting.
+   * List of import groups for sorting.
    *
-   * Each import will be assigned a single group specified in the groups option (or the `unknown` group if no match is found).
-   * The order of items in the `groups` option determines how groups are ordered.
+   * Each import is assigned to a single group (or `unknown` if none matches), and groups are ordered as listed.
+   * Within a group, imports are sorted according to `order`, `ignoreCase`, etc.
    *
-   * Within a given group, members will be sorted according to the type, order, ignoreCase, etc. options.
+   * A predefined group name is a single selector with optional modifiers, joined by `-` (e.g. `type-external`).
+   * Modifiers can be in any order, but the selector must come last.
    *
-   * Individual groups can be combined together by placing them in an array.
-   * The order of groups in that array does not matter.
-   * All members of the groups in the array will be sorted together as if they were part of a single group.
+   * Selectors, from most to least important:
+   * - `type`: TypeScript type imports.
+   * - `side_effect_style`: Side effect style imports.
+   * - `side_effect`: Side effect imports.
+   * - `style`: Style imports.
+   * - `index`: Main file from the current directory.
+   * - `sibling`: Modules from the same directory.
+   * - `parent`: Modules from the parent directory.
+   * - `subpath`: Node.js subpath imports.
+   * - `internal`: Your internal modules.
+   * - `builtin`: Node.js Built-in Modules.
+   * - `external`: External modules installed in the project.
+   * - `import`: Any import.
    *
-   * Predefined groups are characterized by a single selector and potentially multiple modifiers.
-   * You may enter modifiers in any order, but the selector must always come at the end.
+   * Modifiers, from most to least important:
+   * - `side_effect`: Side effect imports.
+   * - `type`: TypeScript type imports.
+   * - `value`: Value imports.
+   * - `default`: Imports containing the default specifier.
+   * - `wildcard`: Imports containing the wildcard (`* as`) specifier.
+   * - `named`: Imports containing at least one named specifier.
    *
-   * The list of selectors is sorted from most to least important:
-   * - `type` — TypeScript type imports.
-   * - `side_effect_style` — Side effect style imports.
-   * - `side_effect` — Side effect imports.
-   * - `style` — Style imports.
-   * - `index` — Main file from the current directory.
-   * - `sibling` — Modules from the same directory.
-   * - `parent` — Modules from the parent directory.
-   * - `subpath` — Node.js subpath imports.
-   * - `internal` — Your internal modules.
-   * - `builtin` — Node.js Built-in Modules.
-   * - `external` — External modules installed in the project.
-   * - `import` — Any import.
+   * Wrap groups in an array to sort them together as a single group.
+   * The order within the array is only used to break ties between imports from the same source,
+   * e.g. `["type-external", "value-external"]` puts `import type { T } from "a"` before `import { v } from "a"`.
+   * Like the order of groups, it is not reversed by `order: "desc"`.
    *
-   * The list of modifiers is sorted from most to least important:
-   * - `side_effect` — Side effect imports.
-   * - `type` — TypeScript type imports.
-   * - `value` — Value imports.
-   * - `default` — Imports containing the default specifier.
-   * - `wildcard` — Imports containing the wildcard (`* as`) specifier.
-   * - `named` — Imports containing at least one named specifier.
+   * To override `newlinesBetween` at a specific group boundary,
+   * put a `{ "newlinesBetween": boolean }` marker object at that position.
    *
    * - Default: See below
    * ```json
@@ -566,43 +811,39 @@ export interface SortImportsConfig {
    * "unknown"
    * ]
    * ```
-   *
-   * Also, you can override the global `newlinesBetween` setting for specific group boundaries
-   * by including a `{ "newlinesBetween": boolean }` marker object in the `groups` list at the desired position.
    */
   groups?: SortGroupItemConfig[];
   /**
-   * Specifies whether sorting should be case-sensitive.
+   * Ignore case when sorting.
    *
    * - Default: `true`
    */
   ignoreCase?: boolean;
   /**
-   * Specifies a prefix for identifying internal imports.
+   * Prefixes for identifying internal imports.
    *
-   * This is useful for distinguishing your own modules from external dependencies.
-   *
-   * - Default: `["~/", "@/"]`
+   * - Default: `["~/", "@/", "#"]`
    */
   internalPattern?: string[];
   /**
-   * Specifies whether to add newlines between groups.
-   *
-   * When `false`, no newlines are added between groups.
+   * Add newlines between groups.
    *
    * - Default: `true`
    */
   newlinesBetween?: boolean;
   /**
-   * Specifies whether to sort items in ascending or descending order.
+   * Sort in ascending or descending order.
+   *
+   * This applies to import sources only;
+   * the order of `groups` (and of entries within a group) is kept as is.
    *
    * - Default: `"asc"`
    */
   order?: SortOrderConfig;
   /**
-   * Enables the use of comments to separate imports into logical groups.
+   * Use comments to separate imports into logical groups.
    *
-   * When `true`, all comments will be treated as delimiters, creating partitions.
+   * When `true`, all comments are treated as delimiters.
    *
    * ```js
    * import { b1, b2 } from 'b'
@@ -615,10 +856,9 @@ export interface SortImportsConfig {
    */
   partitionByComment?: boolean;
   /**
-   * Enables the empty line to separate imports into logical groups.
+   * Use empty lines to separate imports into logical groups.
    *
-   * When `true`, formatter will not sort imports if there is an empty line between them.
-   * This helps maintain the defined order of logically separated groups of members.
+   * When `true`, imports are not sorted across an empty line.
    *
    * ```js
    * import { b1, b2 } from 'b'
@@ -631,9 +871,9 @@ export interface SortImportsConfig {
    */
   partitionByNewline?: boolean;
   /**
-   * Specifies whether side effect imports should be sorted.
+   * Sort side effect imports.
    *
-   * By default, sorting side-effect imports is disabled for security reasons.
+   * Disabled by default for safety reasons.
    *
    * - Default: `false`
    */
@@ -651,18 +891,13 @@ export interface CustomGroupItemConfig {
   groupName?: string;
   /**
    * Modifiers to match the import characteristics.
-   * All specified modifiers must be present (AND logic).
-   *
-   * Possible values: `"side_effect"`, `"type"`, `"value"`, `"default"`, `"wildcard"`, `"named"`
+   * All specified modifiers must match.
    */
-  modifiers?: string[];
+  modifiers?: ImportModifierConfig[];
   /**
    * Selector to match the import kind.
-   *
-   * Possible values: `"type"`, `"side_effect_style"`, `"side_effect"`, `"style"`, `"index"`,
-   * `"sibling"`, `"parent"`, `"subpath"`, `"internal"`, `"builtin"`, `"external"`, `"import"`
    */
-  selector?: string;
+  selector?: ImportSelectorConfig;
   [k: string]: unknown;
 }
 /**
@@ -728,5 +963,28 @@ export interface SortTailwindcssConfig {
    * - Default: Installed Tailwind CSS's `theme.css`
    */
   stylesheet?: string;
+  [k: string]: unknown;
+}
+export interface SvelteConfig {
+  /**
+   * Whether to allow attribute shorthand if attribute name and expression are the same.
+   *
+   * - Default: `true`
+   */
+  allowShorthand?: boolean;
+  /**
+   * Whether to indent code inside `<script>` and `<style>` tags.
+   *
+   * - Default: `true`
+   */
+  indentScriptAndStyle?: boolean;
+  /**
+   * The order in which Svelte component sections are printed.
+   * Join `options`, `scripts`, `markup`, `styles` with `-` in the desired order,
+   * or use `none` to keep the original order.
+   *
+   * - Default: `"options-scripts-markup-styles"`
+   */
+  sortOrder?: string;
   [k: string]: unknown;
 }

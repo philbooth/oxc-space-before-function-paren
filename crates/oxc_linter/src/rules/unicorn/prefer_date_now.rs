@@ -5,9 +5,10 @@ use oxc_ast::{
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_span::{GetSpan, Span};
+use oxc_str::JSStr;
 use oxc_syntax::operator::{AssignmentOperator, BinaryOperator, UnaryOperator};
 
-use crate::{AstNode, context::LintContext, rule::Rule};
+use crate::{AstNode, context::LintContext, rule::Rule, utils::pad_fix_with_token_boundary};
 
 fn prefer_date_now(span: Span) -> OxcDiagnostic {
     OxcDiagnostic::warn("Prefer `Date.now()` over `new Date()`")
@@ -21,8 +22,8 @@ fn prefer_date_now_over_methods(span: Span, bad_method: &str) -> OxcDiagnostic {
         .with_label(span)
 }
 
-fn prefer_date_now_over_number_date_object(span: Span) -> OxcDiagnostic {
-    OxcDiagnostic::warn("Prefer `Date.now()` over `Number(new Date())`")
+fn prefer_date_now_over_number_date_object(span: Span, kind: &str) -> OxcDiagnostic {
+    OxcDiagnostic::warn(format!("Prefer `Date.now()` over `{kind}(new Date())`"))
         .with_help("Change to `Date.now()`.")
         .with_label(span)
 }
@@ -54,8 +55,11 @@ declare_oxc_lint!(
     PreferDateNow,
     unicorn,
     pedantic,
+    recommended,
     fix,
     version = "0.0.16",
+    short_description =
+        "Prefers use of `Date.now()` over `new Date().getTime()` or `new Date().valueOf()`.",
 );
 
 impl Rule for PreferDateNow {
@@ -67,15 +71,18 @@ impl Rule for PreferDateNow {
                     call_expr.callee.get_inner_expression().as_member_expression()
                     && call_expr.arguments.is_empty()
                     && !member_expr.is_computed()
-                    && matches!(member_expr.static_property_name(), Some("getTime" | "valueOf"))
+                    && let Some(method_name @ ("getTime" | "valueOf")) =
+                        member_expr.static_property_name().and_then(JSStr::as_str)
                     && is_new_date(member_expr.object().get_inner_expression())
                 {
                     ctx.diagnostic_with_fix(
-                        prefer_date_now_over_methods(
-                            call_expr.span,
-                            member_expr.static_property_name().unwrap(),
-                        ),
-                        |fixer| fixer.replace(call_expr.span, "Date.now()"),
+                        prefer_date_now_over_methods(call_expr.span, method_name),
+                        |fixer| {
+                            if ctx.has_comments_between(call_expr.span) {
+                                return fixer.noop();
+                            }
+                            fixer.replace(call_expr.span, "Date.now()")
+                        },
                     );
                 }
 
@@ -88,8 +95,22 @@ impl Rule for PreferDateNow {
                     && is_new_date(expr.get_inner_expression())
                 {
                     ctx.diagnostic_with_fix(
-                        prefer_date_now_over_number_date_object(call_expr.span),
-                        |fixer| fixer.replace(call_expr.span, "Date.now()"),
+                        prefer_date_now_over_number_date_object(
+                            call_expr.span,
+                            ident.name.as_str(),
+                        ),
+                        |fixer| {
+                            let replacement_span = if ident.name.as_str() == "Number" {
+                                call_expr.span
+                            } else {
+                                expr.get_inner_expression().span()
+                            };
+
+                            if ctx.has_comments_between(replacement_span) {
+                                return fixer.noop();
+                            }
+                            fixer.replace(replacement_span, "Date.now()")
+                        },
                     );
                 }
             }
@@ -102,7 +123,22 @@ impl Rule for PreferDateNow {
                 }
                 if is_new_date(&unary_expr.argument) {
                     ctx.diagnostic_with_fix(prefer_date_now(unary_expr.argument.span()), |fixer| {
-                        fixer.replace(unary_expr.span, "Date.now()")
+                        let replacement_span =
+                            if unary_expr.operator == UnaryOperator::UnaryNegation {
+                                unary_expr.argument.get_inner_expression().span()
+                            } else {
+                                unary_expr.span
+                            };
+                        if ctx.has_comments_between(replacement_span) {
+                            return fixer.noop();
+                        }
+                        let mut replacement = "Date.now()".to_string();
+                        pad_fix_with_token_boundary(
+                            fixer.source_text(),
+                            replacement_span,
+                            &mut replacement,
+                        );
+                        fixer.replace(replacement_span, replacement)
                     });
                 }
             }
@@ -225,14 +261,44 @@ fn test() {
         ("new Date().getTime()", "Date.now()"),
         ("new Date().valueOf()", "Date.now()"),
         ("Number(new Date())", "Date.now()"),
-        ("BigInt(new Date())", "Date.now()"),
+        ("BigInt(new Date())", "BigInt(Date.now())"),
         ("(new Date() as number).getTime()", "Date.now()"),
         ("(new Date().valueOf() as string)", "(Date.now() as string)"),
         ("(new Date()     ).     getTime()", "Date.now()"),
         ("(new Date().valueOf()       )", "(Date.now()       )"),
         ("Number(new Date()        )", "Date.now()"),
-        ("BigInt(new             Date());", "Date.now();"),
-        ("BigInt(new Date());", "Date.now();"),
+        ("BigInt(new             Date());", "BigInt(Date.now());"),
+        ("BigInt(new Date());", "BigInt(Date.now());"),
+        ("+new Date()", "Date.now()"),
+        ("-new Date()", "-Date.now()"),
+        ("- new Date()", "- Date.now()"),
+        ("-new Date", "-Date.now()"),
+        ("-(new Date())", "-(Date.now())"),
+        ("function foo(){return+new Date}", "function foo(){return Date.now()}"),
+        ("function foo(){return-new Date}", "function foo(){return-Date.now()}"),
+        ("+/* keep */new Date()", "+/* keep */new Date()"),
+        ("+new /* keep */Date()", "+new /* keep */Date()"),
+        ("-new Date(/* keep */)", "-new Date(/* keep */)"),
+        ("+(/* keep */new Date())", "+(/* keep */new Date())"),
+        ("+(new Date()/* keep */)", "+(new Date()/* keep */)"),
+        ("new Date(/* keep */).getTime()", "new Date(/* keep */).getTime()"),
+        ("new Date()./* keep */valueOf()", "new Date()./* keep */valueOf()"),
+        ("Number(/* keep */new Date())", "Number(/* keep */new Date())"),
+        ("BigInt(new Date(/* keep */))", "BigInt(new Date(/* keep */))"),
+        ("+new Date(// keep\n)", "+new Date(// keep\n)"),
+        ("-/* keep */new Date()", "-/* keep */Date.now()"),
+        ("-// keep\nnew Date()", "-// keep\nDate.now()"),
+        ("-(/* keep */new Date())", "-(/* keep */Date.now())"),
+        ("-(new Date()/* keep */)", "-(Date.now()/* keep */)"),
+        ("/* keep */+new Date()", "/* keep */Date.now()"),
+        ("BigInt(/* keep */new Date())", "BigInt(/* keep */Date.now())"),
+        ("+(new Date() as unknown as number)", "Date.now()"),
+        ("-(new Date() as unknown as number)", "-(Date.now() as unknown as number)"),
+        ("-(new Date() as any)!", "-(Date.now() as any)!"),
+        ("function foo(){throw+new Date}", "function foo(){throw Date.now()}"),
+        ("function* foo(){yield+new Date}", "function* foo(){yield Date.now()}"),
+        ("async function foo(){await+new Date}", "async function foo(){await Date.now()}"),
+        ("function foo(){return\n+new Date}", "function foo(){return\nDate.now()}"),
     ];
 
     Tester::new(PreferDateNow::NAME, PreferDateNow::PLUGIN, pass, fail)

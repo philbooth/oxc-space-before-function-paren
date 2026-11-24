@@ -1,4 +1,4 @@
-use oxc_ast::AstKind;
+use oxc_ast::{AstKind, ast::MemberExpression};
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_span::{GetSpan, Span};
@@ -39,8 +39,10 @@ declare_oxc_lint!(
     NoUnnecessaryArrayFlatDepth,
     unicorn,
     pedantic,
+    recommended,
     suggestion,
     version = "0.16.12",
+    short_description = "Disallows passing `1` to `Array.prototype.flat`.",
 );
 
 impl Rule for NoUnnecessaryArrayFlatDepth {
@@ -57,7 +59,7 @@ impl Rule for NoUnnecessaryArrayFlatDepth {
             let diagnostic_span = call_expr
                 .callee
                 .as_member_expression()
-                .and_then(oxc_ast::ast::MemberExpression::static_property_info)
+                .and_then(MemberExpression::static_property_info)
                 .map_or(call_expr.span, |(span, _)| span);
 
             ctx.diagnostic_with_suggestion(

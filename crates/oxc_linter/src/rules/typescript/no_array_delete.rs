@@ -37,8 +37,10 @@ declare_oxc_lint!(
     NoArrayDelete(tsgolint),
     typescript,
     correctness,
+    recommended,
     suggestion,
     version = "1.12.0",
+    short_description = "This rule disallows using the delete operator on array values.",
 );
 
 impl Rule for NoArrayDelete {}

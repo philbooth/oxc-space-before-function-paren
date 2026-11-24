@@ -1,15 +1,11 @@
-commit: c7a0ae10
+commit: 01f1a759
 
 estree_typescript_tokens Summary:
-AST Parsed     : 9765/9765 (100.00%)
-Positive Passed: 9760/9765 (99.95%)
-Expect to Parse: tasks/coverage/typescript/tests/cases/compiler/ambientWithStatements.ts
-A 'return' statement can only be used within a function body.
-Expect to Parse: tasks/coverage/typescript/tests/cases/compiler/constDeclarations-invalidContexts.ts
-Lexical declaration cannot appear in a single-statement context
-Expect to Parse: tasks/coverage/typescript/tests/cases/compiler/constDeclarations-scopes.ts
-Lexical declaration cannot appear in a single-statement context
-Expect to Parse: tasks/coverage/typescript/tests/cases/compiler/constDeclarations-validContexts.ts
-Lexical declaration cannot appear in a single-statement context
-Expect to Parse: tasks/coverage/typescript/tests/cases/conformance/parser/ecmascript5/ErrorRecovery/parserStatementIsNotAMemberVariableDeclaration1.ts
-A 'return' statement can only be used within a function body.
+AST Parsed     : 9946/9949 (99.97%)
+Positive Passed: 9946/9949 (99.97%)
+Fatal error: tasks/coverage/typescript/tsc/testdata/tests/cases/compiler/indexSignatureMissingType.ts
+An index signature must have a type annotation.
+Fatal error: tasks/coverage/typescript/tsc/testdata/tests/cases/compiler/jsdocThisTagWithThisParameter.ts
+Identifier expected. 'this' is a reserved word that cannot be used here.
+Fatal error: tasks/coverage/typescript/tsc/testdata/tests/cases/compiler/malformedDestructuringAssignmentTransformVariants.ts
+Cannot assign to this expression

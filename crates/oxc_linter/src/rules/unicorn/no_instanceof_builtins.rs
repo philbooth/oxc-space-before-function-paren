@@ -18,8 +18,6 @@ fn no_instanceof_builtins_diagnostic(span: Span) -> OxcDiagnostic {
         .with_label(span)
 }
 
-const PRIMITIVE_WRAPPERS: &[&str] = &["String", "Number", "Boolean", "BigInt", "Symbol"];
-
 const STRICT_STRATEGY_CONSTRUCTORS: &[&str] = &[
     // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Error
     "Error",
@@ -66,7 +64,7 @@ const STRICT_STRATEGY_CONSTRUCTORS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone, Default, JsonSchema)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct NoInstanceofBuiltinsConfig {
     /// Additional constructor names to check beyond the default set.
     /// Use this to extend the rule with additional constructors.
@@ -78,12 +76,12 @@ pub struct NoInstanceofBuiltinsConfig {
     /// to be available.
     use_error_is_error: bool,
     /// Controls which built-in constructors are checked.
-    strategy: Strategy,
+    strategy: NoInstanceofBuiltinsStrategy,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, JsonSchema, Serialize)]
 #[serde(rename_all = "camelCase")]
-enum Strategy {
+enum NoInstanceofBuiltinsStrategy {
     /// Additionally checks Error types, collections, typed arrays, and other built-in constructors.
     Strict,
     /// Only checks Array, Function, Error (if `useErrorIsError` is true), and primitive wrappers.
@@ -124,9 +122,11 @@ declare_oxc_lint!(
     NoInstanceofBuiltins,
     unicorn,
     suspicious,
+    recommended,
     conditional_suggestion,
     config = NoInstanceofBuiltinsConfig,
     version = "0.16.12",
+    short_description = "Disallow `instanceof` with built-in objects.",
 );
 
 impl Rule for NoInstanceofBuiltins {
@@ -134,7 +134,7 @@ impl Rule for NoInstanceofBuiltins {
         let mut include = Vec::<String>::new();
         let mut exclude = Vec::<String>::new();
         let mut use_error_is_error = false;
-        let mut strategy = Strategy::Loose;
+        let mut strategy = NoInstanceofBuiltinsStrategy::Loose;
 
         if let Value::Array(arr) = value
             && let Some(Value::Object(map)) = arr.first()
@@ -158,8 +158,8 @@ impl Rule for NoInstanceofBuiltins {
             }
             if let Some(Value::String(b)) = map.get("strategy") {
                 match b.as_str() {
-                    "strict" => strategy = Strategy::Strict,
-                    "loose" => strategy = Strategy::Loose,
+                    "strict" => strategy = NoInstanceofBuiltinsStrategy::Strict,
+                    "loose" => strategy = NoInstanceofBuiltinsStrategy::Loose,
                     _ => {}
                 }
             }
@@ -214,15 +214,15 @@ impl Rule for NoInstanceofBuiltins {
         }
 
         // typeof x === 'string' / 'number' / 'boolean' / 'bigint' / 'symbol'
-        if PRIMITIVE_WRAPPERS.contains(&ctor_name) {
-            let typeof_type = match ctor_name {
-                "String" => "string",
-                "Number" => "number",
-                "Boolean" => "boolean",
-                "BigInt" => "bigint",
-                "Symbol" => "symbol",
-                _ => unreachable!(),
-            };
+        let typeof_type = match ctor_name {
+            "String" => Some("string"),
+            "Number" => Some("number"),
+            "Boolean" => Some("boolean"),
+            "BigInt" => Some("bigint"),
+            "Symbol" => Some("symbol"),
+            _ => None,
+        };
+        if let Some(typeof_type) = typeof_type {
             let replacement = format!("typeof ({left_text}) === '{typeof_type}'");
             ctx.diagnostic_with_suggestion(no_instanceof_builtins_diagnostic(bin.span), |fixer| {
                 fixer.replace(bin.span, replacement)
@@ -231,7 +231,7 @@ impl Rule for NoInstanceofBuiltins {
         }
 
         if self.0.include.iter().any(|s| s == ctor_name)
-            || (self.0.strategy == Strategy::Strict
+            || (self.0.strategy == NoInstanceofBuiltinsStrategy::Strict
                 && STRICT_STRATEGY_CONSTRUCTORS.contains(&ctor_name))
         {
             ctx.diagnostic(no_instanceof_builtins_diagnostic(bin.span));

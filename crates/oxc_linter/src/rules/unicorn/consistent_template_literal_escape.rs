@@ -17,7 +17,7 @@ pub struct ConsistentTemplateLiteralEscape;
 declare_oxc_lint!(
     /// ### What it does
     ///
-    /// Enforce consistent style for escaping ${ in template literals.
+    /// Enforce consistent style for escaping `${` in template literals.
     ///
     /// ### Why is this bad?
     /// Using `\${` instead of `${` can improve readability and prevent confusion.
@@ -41,7 +41,8 @@ declare_oxc_lint!(
     unicorn,
     style,
     fix,
-    version = "1.60.0"
+    version = "1.60.0",
+    short_description = "Enforce consistent style for escaping `${` in template literals.",
 );
 
 impl Rule for ConsistentTemplateLiteralEscape {
@@ -55,7 +56,7 @@ impl Rule for ConsistentTemplateLiteralEscape {
         }
 
         for quasis in &template_literal.quasis {
-            let value = quasis.value.raw.as_ref();
+            let value = quasis.span.source_text(ctx.source_text());
             for (start, _) in value.match_indices("$\\{") {
                 let backslash_count =
                     value.as_bytes()[..start].iter().rev().take_while(|&&b| b == b'\\').count();
@@ -91,6 +92,10 @@ fn test() {
         r"const foo = `\\\${a}`",
         r"const foo = '$\{a}'",
         r"const foo = `ééé\${a}`",
+        "`\r\né\\${x}`",
+        "`\r\né${x}`",
+        "tag`\r\né$\\{x}`",
+        "String.raw`\r\né$\\{x}`",
     ];
 
     let fail = vec![
@@ -104,6 +109,16 @@ fn test() {
         r"const foo = `$\{a}${expr}$\{b}`",
         r"const foo = `ééé$\{a}`",
         r"const foo = `ééé\\$\{a}`",
+        "`\r\n$\\{x}`",
+        "`\r\né$\\{x}`",
+        "`\r\n🦀$\\{x}`",
+        "`\r\né\\$\\{x}`",
+        "`\r\né\\\\$\\{x}`",
+        "`\r\né$\\{x}\r\n🦀$\\{y}`",
+        "`\r\né$\\{x}${first}\r\n🦀$\\{y}${second}\r\né$\\{z}`",
+        "`\\\r\né$\\{x}`",
+        "`\né$\\{x}`",
+        "`\ré$\\{x}`",
     ];
     let fix = vec![
         (r"const foo = `$\{a}`", r"const foo = `\${a}`"),
@@ -116,6 +131,19 @@ fn test() {
         (r"const foo = `$\{a}${expr}$\{b}`", r"const foo = `\${a}${expr}\${b}`"),
         (r"const foo = `ééé$\{a}`", r"const foo = `ééé\${a}`"),
         (r"const foo = `ééé\\$\{a}`", r"const foo = `ééé\\\${a}`"),
+        ("`\r\n$\\{x}`", "`\r\n\\${x}`"),
+        ("`\r\né$\\{x}`", "`\r\né\\${x}`"),
+        ("`\r\n🦀$\\{x}`", "`\r\n🦀\\${x}`"),
+        ("`\r\né\\$\\{x}`", "`\r\né\\${x}`"),
+        ("`\r\né\\\\$\\{x}`", "`\r\né\\\\\\${x}`"),
+        ("`\r\né$\\{x}\r\n🦀$\\{y}`", "`\r\né\\${x}\r\n🦀\\${y}`"),
+        (
+            "`\r\né$\\{x}${first}\r\n🦀$\\{y}${second}\r\né$\\{z}`",
+            "`\r\né\\${x}${first}\r\n🦀\\${y}${second}\r\né\\${z}`",
+        ),
+        ("`\\\r\né$\\{x}`", "`\\\r\né\\${x}`"),
+        ("`\né$\\{x}`", "`\né\\${x}`"),
+        ("`\ré$\\{x}`", "`\ré\\${x}`"),
     ];
 
     Tester::new(

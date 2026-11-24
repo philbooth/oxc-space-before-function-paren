@@ -1,7 +1,7 @@
 use itertools::Itertools;
 use oxc_ast::{
     AstKind,
-    ast::{BindingPattern, Expression, ImportOrExportKind},
+    ast::{BindingPattern, Expression},
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
@@ -15,13 +15,14 @@ use crate::{
     fixer::{RuleFix, RuleFixer},
     module_record::ImportImportName,
     rule::Rule,
+    utils::is_vitest_import_source,
 };
 
 fn prefer_importing_vitest_globals_diagnostic(
     spans: &[Span],
     globals_founds: &str,
 ) -> OxcDiagnostic {
-    OxcDiagnostic::warn("Do not use vitest global functions")
+    OxcDiagnostic::warn("Do not use Vitest global functions")
         .with_help(format!(
             "Import global functions `{globals_founds}` from `vitest` package instead of using globals."
         ))
@@ -57,11 +58,11 @@ pub struct PreferImportingVitestGlobals;
 declare_oxc_lint!(
     /// ### What it does
     ///
-    /// Enforces explicit imports from 'vitest' instead of using vitest globals.
+    /// Enforces explicit imports from 'vitest' instead of using Vitest globals.
     ///
     /// ### Why is this bad?
     ///
-    /// Using vitest globals without importing them relies on implicit global configuration
+    /// Using Vitest globals without importing them relies on implicit global configuration
     /// (`globals: true` in vitest config). Explicit imports make dependencies clear,
     /// improve IDE support, and ensure compatibility across different setups.
     ///
@@ -91,6 +92,7 @@ declare_oxc_lint!(
     style,
     fix,
     version = "1.59.0",
+    short_description = "Enforces explicit imports from 'vitest' instead of using Vitest globals.",
 );
 
 impl Rule for PreferImportingVitestGlobals {
@@ -135,8 +137,12 @@ impl Rule for PreferImportingVitestGlobals {
                 continue;
             };
 
-            if import_decl.source.value == "vitest"
-                && import_decl.import_kind == ImportOrExportKind::Value
+            if !import_decl.source.value.as_str().is_some_and(is_vitest_import_source) {
+                continue;
+            }
+
+            if import_decl.import_kind.is_value()
+                && !scoping.symbol_flags(symbol_id).is_type_import()
             {
                 continue;
             }
@@ -162,11 +168,21 @@ impl Rule for PreferImportingVitestGlobals {
         }
 
         let globals_imports = missing_globals.iter().join(", ");
+        let diagnostic =
+            prefer_importing_vitest_globals_diagnostic(globals_spans.as_ref(), &globals_imports);
 
-        ctx.diagnostic_with_fix(
-            prefer_importing_vitest_globals_diagnostic(globals_spans.as_ref(), &globals_imports),
-            |fixer| Self::build_fix(ctx, &globals_imports, fixer),
-        );
+        let fixable_imports = missing_globals
+            .iter()
+            .filter(|name| scoping.get_binding(root_scope, (**name).into()).is_none())
+            .join(", ");
+
+        if fixable_imports.is_empty() {
+            ctx.diagnostic(diagnostic);
+        } else {
+            ctx.diagnostic_with_fix(diagnostic, |fixer| {
+                Self::build_fix(ctx, &fixable_imports, fixer)
+            });
+        }
     }
 }
 
@@ -181,15 +197,18 @@ impl PreferImportingVitestGlobals {
         let vitest_esm_import = module_record
             .import_entries
             .iter()
-            .find(|e| e.module_request.name() == "vitest" && !e.is_type);
+            .find(|e| is_vitest_import_source(e.module_request.name()) && !e.is_type);
 
-        // 1. Existing `import { ... } from 'vitest'` — append to named specifiers.
+        // 1. Existing `import { ... }` from a Vitest source — append to named specifiers.
         if let Some(entry) = vitest_esm_import
             && vitest_esm_import
                 .is_some_and(|import| matches!(import.import_name, ImportImportName::Name(_)))
         {
             let source = ctx.source_range(entry.statement_span);
-            if let Some(close_brace_pos) = source.rfind('}') {
+            if let Some(close_brace_pos) = ctx
+                .find_prev_token_within(entry.statement_span.start, entry.statement_span.end, "}")
+                .map(|offset| offset as usize)
+            {
                 let before_brace = &source[..close_brace_pos];
                 let trimmed = before_brace.trim_end();
                 let needs_comma = !trimmed.ends_with(',');
@@ -209,8 +228,7 @@ impl PreferImportingVitestGlobals {
             }
         }
 
-        // 2. Existing `import defaultName from 'vitest'` — convert to
-        //    `import defaultName, { ... } from 'vitest'`.
+        // 2. Existing `import defaultName` from a Vitest source — append named specifiers.
         if let Some(entry) = vitest_esm_import
             && vitest_esm_import.is_some_and(|import| import.import_name.is_default())
         {
@@ -220,19 +238,28 @@ impl PreferImportingVitestGlobals {
             );
         }
 
-        // 3. Existing `const { ... } = require('vitest')` — append to destructuring.
+        // 3. Existing `const { ... } = require(...)` from a Vitest source — append to destructuring.
         if let Some(fix) = Self::try_fix_cjs_require(ctx, globals_imports, &fixer) {
             return fix;
         }
 
-        // 4. Fallback: add a new `import { ... } from 'vitest'` at the top.
-        fixer.insert_text_before_range(
-            Span::empty(0),
-            format!("import {{ {globals_imports} }} from 'vitest';\n"),
-        )
+        let import_source = vitest_esm_import
+            .map(|entry| entry.module_request.name())
+            .or_else(|| Self::find_vitest_require_source(ctx))
+            .unwrap_or("vitest");
+
+        let text = format!("import {{ {globals_imports} }} from '{import_source}';");
+        let program = ctx.nodes().program();
+        if let Some(directive) = program.directives.last() {
+            return fixer.insert_text_after_range(directive.span, format!("\n{text}"));
+        }
+        if let Some(hashbang) = &program.hashbang {
+            return fixer.insert_text_after_range(hashbang.span, format!("\n{text}"));
+        }
+        fixer.insert_text_before_range(Span::empty(0), format!("{text}\n"))
     }
 
-    /// Try to append missing names to an existing `const { ... } = require('vitest')`.
+    /// Try to append missing names to an existing `const { ... } = require(...)` from a Vitest source.
     fn try_fix_cjs_require<'a>(
         ctx: &LintContext<'a>,
         globals_imports: &str,
@@ -248,7 +275,7 @@ impl PreferImportingVitestGlobals {
             let is_vitest_require = call.arguments.len() == 1
                 && call.arguments.first().is_some_and(|arg| {
                     arg.as_expression().is_some_and(|expr| {
-                        matches!(expr, Expression::StringLiteral(lit) if lit.value == "vitest")
+                        matches!(expr, Expression::StringLiteral(lit) if lit.value.as_str().is_some_and(is_vitest_import_source))
                     })
                 });
 
@@ -290,6 +317,35 @@ impl PreferImportingVitestGlobals {
 
         None
     }
+
+    fn find_vitest_require_source<'a>(ctx: &LintContext<'a>) -> Option<&'a str> {
+        let require_refs = ctx.scoping().root_unresolved_references().get("require")?;
+
+        for &ref_id in require_refs {
+            let reference = ctx.scoping().get_reference(ref_id);
+            let parent = ctx.nodes().parent_node(reference.node_id());
+            let AstKind::CallExpression(call) = parent.kind() else { continue };
+
+            if call.arguments.len() != 1 {
+                continue;
+            }
+
+            let Some(source) = call.arguments.first().and_then(|arg| {
+                arg.as_expression().and_then(|expr| match expr {
+                    Expression::StringLiteral(lit) => lit.value.as_str(),
+                    _ => None,
+                })
+            }) else {
+                continue;
+            };
+
+            if is_vitest_import_source(source) {
+                return Some(source);
+            }
+        }
+
+        None
+    }
 }
 
 #[test]
@@ -299,37 +355,76 @@ fn test() {
     let pass = vec![
         "vitest.describe('suite', () => {});",
         "import { describe } from 'vitest'; describe('suite', () => {});",
+        "import { describe } from 'vite-plus/test'; describe('suite', () => {});",
         "import { describe, it } from 'vitest'; describe('suite', () => {});",
         "import { describe, desccribe } from 'vitest'; describe('suite', () => {});",
         "const { describe } = require('vitest'); describe('suite', () => {});",
+        "const { describe } = require('vite-plus/test'); describe('suite', () => {});",
         "const { describe, it } = require('vitest'); describe('suite', () => {});",
         "const { describe, desccribe } = require('vitest'); describe('suite', () => {});",
         "import { describe, expect, it } from 'vitest'; describe('suite', () => { it('test', () => { let test = 5; expect(test).toBe(5); }); });",
         "import { describe, expect, it } from 'vitest'; describe('suite', () => { it('test', () => { const test = () => true; expect(test()).toBe(true); }); });",
         "import { describe, expect, it } from 'vitest'; describe('suite', () => { it('test', () => { function fn(test) { return test; } expect(fn(5)).toBe(5); }); });",
+        "import { describe } from 'jest'; describe('suite', () => {});",
+        "import { test } from 'node:test'; test('x', () => {});",
+        "import { test, expect } from '@playwright/test'; test('x', async () => {});",
     ];
 
     let fail = vec![
         "describe('suite', () => {});",
         "import { it } from 'vitest';
             describe('suite', () => {});",
-        "import { describe } from 'jest';
+        "import { it } from 'vite-plus/test';
             describe('suite', () => {});",
         "import vitest from 'vitest';
             describe('suite', () => {});",
         "import * as abc from 'vitest';
             describe('suite', () => {});",
+        "import * as abc from 'vite-plus/test';
+            describe('suite', () => {});",
         r#"import { "default" as vitest } from 'vitest'; describe('suite', () => {});"#,
         "const x = require('something', 'else'); describe('suite', () => {});",
         "const x = require('jest'); describe('suite', () => {});",
         "const vitest = require('vitest'); describe('suite', () => {});",
+        "const vitePlusTest = require('vite-plus/test'); describe('suite', () => {});",
         "const { ...rest } = require('vitest'); describe('suite', () => {});",
         r#"const { "default": vitest } = require('vitest'); describe('suite', () => {});"#,
         "const { it } = require('vitest');
             describe('suite', () => {});",
+        "const { it } = require('vite-plus/test');
+            describe('suite', () => {});",
+        "import type { describe } from 'vitest'; describe('suite', () => {});",
+        "import { type describe } from 'vitest'; describe('suite', () => {});",
+        "import type { describe } from 'vitest'; it('test', () => {}); describe('suite', () => {});",
+        "import type { test } from 'node:test'; test('x', () => {});",
     ];
 
     let fix = vec![
+        (
+            "#!/usr/bin/env node\n\ndescribe('suite', () => {});",
+            "#!/usr/bin/env node\nimport { describe } from 'vitest';\n\ndescribe('suite', () => {});",
+        ),
+        (
+            "#!/usr/bin/env node\r\ndescribe('suite', () => {});",
+            "#!/usr/bin/env node\nimport { describe } from 'vitest';\r\ndescribe('suite', () => {});",
+        ),
+        (
+            "'use strict';\n'use client';\ndescribe('suite', () => {});",
+            "'use strict';\n'use client';\nimport { describe } from 'vitest';\ndescribe('suite', () => {});",
+        ),
+        (
+            "#!/usr/bin/env node\n'use strict'\ndescribe('suite', () => {});",
+            "#!/usr/bin/env node\n'use strict'\nimport { describe } from 'vitest';\ndescribe('suite', () => {});",
+        ),
+        (
+            "#!/usr/bin/env node\nimport * as vitest from 'vite-plus/test';\ndescribe('suite', () => {});",
+            "#!/usr/bin/env node\nimport { describe } from 'vite-plus/test';\nimport * as vitest from 'vite-plus/test';\ndescribe('suite', () => {});",
+        ),
+        // the `}` inside the comment is not the end of the specifier list
+        (
+            "import { it } from /* } */ 'vitest';\ndescribe('suite', () => {});",
+            "import { it, describe } from /* } */ 'vitest';\ndescribe('suite', () => {});",
+        ),
         (
             "describe('suite', () => {});",
             "import { describe } from 'vitest';\ndescribe('suite', () => {});",
@@ -341,9 +436,9 @@ fn test() {
             describe('suite', () => {});",
         ),
         (
-            "import { describe } from 'jest';
+            "import { it } from 'vite-plus/test';
             describe('suite', () => {});",
-            "import { describe } from 'vitest';\nimport { describe } from 'jest';
+            "import { it, describe } from 'vite-plus/test';
             describe('suite', () => {});",
         ),
         (
@@ -356,6 +451,12 @@ fn test() {
             "import * as abc from 'vitest';
             describe('suite', () => {});",
             "import { describe } from 'vitest';\nimport * as abc from 'vitest';
+            describe('suite', () => {});",
+        ),
+        (
+            "import * as abc from 'vite-plus/test';
+            describe('suite', () => {});",
+            "import { describe } from 'vite-plus/test';\nimport * as abc from 'vite-plus/test';
             describe('suite', () => {});",
         ),
         (
@@ -374,6 +475,10 @@ fn test() {
             "const vitest = require('vitest'); describe('suite', () => {});",
             "import { describe } from 'vitest';\nconst vitest = require('vitest'); describe('suite', () => {});",
         ),
+        (
+            "const vitePlusTest = require('vite-plus/test'); describe('suite', () => {});",
+            "import { describe } from 'vite-plus/test';\nconst vitePlusTest = require('vite-plus/test'); describe('suite', () => {});",
+        ),
         // Oxc emit an error if ...rest it's declared as first value instead of second.
         (
             "const { ...rest } = require('vitest');
@@ -390,6 +495,28 @@ fn test() {
             describe('suite', () => {});",
             "const { it, describe } = require('vitest');
             describe('suite', () => {});",
+        ),
+        (
+            "const { it } = require('vite-plus/test');
+            describe('suite', () => {});",
+            "const { it, describe } = require('vite-plus/test');
+            describe('suite', () => {});",
+        ),
+        (
+            "import type { describe } from 'vitest'; describe('suite', () => {});",
+            "import type { describe } from 'vitest'; describe('suite', () => {});",
+        ),
+        (
+            "import { type describe } from 'vitest'; describe('suite', () => {});",
+            "import { type describe } from 'vitest'; describe('suite', () => {});",
+        ),
+        (
+            "import type { describe } from 'vitest'; it('test', () => {}); describe('suite', () => {});",
+            "import { it } from 'vitest';\nimport type { describe } from 'vitest'; it('test', () => {}); describe('suite', () => {});",
+        ),
+        (
+            "import type { test } from 'node:test'; test('x', () => {});",
+            "import type { test } from 'node:test'; test('x', () => {});",
         ),
     ];
 

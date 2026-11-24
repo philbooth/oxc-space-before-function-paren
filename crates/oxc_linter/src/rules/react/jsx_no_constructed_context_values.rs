@@ -1,8 +1,8 @@
 use oxc_ast::{
     AstKind,
     ast::{
-        Expression, IdentifierReference, JSXAttributeItem, JSXAttributeName, JSXAttributeValue,
-        JSXOpeningElement,
+        ChainElement, Expression, IdentifierReference, JSXAttributeItem, JSXAttributeName,
+        JSXAttributeValue, JSXElementName, JSXOpeningElement,
     },
 };
 use oxc_diagnostics::OxcDiagnostic;
@@ -17,7 +17,7 @@ use crate::{
 
 fn jsx_no_constructed_context_values(span: Span) -> OxcDiagnostic {
     OxcDiagnostic::warn("The Context `value` prop should not be constructed.")
-        .with_help("Wrap the `value` prop in useMemo() or useCallback(), or use a constant value to prevent unnecessary rerenders.\nAlternatively, move the value outside the render function if it doesn't depend on props or state.")
+        .with_help("Wrap the `value` prop in useMemo() or useCallback(), or use a constant value to prevent unnecessary re-renders.\nAlternatively, move the value outside the render function if it doesn't depend on props or state.")
         .with_label(span)
 }
 
@@ -27,18 +27,18 @@ pub struct JsxNoConstructedContextValues;
 declare_oxc_lint!(
     /// ### What it does
     ///
-    /// Disallows JSX context provider values from taking values that will cause needless rerenders.
+    /// Disallows JSX context provider values that cause needless re-renders.
     ///
     /// ### Why is this bad?
     ///
-    /// React Context and all its child nodes and Consumers are rerendered whenever the value prop
+    /// React Context and all its child nodes and Consumers are re-rendered whenever the value prop
     /// changes. Because each JavaScript object carries its own identity, things like object
     /// expressions (`{foo: 'bar'}`) or function expressions get a new identity on every render.
-    /// This makes the context think it has gotten a new object and can cause needless rerenders
+    /// This makes the context think it has gotten a new object and can cause needless re-renders
     /// and unintended consequences.
     ///
     /// This can be a large performance hit because not only will it cause the context providers
-    /// and consumers to rerender with all the elements in its subtree, the processing for the
+    /// and consumers to re-render with all the elements in its subtree, the processing for the
     /// tree scan React does to render the provider and find consumers is also wasted.
     ///
     /// ### Examples
@@ -77,6 +77,7 @@ declare_oxc_lint!(
     react,
     perf,
     version = "1.48.0",
+    short_description = "Disallows JSX context provider values that cause needless re-renders.",
 );
 
 impl Rule for JsxNoConstructedContextValues {
@@ -124,11 +125,8 @@ impl Rule for JsxNoConstructedContextValues {
 
 fn is_context_provider(jsx_opening_elem: &JSXOpeningElement, ctx: &LintContext<'_>) -> bool {
     match &jsx_opening_elem.name {
-        oxc_ast::ast::JSXElementName::MemberExpression(member_expr) => {
-            &member_expr.property.name == "Provider"
-        }
-        name @ (oxc_ast::ast::JSXElementName::Identifier(_)
-        | oxc_ast::ast::JSXElementName::IdentifierReference(_)) => {
+        JSXElementName::MemberExpression(member_expr) => &member_expr.property.name == "Provider",
+        name @ (JSXElementName::Identifier(_) | JSXElementName::IdentifierReference(_)) => {
             // Check if this identifier refers to a context created with createContext()
             name.get_identifier().is_some_and(|ident| is_react_context(ident, ctx))
         }
@@ -267,7 +265,7 @@ fn is_constructed_expression(expr: &Expression, ctx: &LintContext) -> bool {
         Expression::Identifier(ident) => is_identifier_a_constructed_value(ident, ctx),
 
         Expression::ChainExpression(chain_expr) => match &chain_expr.expression {
-            oxc_ast::ast::ChainElement::CallExpression(call) => {
+            ChainElement::CallExpression(call) => {
                 if let Expression::Identifier(ident) = &call.callee {
                     let name = ident.name.as_str();
                     if name == "useMemo" || name == "useCallback" {

@@ -8,36 +8,45 @@ use std::{
 };
 
 use oxc_allocator::Allocator;
+use oxc_ast::ast::{Expression, IdentifierReference};
+use oxc_semantic::{IsGlobalReference, Scoping};
 use oxc_span::Span;
+use oxc_str::static_ident;
 use oxc_syntax::identifier::{is_identifier_part, is_identifier_start};
+
+use crate::{config::GlobalValue, context::LintContext};
 
 mod comment;
 mod config;
+mod control_flow;
+mod declarator;
 mod express;
 mod jest;
 mod jsdoc;
 mod nextjs;
+mod node;
+mod number;
 mod promise;
 mod react;
+mod react_compiler;
 mod react_perf;
 mod regex;
+mod schemars;
+mod static_value;
+mod this_expression;
 mod typescript;
 mod unicorn;
 mod url;
 mod vitest;
 mod vue;
+pub mod vue_casing;
 
 pub use self::{
-    comment::*, config::*, express::*, jest::*, jsdoc::*, nextjs::*, promise::*, react::*,
-    react_perf::*, regex::*, typescript::*, unicorn::*, url::*, vitest::*, vue::*,
+    comment::*, config::*, control_flow::*, declarator::*, express::*, jest::*, jsdoc::*,
+    nextjs::*, node::*, number::*, promise::*, react::*, react_compiler::*, react_perf::*,
+    regex::*, schemars::*, static_value::*, this_expression::*, typescript::*, unicorn::*, url::*,
+    vitest::*, vue::*,
 };
-
-/// List of Jest rules that have Vitest equivalents.
-// When adding a new rule to this list, please ensure that
-// the crates/oxc_linter/data/vitest_compatible_jest_rules.json
-// file is also updated. The JSON file is used by the oxlint-migrate
-// and eslint-plugin-oxlint repos to keep everything synced.
-const VITEST_COMPATIBLE_JEST_RULES: [&str; 0] = [];
 
 /// List of Eslint rules that have TypeScript equivalents.
 // When adding a new rule to this list, please ensure oxlint-migrate is also updated.
@@ -84,13 +93,6 @@ const TYPESCRIPT_COMPATIBLE_ESLINT_RULES: [&str; 18] = [
     // "space-infix-ops"
 ];
 
-/// Check if the Jest rule is adapted to Vitest.
-/// Many Vitest rule are essentially ports of Jest plugin rules with minor modifications.
-/// For these rules, we use the corresponding jest rules with some adjustments for compatibility.
-pub fn is_jest_rule_adapted_to_vitest(rule_name: &str) -> bool {
-    VITEST_COMPATIBLE_JEST_RULES.binary_search(&rule_name).is_ok()
-}
-
 /// Check if the Eslint rule is adapted to Typescript.
 /// Many Typescript rule are essentially ports of Eslint plugin rules with minor modifications.
 /// For these rules, we use the corresponding eslint rules with some adjustments for compatibility.
@@ -120,6 +122,30 @@ pub fn pad_fix_with_token_boundary(source_text: &str, span: Span, replacement: &
     if needs_pad_end {
         replacement.push(' ');
     }
+}
+
+/// Checks whether an identifier references a global enabled by the linter configuration.
+pub fn is_enabled_global_reference(ident: &IdentifierReference<'_>, ctx: &LintContext<'_>) -> bool {
+    ident.is_global_reference(ctx.scoping())
+        && ctx
+            .get_global_variable_value(ident.name.as_str())
+            .is_some_and(|value| value != GlobalValue::Off)
+}
+
+pub fn is_string_raw_member_expression(expr: &Expression, scoping: &Scoping) -> bool {
+    if let Some(member) = expr.get_member_expr()
+        && member.static_property_name().is_some_and(|name| name == "raw")
+        && let Expression::Identifier(ident) = member.object().get_inner_expression()
+    {
+        ident.is_global_reference_name(static_ident!("String"), scoping)
+    } else {
+        false
+    }
+}
+
+/// Checks if `haystack` starts with `prefix`, ignoring ASCII case.
+pub fn starts_with_ignore_case(haystack: &[u8], prefix: &str) -> bool {
+    haystack.get(..prefix.len()).is_some_and(|start| start.eq_ignore_ascii_case(prefix.as_bytes()))
 }
 
 /// Reads the content of a path and returns it.
@@ -233,8 +259,8 @@ fn read_to_arena_bytes_known_size(
         let mut vec = ManuallyDrop::new(vec);
         let bytes_written = file.take(size as u64).read_to_end(&mut vec)?;
 
-        debug_assert!(vec.capacity() == size);
-        debug_assert!(vec.len() == bytes_written);
+        debug_assert_eq!(vec.capacity(), size);
+        debug_assert_eq!(vec.len(), bytes_written);
 
         // Update `size`, in case file was altered and got smaller since the call to `file.metadata()`,
         // or `file.metadata()` reported inaccurate size
@@ -259,38 +285,10 @@ fn read_to_arena_bytes_unknown_size(mut file: File, allocator: &Allocator) -> io
 
 #[cfg(test)]
 mod test {
-    use crate::utils::{
-        TYPESCRIPT_COMPATIBLE_ESLINT_RULES, VITEST_COMPATIBLE_JEST_RULES, read_to_string,
-    };
-    use serde_json::from_str;
-    use std::path::Path;
+    use crate::utils::TYPESCRIPT_COMPATIBLE_ESLINT_RULES;
 
     #[test]
     fn test_typescript_rules_list_is_alphabetized() {
         assert!(TYPESCRIPT_COMPATIBLE_ESLINT_RULES.is_sorted());
-    }
-
-    #[test]
-    fn test_vitest_rules_list_is_alphabetized() {
-        assert!(VITEST_COMPATIBLE_JEST_RULES.is_sorted());
-    }
-
-    #[test]
-    fn test_vitest_rules_list_matches_json() {
-        let json_path =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("data/vitest_compatible_jest_rules.json");
-        let json = read_to_string(&json_path).expect("Failed to read vitest rules JSON file");
-        let json_rules: Vec<String> =
-            from_str(&json).expect("Failed to parse vitest rules JSON file");
-        assert!(json_rules.is_sorted(), "vitest JSON list must be alphabetized");
-        let rust_rules: Vec<&str> = VITEST_COMPATIBLE_JEST_RULES.to_vec();
-        assert_eq!(
-            json_rules.len(),
-            rust_rules.len(),
-            "Rule counts differ between Rust constant and JSON, please ensure both are updated"
-        );
-        for (json_rule, rust_rule) in json_rules.iter().zip(rust_rules.iter()) {
-            assert_eq!(json_rule, rust_rule, "Mismatch for rule: {json_rule}");
-        }
     }
 }

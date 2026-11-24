@@ -51,7 +51,9 @@ declare_oxc_lint!(
     JsxNoCommentTextnodes,
     react,
     suspicious,
+    recommended,
     version = "0.0.14",
+    short_description = "This rule prevents comment strings (e.g. beginning with `//` or `/*`) from being accidentally injected as a text node in JSX statements.",
 );
 
 impl Rule for JsxNoCommentTextnodes {

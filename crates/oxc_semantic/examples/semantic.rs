@@ -16,7 +16,7 @@
 //! - `--symbols`: Display symbol table and reference information
 //! - `--symbol-references`: Display detailed reference information for each symbol
 
-use std::{env, path::Path, sync::Arc};
+use std::{env, path::Path};
 
 use itertools::Itertools;
 
@@ -37,18 +37,18 @@ fn main() -> std::io::Result<()> {
     let show_symbols = env::args().skip(1).any(|arg| arg == "--symbols");
     let show_symbol_references = env::args().skip(1).any(|arg| arg == "--symbol-references");
     let path = Path::new(&name);
-    let source_text = Arc::new(std::fs::read_to_string(path)?);
+    let source_text = std::fs::read_to_string(path)?;
     let source_type = SourceType::from_path(path).unwrap();
     // Memory arena where Semantic and Parser allocate objects
     let allocator = Allocator::default();
 
     // Parse the source text into an AST
     let parser_ret = Parser::new(&allocator, &source_text, source_type).parse();
-    if !parser_ret.errors.is_empty() {
+    if !parser_ret.diagnostics.is_empty() {
         let error_message: String = parser_ret
-            .errors
+            .diagnostics
             .into_iter()
-            .map(|error| format!("{:?}", error.with_source_code(Arc::clone(&source_text))))
+            .map(|error| error.render_with_source_code(source_text.as_str()))
             .join("\n");
         println!("Parsing failed:\n\n{error_message}");
         return Ok(());
@@ -56,18 +56,16 @@ fn main() -> std::io::Result<()> {
 
     let program = parser_ret.program;
 
-    // Build semantic model with syntax error checking
-    let semantic = SemanticBuilder::new()
-        // Enable additional syntax checks not performed by the parser
-        .with_check_syntax_error(true)
-        .build(&program);
+    // Compiler-pipeline defaults, plus the full `AstNodes` store since this
+    // example reads `semantic.nodes()`.
+    let semantic = SemanticBuilder::new_compiler().with_build_nodes(true).build(&program);
 
     // Report semantic analysis errors
-    if !semantic.errors.is_empty() {
+    if !semantic.diagnostics.is_empty() {
         let error_message: String = semantic
-            .errors
+            .diagnostics
             .into_iter()
-            .map(|error| format!("{:?}", error.with_source_code(Arc::clone(&source_text))))
+            .map(|error| error.render_with_source_code(source_text.as_str()))
             .join("\n");
         println!("Semantic analysis failed:\n\n{error_message}");
     }
@@ -113,7 +111,29 @@ fn main() -> std::io::Result<()> {
                 info = info.with_note("This symbol has no references.");
             }
 
-            let info = info.with_source_code(Arc::clone(&source_text));
+            let info = info.with_source_code(source_text.as_str());
+
+            let mut s = String::new();
+            reporter.render_report(&mut s, info.as_ref()).unwrap();
+            println!("{s}");
+        }
+
+        for (ident, references) in semantic.semantic.scoping().root_unresolved_references() {
+            let info = OxcDiagnostic::warn(format!("Unresolved ident `{ident}`")).and_labels(
+                references
+                    .iter()
+                    .map(|reference_id| semantic.semantic.scoping().get_reference(*reference_id))
+                    .map(|reference| {
+                        semantic
+                            .semantic
+                            .nodes()
+                            .get_node(reference.node_id())
+                            .span()
+                            .label(format!("referenced here: ({:?})", reference.flags()))
+                    }),
+            );
+
+            let info = info.with_source_code(source_text.as_str());
 
             let mut s = String::new();
             reporter.render_report(&mut s, info.as_ref()).unwrap();

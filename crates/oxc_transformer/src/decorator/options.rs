@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-#[derive(Debug, Default, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(default, rename_all = "camelCase", deny_unknown_fields)]
 /// Decorator transform options.
 pub struct DecoratorOptions {
@@ -18,4 +18,47 @@ pub struct DecoratorOptions {
     /// This option is the same as [emitDecoratorMetadata](https://www.typescriptlang.org/tsconfig/#emitDecoratorMetadata)
     /// in TypeScript, and it only works when `legacy` is true.
     pub emit_decorator_metadata: bool,
+
+    /// Whether the source is compiled under `--strictNullChecks`. Defaults to `true`.
+    ///
+    /// When `false`, `null` and `undefined` are elided from union `design:type` annotations
+    /// (`T | null` emits the constructor of `T` instead of `Object`).
+    ///
+    /// <https://www.typescriptlang.org/tsconfig#strictNullChecks>
+    #[serde(default = "default_as_true")]
+    pub strict_null_checks: bool,
+}
+
+impl Default for DecoratorOptions {
+    fn default() -> Self {
+        Self {
+            legacy: false,
+            emit_decorator_metadata: false,
+            strict_null_checks: default_as_true(),
+        }
+    }
+}
+
+fn default_as_true() -> bool {
+    true
+}
+
+/// Decorator semantics selected by the public transform options.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DecoratorMode {
+    Preserve,
+    Legacy,
+}
+
+impl DecoratorMode {
+    /// Whether the legacy (`experimentalDecorators`) semantics are selected.
+    pub(crate) fn is_legacy(self) -> bool {
+        matches!(self, Self::Legacy)
+    }
+}
+
+impl DecoratorOptions {
+    pub(crate) fn mode(self) -> DecoratorMode {
+        if self.legacy { DecoratorMode::Legacy } else { DecoratorMode::Preserve }
+    }
 }

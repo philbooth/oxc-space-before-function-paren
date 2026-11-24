@@ -4,7 +4,8 @@ use serde::Deserialize;
 use oxc_ast::{
     AstKind,
     ast::{
-        AssignmentTarget, ClassElement, ExportDefaultDeclarationKind, Expression, ObjectExpression,
+        AssignmentExpression, AssignmentTarget, CallExpression, Class, ClassElement,
+        ExportDefaultDeclaration, ExportDefaultDeclarationKind, Expression, ObjectExpression,
         ObjectPropertyKind, PropertyKey, Statement,
     },
 };
@@ -21,8 +22,9 @@ use crate::{
     context::LintContext,
     rule::{DefaultRuleConfig, Rule},
     utils::{
-        InnermostFunction, expression_contains_jsx, find_innermost_function_with_jsx,
-        function_body_contains_jsx, function_contains_jsx, is_hoc_call, is_react_component_name,
+        InnermostFunction, arrow_function_returns, expression_returns,
+        find_innermost_function_with_jsx, function_returns, is_component_wrapper_call,
+        is_es6_component_class, is_react_component_name,
     },
 };
 
@@ -63,8 +65,10 @@ declare_oxc_lint!(
     DisplayName,
     react,
     pedantic,
+    recommended,
     config = DisplayNameConfig,
     version = "1.42.0",
+    short_description = "Enforces that React components have a `displayName` property.",
 );
 
 #[derive(Debug)]
@@ -139,7 +143,7 @@ pub struct DisplayName(Box<DisplayNameConfig>);
 
 impl Rule for DisplayName {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        serde_json::from_value::<DefaultRuleConfig<Self>>(value).map(DefaultRuleConfig::into_inner)
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
     }
 
     fn run_once(&self, ctx: &LintContext) {
@@ -176,7 +180,6 @@ impl Rule for DisplayName {
                     continue; // Name is valid displayName
                 }
 
-                // Check if this symbol has a displayName assignment via semantic references
                 if !has_display_name_via_semantic(symbol_id, component_info.name.as_ref(), ctx) {
                     components_to_report.push((component_info.span, component_info.is_context));
                 }
@@ -189,12 +192,10 @@ impl Rule for DisplayName {
                         check_context_assignment_references(symbol_id, decl_node, ctx)
                     });
 
-                if let Some(component_info) = context_assignment_info {
-                    // Check if this symbol has a displayName assignment
-                    if !has_display_name_via_semantic(symbol_id, component_info.name.as_ref(), ctx)
-                    {
-                        components_to_report.push((component_info.span, component_info.is_context));
-                    }
+                if let Some(component_info) = context_assignment_info
+                    && !has_display_name_via_semantic(symbol_id, component_info.name.as_ref(), ctx)
+                {
+                    components_to_report.push((component_info.span, component_info.is_context));
                 }
             }
         }
@@ -206,9 +207,9 @@ impl Rule for DisplayName {
             // Efficiently find export default by checking only top-level statements
             let program = ctx.nodes().program();
             for stmt in &program.body {
-                if let oxc_ast::ast::Statement::ExportDefaultDeclaration(export) = stmt {
+                if let Statement::ExportDefaultDeclaration(export) = stmt {
                     if let Some(component_info) =
-                        is_anonymous_export_component(export, ignore_transpiler_name)
+                        is_anonymous_export_component(export, ctx, ignore_transpiler_name)
                     {
                         components_to_report.push((component_info.span, component_info.is_context));
                     }
@@ -232,6 +233,7 @@ impl Rule for DisplayName {
                             assign,
                             ignore_transpiler_name,
                             check_context_objects,
+                            ctx,
                         ) {
                             components_to_report
                                 .push((component_info.span, component_info.is_context));
@@ -321,26 +323,8 @@ fn extract_member_expression_path(expr: &Expression) -> String {
 }
 
 /// Check if a call expression is a createContext call
-fn is_create_context_call(call: &oxc_ast::ast::CallExpression) -> bool {
+fn is_create_context_call(call: &CallExpression) -> bool {
     call.callee_name().is_some_and(|name| name == "createContext")
-}
-
-/// Check if a class extends React.Component or React.PureComponent
-fn extends_react_component(class: &oxc_ast::ast::Class) -> bool {
-    class.super_class.as_ref().is_some_and(|super_class| {
-        if let Some(member_expr) = super_class.as_member_expression()
-            && let Expression::Identifier(ident) = member_expr.object()
-        {
-            return ident.name == "React"
-                && member_expr
-                    .static_property_name()
-                    .is_some_and(|name| name == "Component" || name == "PureComponent");
-        }
-        if let Some(ident_reference) = super_class.get_identifier_reference() {
-            return ident_reference.name == "Component" || ident_reference.name == "PureComponent";
-        }
-        false
-    })
 }
 
 /// Check if a symbol has a displayName assignment via semantic references
@@ -351,7 +335,6 @@ fn has_display_name_via_semantic(
 ) -> bool {
     let component_name_str = component_name.map(CompactStr::as_str);
 
-    // Check all references to this symbol
     for reference in ctx.scoping().get_resolved_references(symbol_id) {
         if is_display_name_assignment_for_reference(reference, component_name_str, ctx) {
             return true;
@@ -379,7 +362,6 @@ fn check_context_assignment_references(
         None
     };
 
-    // Check all write references to this symbol
     for reference in ctx.scoping().get_resolved_references(symbol_id) {
         if !reference.is_write() {
             continue;
@@ -422,7 +404,6 @@ fn is_react_component_node<'a>(
             // That will be handled by checking write references in Phase 1
             decl.init.as_ref()?;
 
-            // Check for createContext
             if let Some(Expression::CallExpression(call)) = &decl.init
                 && is_create_context_call(call)
             {
@@ -440,14 +421,44 @@ fn is_react_component_node<'a>(
                 && let Some(callee_name) = call.callee_name()
             {
                 // Check for HOC patterns
-                if is_hoc_call(callee_name, ctx) {
+                if is_component_wrapper_call(call, ctx) {
+                    let mut inner_component =
+                        call.arguments.first()?.as_expression()?.get_inner_expression();
+                    while let Expression::CallExpression(inner_call) = inner_component {
+                        if !is_component_wrapper_call(inner_call, ctx) {
+                            return None;
+                        }
+                        inner_component =
+                            inner_call.arguments.first()?.as_expression()?.get_inner_expression();
+                    }
+                    match inner_component {
+                        Expression::ClassExpression(class) => {
+                            if !is_es6_component_class(class)
+                                || class_has_static_display_name(class)
+                            {
+                                return None;
+                            }
+                            let reported_via_class_symbol = class.id.as_ref().is_some_and(|id| {
+                                is_react_component_name(&id.name) && class_returns_jsx(class, ctx)
+                            });
+                            if class.id.is_some()
+                                && (!ignore_transpiler_name || reported_via_class_symbol)
+                            {
+                                return None;
+                            }
+                        }
+                        Expression::FunctionExpression(_)
+                        | Expression::ArrowFunctionExpression(_)
+                        | Expression::Identifier(_) => {}
+                        _ => return None,
+                    }
+
                     // Handle React.memo(React.forwardRef(...)) - skip if version compatible
                     if callee_name.ends_with("memo")
                         && let Some(first_arg) = call.arguments.first()
                         && let Some(Expression::CallExpression(inner_call)) =
                             first_arg.as_expression()
-                        && let Some(inner_callee_name) = inner_call.callee_name()
-                        && is_hoc_call(inner_callee_name, ctx)
+                        && is_component_wrapper_call(inner_call, ctx)
                         && version_cache.get_memo_forwardref_compatible(ctx)
                     {
                         return None;
@@ -473,7 +484,6 @@ fn is_react_component_node<'a>(
                     });
                 }
 
-                // Check for createReactClass
                 if callee_name == "createClass" || callee_name == "createReactClass" {
                     if !has_create_react_class_display_name(call, ignore_transpiler_name) {
                         return Some(ReactComponentInfo {
@@ -488,8 +498,11 @@ fn is_react_component_node<'a>(
 
             // Check for function/arrow function components with JSX
             if let Some(expr) = &decl.init {
-                // Check if it's a direct component (has JSX directly)
-                if expression_contains_jsx(expr) {
+                // Check if it's a direct component (returns JSX directly)
+                let returns_jsx = expression_returns(expr, ctx).has_jsx();
+                if returns_jsx
+                    && name.as_ref().is_some_and(|name| is_react_component_name(name.as_str()))
+                {
                     return Some(ReactComponentInfo {
                         span: decl.id.span(),
                         is_context: false,
@@ -498,16 +511,22 @@ fn is_react_component_node<'a>(
                 }
 
                 // Check if it's a HOF pattern
-                if let Some(innermost) = find_innermost_function_with_jsx(expr, ctx) {
-                    let inner_has_name = match innermost {
-                        InnermostFunction::Function(func) => func.id.is_some(),
-                        InnermostFunction::ArrowFunction => false,
+                if !returns_jsx && let Some(innermost) = find_innermost_function_with_jsx(expr, ctx)
+                {
+                    let inner_span = match innermost {
+                        InnermostFunction::Function(func) => func
+                            .id
+                            .is_none()
+                            .then_some(Span::new(func.span.start, func.params.span.end)),
+                        InnermostFunction::ArrowFunction(func) => {
+                            Some(Span::new(func.span.start, func.params.span.end))
+                        }
                     };
 
                     // Only treat as HOF if inner function is unnamed
-                    if !inner_has_name {
+                    if let Some(span) = inner_span {
                         return Some(ReactComponentInfo {
-                            span: decl.id.span(),
+                            span,
                             is_context: false,
                             name: None, // HOF doesn't use variable name
                         });
@@ -520,7 +539,7 @@ fn is_react_component_node<'a>(
             // Check for object expressions with methods
             if let Some(Expression::ObjectExpression(obj_expr)) = &decl.init
                 && let Some(name) = &name
-                && has_component_methods_in_object(obj_expr, ignore_transpiler_name)
+                && has_component_methods_in_object(obj_expr, ctx, ignore_transpiler_name)
             {
                 return Some(ReactComponentInfo {
                     span: decl.id.span(),
@@ -539,7 +558,7 @@ fn is_react_component_node<'a>(
                     return None; // Has static displayName
                 }
 
-                if class_contains_jsx(class) {
+                if class_returns_jsx(class, ctx) {
                     return Some(ReactComponentInfo {
                         span: class.span,
                         is_context: false,
@@ -553,8 +572,8 @@ fn is_react_component_node<'a>(
             if let Some(name) = &func.id
                 && is_react_component_name(&name.name)
             {
-                // Check if function directly contains JSX
-                if function_contains_jsx(func) {
+                // Check if function directly returns JSX
+                if function_returns(func, ctx).has_jsx() {
                     return Some(ReactComponentInfo {
                         span: func.span,
                         is_context: false,
@@ -609,6 +628,7 @@ fn is_react_component_node<'a>(
 /// Check if an object expression has component methods
 fn has_component_methods_in_object(
     obj_expr: &ObjectExpression,
+    ctx: &LintContext,
     ignore_transpiler_name: bool,
 ) -> bool {
     for prop in &obj_expr.properties {
@@ -617,7 +637,7 @@ fn has_component_methods_in_object(
             && obj_prop.method
             && ignore_transpiler_name
             && is_react_component_name(&ident.name)
-            && matches!(&obj_prop.value, Expression::FunctionExpression(f) if function_contains_jsx(f))
+            && matches!(&obj_prop.value, Expression::FunctionExpression(f) if function_returns(f, ctx).has_jsx())
         {
             return true;
         }
@@ -627,43 +647,35 @@ fn has_component_methods_in_object(
 
 /// Handle anonymous export default components
 fn is_anonymous_export_component(
-    export: &oxc_ast::ast::ExportDefaultDeclaration,
+    export: &ExportDefaultDeclaration,
+    ctx: &LintContext,
     ignore_transpiler_name: bool,
 ) -> Option<ReactComponentInfo> {
     match &export.declaration {
         ExportDefaultDeclarationKind::ArrowFunctionExpression(func)
-            // Uses visitor pattern to handle JSX in nested control flow
-            if function_body_contains_jsx(&func.body) => {
-                return Some(ReactComponentInfo {
-                    span: export.span,
-                    is_context: false,
-                    name: None,
-                });
-            }
+            if arrow_function_returns(func, ctx).has_jsx() =>
+        {
+            return Some(ReactComponentInfo { span: export.span, is_context: false, name: None });
+        }
         ExportDefaultDeclarationKind::FunctionExpression(func)
-            // Uses visitor pattern to handle JSX in nested control flow
-            if function_contains_jsx(func) && (func.id.is_none() || ignore_transpiler_name) => {
+            if function_returns(func, ctx).has_jsx()
+                && (func.id.is_none() || ignore_transpiler_name) =>
+        {
+            return Some(ReactComponentInfo { span: export.span, is_context: false, name: None });
+        }
+        ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
+            // Named default-export functions are handled in phase 1 via symbols/references.
+            // Keep this path for anonymous default-export functions only.
+            if func.id.is_none() && function_returns(func, ctx).has_jsx() {
                 return Some(ReactComponentInfo {
                     span: export.span,
                     is_context: false,
                     name: None,
-                });
-            }
-        ExportDefaultDeclarationKind::FunctionDeclaration(func) => {
-            if let Some(name) = &func.id
-                && ignore_transpiler_name
-                && is_react_component_name(&name.name)
-                && function_contains_jsx(func)
-            {
-                return Some(ReactComponentInfo {
-                    span: export.span,
-                    is_context: false,
-                    name: Some(CompactStr::from(name.name.as_str())),
                 });
             }
         }
         ExportDefaultDeclarationKind::ClassDeclaration(class) => {
-            return check_class_component(class, export.span, ignore_transpiler_name);
+            return check_class_component(class, export.span, ctx, ignore_transpiler_name);
         }
         _ => {}
     }
@@ -672,8 +684,9 @@ fn is_anonymous_export_component(
 
 /// Check if a class is a React component that needs displayName
 fn check_class_component(
-    class: &oxc_ast::ast::Class,
+    class: &Class,
     span: Span,
+    ctx: &LintContext,
     ignore_transpiler_name: bool,
 ) -> Option<ReactComponentInfo> {
     // Named default-export classes are handled in phase 1 via symbols/references.
@@ -686,7 +699,7 @@ fn check_class_component(
         return None;
     }
 
-    if !class_contains_jsx(class) {
+    if !class_returns_jsx(class, ctx) {
         return None;
     }
 
@@ -695,7 +708,7 @@ fn check_class_component(
         return Some(ReactComponentInfo { span, is_context: false, name: None });
     }
 
-    if extends_react_component(class) {
+    if is_es6_component_class(class) {
         return Some(ReactComponentInfo { span, is_context: false, name: None });
     }
 
@@ -704,9 +717,10 @@ fn check_class_component(
 
 /// Handle module.exports assignments
 fn is_module_exports_component(
-    assign: &oxc_ast::ast::AssignmentExpression,
+    assign: &AssignmentExpression,
     ignore_transpiler_name: bool,
     check_context_objects: bool,
+    ctx: &LintContext,
 ) -> Option<ReactComponentInfo> {
     if let AssignmentTarget::StaticMemberExpression(member) = &assign.left
         && let Expression::Identifier(ident) = &member.object
@@ -715,23 +729,24 @@ fn is_module_exports_component(
     {
         match &assign.right {
             Expression::ArrowFunctionExpression(func)
-                // Uses visitor pattern to handle JSX in nested control flow
-                if function_body_contains_jsx(&func.body) => {
-                    return Some(ReactComponentInfo {
-                        span: assign.span,
-                        is_context: false,
-                        name: None,
-                    });
-                }
+                if arrow_function_returns(func, ctx).has_jsx() =>
+            {
+                return Some(ReactComponentInfo {
+                    span: assign.span,
+                    is_context: false,
+                    name: None,
+                });
+            }
             Expression::FunctionExpression(func)
-                // Uses visitor pattern to handle JSX in nested control flow
-                if function_contains_jsx(func) && (func.id.is_none() || ignore_transpiler_name) => {
-                    return Some(ReactComponentInfo {
-                        span: assign.span,
-                        is_context: false,
-                        name: None,
-                    });
-                }
+                if function_returns(func, ctx).has_jsx()
+                    && (func.id.is_none() || ignore_transpiler_name) =>
+            {
+                return Some(ReactComponentInfo {
+                    span: assign.span,
+                    is_context: false,
+                    name: None,
+                });
+            }
             Expression::CallExpression(call) => {
                 if let Some(callee_name) = call.callee_name() {
                     if callee_name == "createClass" || callee_name == "createReactClass" {
@@ -806,7 +821,7 @@ fn test_react_version_for_memo_forwardref_internal(version: Option<&ReactVersion
 
 /// Check if a createReactClass call has a displayName property
 fn has_create_react_class_display_name(
-    call: &oxc_ast::ast::CallExpression,
+    call: &CallExpression,
     ignore_transpiler_name: bool,
 ) -> bool {
     call.arguments.iter().any(|arg| {
@@ -825,25 +840,23 @@ fn has_create_react_class_display_name(
 }
 
 /// Check if a class has a static displayName property
-fn class_has_static_display_name(class: &oxc_ast::ast::Class) -> bool {
+fn class_has_static_display_name(class: &Class) -> bool {
     class.body.body.iter().any(|element| match element {
         ClassElement::MethodDefinition(method_def) => {
-            method_def.r#static
-                && method_def.key.static_name() == Some(std::borrow::Cow::Borrowed("displayName"))
+            method_def.r#static && method_def.key.is_specific_static_name("displayName")
         }
         ClassElement::PropertyDefinition(prop_def) => {
-            prop_def.r#static
-                && prop_def.key.static_name() == Some(std::borrow::Cow::Borrowed("displayName"))
+            prop_def.r#static && prop_def.key.is_specific_static_name("displayName")
         }
         _ => false,
     })
 }
 
-/// Check if a class contains JSX in any of its methods
-fn class_contains_jsx(class: &oxc_ast::ast::Class) -> bool {
+/// Check if a class returns JSX from any of its methods.
+fn class_returns_jsx(class: &Class, ctx: &LintContext) -> bool {
     class.body.body.iter().any(|element| {
         if let ClassElement::MethodDefinition(method_def) = element {
-            return function_contains_jsx(&method_def.value);
+            return function_returns(&method_def.value, ctx).has_jsx();
         }
         false
     })
@@ -854,6 +867,11 @@ fn test() {
     use crate::tester::Tester;
 
     let pass = vec![
+        (
+            "const createHandler = () => () => { someGlobalFunc(<div />); };",
+            None,
+            None,
+        ),
         (
             "
                     var Hello = createReactClass({
@@ -1755,9 +1773,80 @@ fn test() {
             Some(serde_json::json!([{ "checkContextObjects": true }])),
             None,
         ),
+        (
+            "
+                    export default function Hello() {
+                      return <div>Hello {this.props.name}</div>;
+                    }
+                    Hello.displayName = 'Hello';
+                  ",
+            Some(serde_json::json!([{ "ignoreTranspilerName": true }])),
+            None,
+        ),
+        (
+            "
+                    export default function Testing() {
+                      const renderThing = () => <div>Thing</div>;
+                      return <div>{renderThing()}</div>;
+                    }
+                    Testing.displayName = 'Testing';
+                  ",
+            Some(serde_json::json!([{ "ignoreTranspilerName": true }])),
+            None,
+        ),
+        (
+            "
+                    import React from 'react';
+
+                    type Props = { onSubmit: () => void };
+                    type HOCProps = { label: string };
+
+                    export const HOC =
+                      ({ label }: HOCProps) =>
+                      // eslint-disable-next-line react/display-name
+                      ({ onSubmit }: Props): JSX.Element => <button onClick={onSubmit}>{label}</button>;",
+            None,
+            None,
+        ),
+        (
+            r#"
+                const createMemo = (fn) => fn;
+                export function useLookup() {
+                    const memo = createMemo((a, b) => a + b);
+                    const value = memo("x", "y");
+                    return value;
+                }
+            "#,
+            None,
+            None,
+        ),
+        ("const memo = fn => fn; const Component = memo(() => <li />);", None, None),
+        (r#"const forwardRef = fn => fn; const value = forwardRef("x");"#, None, None),
+        (r#"import { memo } from 'react'; const value = memo("x");"#, None, None),
+        (r#"import { forwardRef } from 'react'; const value = forwardRef("x");"#, None, None),
+        ("const forwardRef = fn => fn; const Component = forwardRef(() => <li />);", None, None),
+        ("import { memo } from 'other'; const Component = memo(() => <li />);", None, None),
+        ("import { memo } from 'react'; function useValue(memo) { const value = memo(() => <li />); }", None, None),
+        ("const utils = { memo: fn => fn }; const Component = utils.memo(() => <li />);", None, None),
+        ("const memo = fn => fn; const make = () => memo(() => <li />);", None, None),
+        ("import { memo } from 'react'; const value = memo();", None, None),
+        ("const value = React.memo(42);", None, None),
+        ("const value = React.forwardRef(null);", None, None),
+        ("const value = React.memo({});", None, None),
+        ("const value = React.memo(...components);", None, None),
+        ("const value = React.memo(getComponent());", None, None),
+        (r#"const value = React.memo(React.forwardRef("x"));"#, None, None),
+        ("const C = React.memo(class C extends React.Component { render() { return <div />; } });", None, None),
+        (r#"const C = React.memo(class extends React.Component { static displayName = "C"; render() { return <div />; } });"#, None, None),
+        ("const C = React.memo(class { render() { return <div />; } });", None, None),
     ];
 
     let fail = vec![
+        (
+            "export default () => { const view = <div/>; return view; };",
+            None,
+            None,
+        ),
         (
             r#"
                     var Hello = createReactClass({
@@ -2111,10 +2200,25 @@ fn test() {
         ),
         (
             "
-                    const renderer = a => listItem => (
-                      <div>{a} {listItem}</div>
-                    );
-                  ",
+                    import React from 'react';
+
+                    type Props = { onSubmit: () => void };
+                    type HOCProps = { label: string };
+
+                    export const HOC =
+                      ({ label }: HOCProps) =>
+                      ({ onSubmit }: Props): JSX.Element => <button onClick={onSubmit}>{label}</button>;",
+            None,
+            None,
+        ),
+        (
+            "
+                    const HOC = () =>
+                      (props) => {
+                        /* eslint-disable react/display-name */
+                        return <div />;
+                        /* eslint-enable react/display-name */
+                      };",
             None,
             None,
         ),
@@ -2195,6 +2299,47 @@ fn test() {
                     Hello = React.createContext();
                   ",
             Some(serde_json::json!([{ "checkContextObjects": true }])),
+            None,
+        ),
+        (
+            "export default function Hello() {
+  return <div>Hello {this.props.name}</div>;
+}",
+            Some(serde_json::json!([{ "ignoreTranspilerName": true }])),
+            None,
+        ),
+        ("import { memo } from 'react'; const Component = memo(() => <li />);", None, None),
+        ("import { forwardRef } from 'react'; const Component = forwardRef(() => <li />);", None, None),
+        (r#"const { memo } = require("react"); const Component = memo(() => <li />);"#, None, None),
+        ("const { forwardRef } = React; const Component = forwardRef(() => <li />);", None, None),
+        ("const memo = React.memo; const Component = memo(() => <li />);", None, None),
+        (r#"const forwardRef = require("react").forwardRef; const Component = forwardRef(() => <li />);"#, None, None),
+        ("import { memo } from 'react'; const Component = memo(function () {});", None, None),
+        (
+            "const memo = fn => fn; const Component = memo(() => <li />);",
+            None,
+            Some(serde_json::json!({ "settings": { "react": { "componentWrapperFunctions": ["memo"] } } })),
+        ),
+        ("const C = React.memo(class extends React.Component { render() { return <div />; } });", None, None),
+        ("const C = React.memo(class extends React.Component {});", None, None),
+        (
+            "const C = React.memo(class Named extends React.Component { render() { return null; } });",
+            Some(serde_json::json!([{ "ignoreTranspilerName": true }])),
+            None,
+        ),
+        (
+            "const C = React.memo(class Named extends React.Component {});",
+            Some(serde_json::json!([{ "ignoreTranspilerName": true }])),
+            None,
+        ),
+        (
+            "const C = React.memo(class named extends React.Component { render() { return <div />; } });",
+            Some(serde_json::json!([{ "ignoreTranspilerName": true }])),
+            None,
+        ),
+        (
+            "const C = React.memo(class Named extends React.Component { render() { return <div />; } });",
+            Some(serde_json::json!([{ "ignoreTranspilerName": true }])),
             None,
         ),
     ];

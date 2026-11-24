@@ -1,10 +1,10 @@
 use std::str;
 
-use oxc_allocator::{Allocator, Vec as ArenaVec};
+use oxc_allocator::{Allocator, ArenaVec};
 use oxc_ast::ast::*;
 use oxc_ast_visit::Visit;
 use oxc_semantic::{NodeId, Reference, Scoping};
-use oxc_span::SPAN;
+use oxc_span::{SPAN, Span};
 use oxc_str::Ident;
 use oxc_syntax::{
     reference::{ReferenceFlags, ReferenceId},
@@ -143,7 +143,7 @@ impl<'a> TraverseScoping<'a> {
     /// `flags` provided are amended to inherit from parent scope's flags.
     pub fn insert_scope_below_statements(
         &mut self,
-        stmts: &ArenaVec<Statement>,
+        stmts: &ArenaVec<'a, Statement<'a>>,
         flags: ScopeFlags,
     ) -> ScopeId {
         let mut collector = ChildScopeCollector::new();
@@ -157,10 +157,8 @@ impl<'a> TraverseScoping<'a> {
         child_scope_ids: &[ScopeId],
         flags: ScopeFlags,
     ) -> ScopeId {
-        // Create new scope as child of parent
         let new_scope_id = self.create_child_scope(scope_id, flags);
 
-        // Set scopes as children of new scope instead
         for &child_id in child_scope_ids {
             self.scoping.set_scope_parent_id(child_id, Some(new_scope_id));
         }
@@ -237,7 +235,19 @@ impl<'a> TraverseScoping<'a> {
         scope_id: ScopeId,
         flags: SymbolFlags,
     ) -> SymbolId {
-        let symbol_id = self.scoping.create_symbol(SPAN, name, flags, scope_id, NodeId::DUMMY);
+        self.add_spanned_binding(name, SPAN, scope_id, flags)
+    }
+
+    /// Add binding to `ScopeTree` and `SymbolTable` with a source span.
+    #[inline]
+    pub(crate) fn add_spanned_binding(
+        &mut self,
+        name: Ident<'_>,
+        span: Span,
+        scope_id: ScopeId,
+        flags: SymbolFlags,
+    ) -> SymbolId {
+        let symbol_id = self.scoping.create_symbol(span, name, flags, scope_id, NodeId::DUMMY);
         self.scoping.add_binding(scope_id, name, symbol_id);
 
         symbol_id
@@ -252,7 +262,20 @@ impl<'a> TraverseScoping<'a> {
         scope_id: ScopeId,
         flags: SymbolFlags,
     ) -> BoundIdentifier<'a> {
-        let symbol_id = self.add_binding(name, scope_id, flags);
+        self.generate_spanned_binding(name, SPAN, scope_id, flags)
+    }
+
+    /// Generate binding with a source span.
+    ///
+    /// Creates a symbol with the provided name, span, and flags and adds it to the specified scope.
+    pub fn generate_spanned_binding(
+        &mut self,
+        name: Ident<'a>,
+        span: Span,
+        scope_id: ScopeId,
+        flags: SymbolFlags,
+    ) -> BoundIdentifier<'a> {
+        let symbol_id = self.add_spanned_binding(name, span, scope_id, flags);
         BoundIdentifier::new(name, symbol_id)
     }
 
@@ -351,6 +374,25 @@ impl<'a> TraverseScoping<'a> {
     /// Delete reference for an `IdentifierReference`.
     pub fn delete_reference_for_identifier(&mut self, ident: &IdentifierReference) {
         self.delete_reference(ident.reference_id(), ident.name);
+    }
+
+    /// Rebind an existing reference to `symbol_id`.
+    ///
+    /// The reference keeps its `ReferenceId` and flags. It is removed from the resolved references
+    /// of the symbol it currently points to (or from root unresolved references if it is
+    /// unresolved), and added to the resolved references of `symbol_id`.
+    ///
+    /// Provided `name` must be the current name of `reference_id`.
+    /// This does not change the name of the `IdentifierReference` in the AST.
+    pub fn rebind_reference(
+        &mut self,
+        reference_id: ReferenceId,
+        name: Ident<'_>,
+        symbol_id: SymbolId,
+    ) {
+        self.delete_reference(reference_id, name);
+        self.scoping.get_reference_mut(reference_id).set_symbol_id(symbol_id);
+        self.scoping.add_resolved_reference(symbol_id, reference_id);
     }
 }
 

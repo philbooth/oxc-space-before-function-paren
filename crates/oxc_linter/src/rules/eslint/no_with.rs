@@ -40,7 +40,9 @@ declare_oxc_lint!(
     NoWith,
     eslint,
     correctness,
+    recommended,
     version = "0.2.14",
+    short_description = "Disallow `with` statements.",
 );
 
 impl Rule for NoWith {

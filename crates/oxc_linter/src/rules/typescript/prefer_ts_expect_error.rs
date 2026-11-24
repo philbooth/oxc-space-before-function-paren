@@ -56,8 +56,9 @@ declare_oxc_lint!(
     PreferTsExpectError,
     typescript,
     pedantic,
-    fix,
+    suggestion,
     version = "0.2.11",
+    short_description = "Enforce using @ts-expect-error over @ts-ignore.",
 );
 
 impl Rule for PreferTsExpectError {
@@ -67,26 +68,32 @@ impl Rule for PreferTsExpectError {
         for comment in comments {
             let raw = ctx.source_range(comment.content_span());
 
-            if !is_valid_ts_ignore_present(*comment, raw) {
+            if !is_valid_ts_ignore_present(comment, raw) {
                 continue;
             }
 
             if comment.is_line() {
                 let comment_span = comment.span;
-                ctx.diagnostic_with_fix(prefer_ts_expect_error_diagnostic(comment_span), |fixer| {
-                    fixer.replace(
-                        comment_span,
-                        format!("//{}", raw.cow_replace("@ts-ignore", "@ts-expect-error")),
-                    )
-                });
+                ctx.diagnostic_with_suggestion(
+                    prefer_ts_expect_error_diagnostic(comment_span),
+                    |fixer| {
+                        fixer.replace(
+                            comment_span,
+                            format!("//{}", raw.cow_replace("@ts-ignore", "@ts-expect-error")),
+                        )
+                    },
+                );
             } else {
                 let comment_span = comment.span;
-                ctx.diagnostic_with_fix(prefer_ts_expect_error_diagnostic(comment_span), |fixer| {
-                    fixer.replace(
-                        comment_span,
-                        format!("/*{}*/", raw.cow_replace("@ts-ignore", "@ts-expect-error")),
-                    )
-                });
+                ctx.diagnostic_with_suggestion(
+                    prefer_ts_expect_error_diagnostic(comment_span),
+                    |fixer| {
+                        fixer.replace(
+                            comment_span,
+                            format!("/*{}*/", raw.cow_replace("@ts-ignore", "@ts-expect-error")),
+                        )
+                    },
+                );
             }
         }
     }
@@ -96,18 +103,18 @@ impl Rule for PreferTsExpectError {
     }
 }
 
-fn get_last_comment_line(comment: Comment, raw: &str) -> String {
+fn get_last_comment_line<'a>(comment: &Comment, raw: &'a str) -> &'a str {
     if comment.is_line() {
-        return String::from(raw);
+        return raw;
     }
 
-    String::from(raw.lines().last().unwrap_or(raw))
+    raw.lines().last().unwrap_or(raw)
 }
 
-fn is_valid_ts_ignore_present(comment: Comment, raw: &str) -> bool {
+fn is_valid_ts_ignore_present(comment: &Comment, raw: &str) -> bool {
     let line = get_last_comment_line(comment, raw);
 
-    if comment.is_line() { test_single_line_comment(&line) } else { test_multi_line_comment(&line) }
+    if comment.is_line() { test_single_line_comment(line) } else { test_multi_line_comment(line) }
 }
 
 fn test_single_line_comment(line: &str) -> bool {
@@ -121,7 +128,7 @@ fn test_multi_line_comment(line: &str) -> bool {
 
 #[test]
 fn test() {
-    use crate::tester::Tester;
+    use crate::{fixer::FixKind, tester::Tester};
 
     let pass = vec![
         "// @ts-nocheck",
@@ -224,6 +231,13 @@ console.log('hello');
             None,
         ),
     ];
+
+    let mut fix = fix
+        .into_iter()
+        .map(|(source, expected, config)| (source, expected, config, FixKind::Suggestion))
+        .collect::<Vec<_>>();
+    let ts_ignore = "// @ts-ignore\nconst n: number = 1;\n";
+    fix.push((ts_ignore, ts_ignore, None, FixKind::SafeFix));
 
     Tester::new(PreferTsExpectError::NAME, PreferTsExpectError::PLUGIN, pass, fail)
         .expect_fix(fix)

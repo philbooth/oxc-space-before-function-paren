@@ -16,7 +16,7 @@ declare_oxc_lint!(NoTestReturnStatement, jest, style, docs = DOCUMENTATION, vers
 impl Rule for NoTestReturnStatement {
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
         match node.kind() {
-            AstKind::CallExpression(_) | AstKind::Function(_) => {}
+            AstKind::ReturnStatement(_) => {}
             _ => return,
         }
         run(node, ctx);
@@ -26,8 +26,6 @@ impl Rule for NoTestReturnStatement {
 #[test]
 fn test() {
     use crate::tester::Tester;
-
-    // Note: Both Jest and Vitest share the same unit tests
 
     let pass = vec![
         ("it('noop', () => {});", None),
@@ -64,6 +62,29 @@ fn test() {
                 it('one', () => expect(1).toBe(1));
                 function myHelper() {}
             ",
+            None,
+        ),
+        (
+            "
+                function myHelper() {
+                    return expect(1).toBe(1);
+                }
+            ",
+            None,
+        ),
+        (
+            "
+                it('one', () => {
+                    function myHelper() {
+                        return expect(1).toBe(1);
+                    }
+                });
+            ",
+            None,
+        ),
+        (
+            r"const test = (name, callback) => callback();
+            test('foo', () => { return expect(1).toBe(1); });",
             None,
         ),
     ];
@@ -132,6 +153,19 @@ fn test() {
                     return expect(1).toBe(1);
                 }
             ",
+            None,
+        ),
+        (
+            r"import { test as customTest } from '@jest/globals';
+            customTest('foo', () => { return expect(1).toBe(1); });",
+            None,
+        ),
+        (
+            r"import { it as customTest } from '@jest/globals';
+            function callback() {
+                return expect(1).toBe(1);
+            }
+            customTest('foo', callback);",
             None,
         ),
     ];

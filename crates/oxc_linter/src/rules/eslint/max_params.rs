@@ -31,7 +31,7 @@ pub struct MaxParams(Box<MaxParamsConfig>);
 pub struct MaxParamsConfig {
     /// Maximum number of parameters allowed in function definitions.
     #[serde(alias = "maximum")]
-    max: usize,
+    max: u32,
     /// This option controls when to count a `this` parameter.
     ///
     /// - "always": always count `this`
@@ -81,6 +81,14 @@ impl MaxParamsConfig {
     }
 }
 
+#[derive(Debug, JsonSchema, Deserialize)]
+#[serde(untagged)]
+#[expect(unused)]
+enum MaxParamsConfigEnum {
+    Number(u32),
+    Object(MaxParamsConfig),
+}
+
 impl MaxParams {
     fn should_count_this_param(&self, is_void_this: bool) -> bool {
         match self.count_this() {
@@ -90,8 +98,9 @@ impl MaxParams {
         }
     }
 
-    fn ts_function_type_param_count(&self, function: &TSFunctionType) -> usize {
-        let mut real_len = function.params.items.len();
+    #[expect(clippy::cast_possible_truncation)] // the length of parameters can't be over u32::MAX, because the source code is already limited by u32::MAX.
+    fn ts_function_type_param_count(&self, function: &TSFunctionType) -> u32 {
+        let mut real_len = function.params.parameters_count() as u32;
         if let Some(this_params) = &function.this_param {
             let is_void_this = this_params
                 .type_annotation
@@ -149,8 +158,10 @@ declare_oxc_lint!(
     MaxParams,
     eslint,
     style,
-    config = MaxParamsConfig,
+    config = MaxParamsConfigEnum,
     version = "0.2.14",
+    short_description =
+        "Enforce a maximum number of parameters in function definitions which by default is three.",
 );
 
 impl Rule for MaxParams {
@@ -159,23 +170,22 @@ impl Rule for MaxParams {
             .get(0)
             .and_then(Value::as_number)
             .and_then(serde_json::Number::as_u64)
-            .and_then(|v| usize::try_from(v).ok())
+            .and_then(|v| u32::try_from(v).ok())
         {
             Ok(Self(Box::new(MaxParamsConfig { max, ..MaxParamsConfig::default() })))
         } else {
-            serde_json::from_value::<DefaultRuleConfig<Self>>(value)
-                .map(DefaultRuleConfig::into_inner)
+            DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
         }
     }
 
+    #[expect(clippy::cast_possible_truncation)] // the length of parameters can't be over u32::MAX, because the source code is already limited by u32::MAX.
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
         match node.kind() {
             AstKind::Function(function) => {
                 if !function.is_declaration() & !function.is_expression() {
                     return;
                 }
-                let params = &function.params;
-                let mut real_len = params.items.len();
+                let mut real_len = function.params.parameters_count() as u32;
                 if let Some(this_params) = &function.this_param {
                     let is_void_this = this_params
                         .type_annotation
@@ -205,16 +215,16 @@ impl Rule for MaxParams {
                     }
                 }
             }
-            AstKind::ArrowFunctionExpression(function)
-                if function.params.items.len() > self.max =>
-            {
-                let error_msg = format!(
-                    "Arrow function has too many parameters ({}). Maximum allowed is {}.",
-                    function.params.items.len(),
-                    self.max
-                );
-                let span = function.params.span;
-                ctx.diagnostic(max_params_diagnostic(&error_msg, span));
+            AstKind::ArrowFunctionExpression(function) => {
+                let real_len = function.params.parameters_count() as u32;
+                if real_len > self.max {
+                    let error_msg = format!(
+                        "Arrow function has too many parameters ({}). Maximum allowed is {}.",
+                        real_len, self.max
+                    );
+                    let span = function.params.span;
+                    ctx.diagnostic(max_params_diagnostic(&error_msg, span));
+                }
             }
             AstKind::TSFunctionType(function) => {
                 let real_len = self.ts_function_type_param_count(function);
@@ -326,6 +336,14 @@ fn test() {
             "function foo(this: void, a, b, c) {}",
             Some(serde_json::json!([{ "max": 3, "countThis": "except-void" }])),
         ),
+        ("function foo(a, b, ...rest) {}", None),
+        ("const foo = function(a, b, ...rest) {};", None),
+        ("const foo = (a, b, ...rest) => {};", None),
+        ("function foo(...rest) {}", Some(serde_json::json!([1]))),
+        ("const foo = (...rest) => {};", Some(serde_json::json!([1]))),
+        ("type Foo = (a: number, b: number, ...rest: number[]) => void;", None),
+        ("function foo(this: void, a, b, ...rest) {}", None),
+        ("type Foo = (this: void, a: number, b: number, ...rest: number[]) => void;", None),
     ];
 
     let fail = vec![
@@ -423,6 +441,26 @@ fn test() {
         (
             "function foo(this: unknown[], a, b, c) {}",
             Some(serde_json::json!([{ "max": 3, "countThis": "except-void" }])),
+        ),
+        ("export function f(a, b, c, ...rest) { return rest; }", None),
+        ("export function g(a, b, c, d) { return d; }", None),
+        ("const foo = function(a, b, c, ...rest) {};", None),
+        ("const foo = (a, b, c, ...rest) => {};", None),
+        ("const foo = { method(a, b, c, ...rest) {} };", None),
+        ("class Foo { constructor(a, b, c, ...rest) {} }", None),
+        ("function foo(...rest) {}", Some(serde_json::json!([0]))),
+        ("const foo = (...rest) => {};", Some(serde_json::json!([0]))),
+        ("type Foo = (...rest: number[]) => void;", Some(serde_json::json!([0]))),
+        ("type Foo = (a: number, b: number, c: number, ...rest: number[]) => void;", None),
+        ("declare function foo(a: number, b: number, c: number, ...rest: number[]): void;", None),
+        ("function foo(this: void, a, b, c, ...rest) {}", None),
+        (
+            "function foo(this: void, ...rest) {}",
+            Some(serde_json::json!([{ "max": 1, "countThis": "always" }])),
+        ),
+        (
+            "type Foo = (this: void, ...rest: number[]) => void;",
+            Some(serde_json::json!([{ "max": 1, "countThis": "always" }])),
         ),
     ];
 

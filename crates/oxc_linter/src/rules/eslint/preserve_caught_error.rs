@@ -1,9 +1,12 @@
-use oxc_ast::AstKind;
-use oxc_ast::ast::{
-    Argument, BindingPattern, CatchClause, Expression, Function, IdentifierReference,
-    ObjectExpression, ObjectPropertyKind, PropertyKey, ThrowStatement, TryStatement,
+use oxc_ast::{
+    AstKind,
+    ast::{
+        Argument, ArrowFunctionExpression, BindingPattern, CatchClause, Expression, Function,
+        IdentifierReference, ObjectExpression, ObjectPropertyKind, PropertyKey, StaticBlock,
+        ThrowStatement, TryStatement,
+    },
 };
-use oxc_ast_visit::Visit;
+use oxc_ast_visit::VisitJs;
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_semantic::{IsGlobalReference, ScopeFlags};
@@ -41,7 +44,8 @@ fn missing_catch_parameter_diagnostic(span: Span) -> OxcDiagnostic {
 #[schemars(rename_all = "camelCase")]
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 struct PreserveCaughtErrorOptions {
-    /// When set to `true`, requires that catch clauses always have a parameter.
+    /// When set to `true`, requires catch clauses that throw a new error to have a
+    /// caught error parameter, so the caught error is not discarded when re-throwing.
     require_catch_parameter: bool,
 }
 
@@ -49,24 +53,33 @@ struct PreserveCaughtErrorOptions {
 pub struct PreserveCaughtError(PreserveCaughtErrorOptions);
 
 struct ThrowFinder<'a, 'ctx> {
-    catch_param: &'a BindingPattern<'a>,
+    catch_param: Option<&'a BindingPattern<'a>>,
     ctx: &'ctx LintContext<'a>,
 }
 
-impl<'a> Visit<'a> for ThrowFinder<'a, '_> {
+impl<'a> VisitJs<'a> for ThrowFinder<'a, '_> {
     fn visit_throw_statement(&mut self, throw_stmt: &ThrowStatement<'a>) {
-        let (callee, args) = match &throw_stmt.argument {
-            Expression::NewExpression(new_expr) => (&new_expr.callee, &new_expr.arguments),
-            Expression::CallExpression(call_expr) => (&call_expr.callee, &call_expr.arguments),
+        let (callee, type_arguments, args) = match &throw_stmt.argument {
+            Expression::NewExpression(new_expr) => {
+                (&new_expr.callee, &new_expr.type_arguments, &new_expr.arguments)
+            }
+            Expression::CallExpression(call_expr) => {
+                (&call_expr.callee, &call_expr.type_arguments, &call_expr.arguments)
+            }
             _ => return,
         };
 
-        if !is_builtin_error_constructor(callee, self.ctx) {
+        let Some(options_argument_index) = error_options_argument_index(callee, self.ctx) else {
             return;
-        }
+        };
 
-        if let Some(Argument::ObjectExpression(obj_expr)) = args.get(1)
-            && has_cause_property(obj_expr, self.catch_param, self.ctx)
+        let Some(catch_param) = self.catch_param else {
+            self.ctx.diagnostic(missing_catch_parameter_diagnostic(throw_stmt.span));
+            return;
+        };
+
+        if let Some(Argument::ObjectExpression(obj_expr)) = args.get(options_argument_index)
+            && has_cause_property(obj_expr, catch_param, self.ctx)
         {
             return;
         }
@@ -77,22 +90,28 @@ impl<'a> Visit<'a> for ThrowFinder<'a, '_> {
         }
 
         self.ctx.diagnostic_with_fix(preserve_caught_error_diagnostic(throw_stmt.span), |fixer| {
-            let Some(ident) = self.catch_param.get_identifier_name() else {
+            let Some(ident) = catch_param.get_identifier_name() else {
                 return fixer.noop();
             };
+            // Keep the catch binding unchanged as part of each fix, so removing or renaming it
+            // conflicts with inserting a reference to it (e.g. `prefer-optional-catch-binding`).
+            let preserve_catch_param = || fixer.replace_with(catch_param, catch_param);
             let cause_prop_text = format!("cause: {}", ident.as_str());
 
             match args.len() {
                 0 => {
-                    // find starting `(` of call after callee
-                    let src = throw_stmt.argument.span().source_text(fixer.source_text());
-                    if let Some(start_paren_idx) = src.find('(') {
-                        let mut fix = fixer.new_fix_with_capacity(3);
-                        #[expect(clippy::cast_possible_truncation)]
-                        let span = Span::sized(
-                            throw_stmt.argument.span().start + start_paren_idx as u32,
-                            1,
-                        );
+                    // find starting `(` of call after the callee and its type arguments
+                    let args_start = match type_arguments {
+                        Some(type_args) => type_args.span.end,
+                        None => callee.span().end,
+                    };
+                    if let Some(offset) = fixer.find_next_token_within(
+                        args_start,
+                        throw_stmt.argument.span().end,
+                        "(",
+                    ) {
+                        let mut fix = fixer.new_fix_with_capacity(4);
+                        let span = Span::sized(args_start + offset, 1);
                         if let Expression::Identifier(ident) = callee
                             && is_aggregate_error(ident, self.ctx)
                         {
@@ -103,13 +122,13 @@ impl<'a> Visit<'a> for ThrowFinder<'a, '_> {
                         fix.push(
                             fixer.insert_text_after_range(span, format!("{{ {cause_prop_text} }}")),
                         );
-                        return fix.with_message(ADD_CAUSE_PROPERTY);
+                        return fix.extend(preserve_catch_param()).with_message(ADD_CAUSE_PROPERTY);
                     }
                 }
                 1 => {
                     let span = args[0].span();
                     // insert comma
-                    let mut fix = fixer.new_fix_with_capacity(3);
+                    let mut fix = fixer.new_fix_with_capacity(4);
                     if let Expression::Identifier(ident) = callee
                         && is_aggregate_error(ident, self.ctx)
                     {
@@ -120,7 +139,7 @@ impl<'a> Visit<'a> for ThrowFinder<'a, '_> {
                     fix.push(
                         fixer.insert_text_after_range(span, format!("{{ {cause_prop_text} }}")),
                     );
-                    return fix.with_message(ADD_CAUSE_PROPERTY);
+                    return fix.extend(preserve_catch_param()).with_message(ADD_CAUSE_PROPERTY);
                 }
                 2 => {
                     if let Expression::Identifier(ident) = callee
@@ -128,12 +147,12 @@ impl<'a> Visit<'a> for ThrowFinder<'a, '_> {
                     {
                         // AggregateError takes options as its third argument
                         let span = args[1].span();
-                        let mut fix = fixer.new_fix_with_capacity(2);
+                        let mut fix = fixer.new_fix_with_capacity(3);
                         fix.push(fixer.insert_text_after_range(span, ", "));
                         fix.push(
                             fixer.insert_text_after_range(span, format!("{{ {cause_prop_text} }}")),
                         );
-                        return fix.with_message(ADD_CAUSE_PROPERTY);
+                        return fix.extend(preserve_catch_param()).with_message(ADD_CAUSE_PROPERTY);
                     }
 
                     // if the second argument is an existing object, merge into it
@@ -151,15 +170,17 @@ impl<'a> Visit<'a> for ThrowFinder<'a, '_> {
                         if let Some(cause_prop) = cause_prop {
                             // if the identifier name is not the catch parameter, replace it
                             if let ObjectPropertyKind::ObjectProperty(prop) = cause_prop
-                                && !is_catch_parameter(&prop.value, self.catch_param, self.ctx)
+                                && !is_catch_parameter(&prop.value, catch_param, self.ctx)
                             {
                                 if prop.shorthand || prop.method || prop.kind.is_accessor() {
                                     return fixer
                                         .replace(prop.span(), cause_prop_text)
+                                        .extend(preserve_catch_param())
                                         .with_message(REPLACE_CAUSE_PROPERTY);
                                 }
                                 return fixer
                                     .replace(prop.value.span(), ident.as_str().to_string())
+                                    .extend(preserve_catch_param())
                                     .with_message(REPLACE_CAUSE_PROPERTY);
                             }
                         } else if obj_expr.properties.is_empty() {
@@ -168,14 +189,17 @@ impl<'a> Visit<'a> for ThrowFinder<'a, '_> {
                                     obj_expr.span().shrink_right(1),
                                     format!(" {cause_prop_text} "),
                                 )
+                                .extend(preserve_catch_param())
                                 .with_message(ADD_CAUSE_PROPERTY);
                         } else if let Some(last_prop) = obj_expr.properties.last() {
-                            let mut fix = fixer.new_fix_with_capacity(2);
+                            let mut fix = fixer.new_fix_with_capacity(3);
                             fix.push(fixer.insert_text_after_range(last_prop.span(), ", "));
                             fix.push(
                                 fixer.insert_text_after_range(last_prop.span(), cause_prop_text),
                             );
-                            return fix.with_message(ADD_CAUSE_PROPERTY);
+                            return fix
+                                .extend(preserve_catch_param())
+                                .with_message(ADD_CAUSE_PROPERTY);
                         }
                     }
                 }
@@ -186,22 +210,32 @@ impl<'a> Visit<'a> for ThrowFinder<'a, '_> {
         });
     }
 
-    // Do not traverse into nested functions/closures within the catch block
+    // Do not traverse into nested functions/closures or static blocks within the catch block
     fn visit_function(&mut self, _func: &Function<'a>, _flags: ScopeFlags) {}
+
+    fn visit_arrow_function_expression(&mut self, _arrow: &ArrowFunctionExpression<'a>) {}
+
+    fn visit_static_block(&mut self, _block: &StaticBlock<'a>) {}
 
     // Do not traverse into nested catch clauses. They have their own caught error and will be
     // analyzed separately when visiting their associated `TryStatement`.
     fn visit_catch_clause(&mut self, _catch_clause: &CatchClause<'a>) {}
 }
 
-fn is_builtin_error_constructor(expr: &Expression, ctx: &LintContext) -> bool {
+fn error_options_argument_index(expr: &Expression, ctx: &LintContext) -> Option<usize> {
     let Expression::Identifier(ident) = expr else {
-        return false;
+        return None;
     };
 
-    ident.is_global_reference_name(static_ident!("Error"), ctx.scoping())
+    if ident.is_global_reference_name(static_ident!("Error"), ctx.scoping())
         || ident.is_global_reference_name(static_ident!("TypeError"), ctx.scoping())
-        || is_aggregate_error(ident, ctx)
+    {
+        Some(1)
+    } else if is_aggregate_error(ident, ctx) {
+        Some(2)
+    } else {
+        None
+    }
 }
 
 fn is_aggregate_error(ident: &IdentifierReference, ctx: &LintContext) -> bool {
@@ -230,13 +264,11 @@ fn has_cause_property(
 }
 
 fn is_catch_parameter(expr: &Expression, catch_param: &BindingPattern, ctx: &LintContext) -> bool {
-    let oxc_ast::ast::BindingPattern::BindingIdentifier(binding) = &catch_param else {
+    let BindingPattern::BindingIdentifier(binding) = &catch_param else {
         return false;
     };
 
-    let Some(catch_symbol_id) = binding.symbol_id.get() else {
-        return false;
-    };
+    let catch_symbol_id = binding.symbol_id();
 
     let Expression::Identifier(ident) = expr else {
         return false;
@@ -283,9 +315,11 @@ declare_oxc_lint!(
     PreserveCaughtError,
     eslint,
     suspicious,
+    recommended,
     conditional_fix,
     config = PreserveCaughtErrorOptions,
     version = "1.16.0",
+    short_description = "Enforces that when re-throwing an error in a catch block, the original error is preserved using the 'cause' property.",
 );
 impl PreserveCaughtError {
     fn check_try_statement<'a>(&self, try_stmt: &'a TryStatement<'a>, ctx: &LintContext<'a>) {
@@ -295,19 +329,18 @@ impl PreserveCaughtError {
     }
 
     fn check_catch_clause<'a>(&self, catch_clause: &'a CatchClause<'a>, ctx: &LintContext<'a>) {
-        if let Some(catch_param) = &catch_clause.param {
-            let mut finder: ThrowFinder<'a, '_> =
-                ThrowFinder { catch_param: &catch_param.pattern, ctx };
-            finder.visit_block_statement(catch_clause.body.as_ref());
-        } else if self.0.require_catch_parameter {
-            ctx.diagnostic(missing_catch_parameter_diagnostic(catch_clause.span));
+        let catch_param = catch_clause.param.as_ref().map(|param| &param.pattern);
+        if catch_param.is_none() && !self.0.require_catch_parameter {
+            return;
         }
+        let mut finder = ThrowFinder { catch_param, ctx };
+        finder.visit_block_statement(catch_clause.body.as_ref());
     }
 }
 
 impl Rule for PreserveCaughtError {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        serde_json::from_value::<DefaultRuleConfig<Self>>(value).map(DefaultRuleConfig::into_inner)
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
     }
 
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
@@ -413,9 +446,55 @@ fn test() {
             r#"try { doSomething(); } catch (errorA) { try { doSomethingElse(); } catch (errorB) { throw new Error( `The certificate key "${chalk.yellow(keyFile)}" is invalid.\n${errorA.message}`, { cause: errorB }); } }"#,
             None,
         ),
+        (
+            r#"try { doSomething(); } catch (error) { throw new AggregateError([error], "aggregate", { cause: error }); }"#,
+            None,
+        ),
+        (
+            "try {
+					return JSON.parse(text);
+				} catch {
+					return {};
+				}",
+            Some(serde_json::json!([{ "requireCatchParameter": true }])),
+        ),
+        (
+            "try { doSomething(); } catch {}",
+            Some(serde_json::json!([{ "requireCatchParameter": true }])),
+        ),
+        (
+            r#"try { doSomething(); } catch { throw "failed"; }"#,
+            Some(serde_json::json!([{ "requireCatchParameter": true }])),
+        ),
+        (
+            r#"try {
+					doSomething();
+				} catch {
+					foo = { bar() { throw new Error("Something went wrong"); } };
+				}"#,
+            Some(serde_json::json!([{ "requireCatchParameter": true }])),
+        ),
+        (
+            r#"try { doSomething(); } catch (err) { const fail = () => { throw new Error("Something went wrong"); }; }"#,
+            None,
+        ),
+        (
+            r#"try { doSomething(); } catch (err) { class Foo { static { throw new Error("Something went wrong"); } } }"#,
+            None,
+        ),
+        (
+            r#"try { doSomething(); } catch { const fail = () => { throw new Error("Something went wrong"); }; }"#,
+            Some(serde_json::json!([{ "requireCatchParameter": true }])),
+        ),
+        (
+            r#"try { doSomething(); } catch { class Foo { static { throw new Error("Something went wrong"); } } }"#,
+            Some(serde_json::json!([{ "requireCatchParameter": true }])),
+        ),
     ];
 
     let fail = vec![
+        ("try { doSomething(); } catch (err) { throw new Error/* ( */(); }", None),
+        ("try { doSomething(); } catch (err) { throw new Error<() => void>(); }", None),
         (
             r#"try {
 			            doSomething();
@@ -665,9 +744,29 @@ fn test() {
 			}"#,
             None,
         ),
+        (
+            r#"try { doSomething(); } catch (error) { throw new AggregateError([error], "aggregate", { cause: unrelated }); }"#,
+            None,
+        ),
+        (
+            r#"try { doSomething(); } catch { if (shouldThrow) { throw new Error("Something went wrong"); } }"#,
+            Some(serde_json::json!([{ "requireCatchParameter": true }])),
+        ),
     ];
 
     let fix = vec![
+        // the `(` inside the comment is not the start of the arguments
+        (
+            "try { doSomething(); } catch (err) { throw new Error/* ( */(); }",
+            "try { doSomething(); } catch (err) { throw new Error/* ( */(\"\", { cause: err }); }",
+            None,
+        ),
+        // the `(` inside the type arguments is not the start of the arguments
+        (
+            "try { doSomething(); } catch (err) { throw new Error<() => void>(); }",
+            "try { doSomething(); } catch (err) { throw new Error<() => void>(\"\", { cause: err }); }",
+            None,
+        ),
         (
             r#"try {
                         doSomething();
@@ -750,7 +849,6 @@ fn test() {
             None,
         ),
         // Throws a new Error, cause property is present but value is a different identifier
-        // Note: This should actually be a valid case since e === err, but still reporting as it's hard to track.
         (
             r#"try {
                         doSomething();
@@ -864,7 +962,7 @@ fn test() {
             }"#,
             None,
         ),
-        // Multiple throw statements within a catch block
+        // Fixes sharing a catch binding overlap, so only the first throw is fixed per pass
         (
             r#"try {
                 doSomething();
@@ -880,7 +978,7 @@ fn test() {
                 if (err.code === "A") {
                     throw new Error("Type A", { cause: err });
                 }
-                throw new TypeError("Fallback error", { cause: err });
+                throw new TypeError("Fallback error");
             }"#,
             None,
         ),
@@ -1072,6 +1170,12 @@ fn test() {
             } catch (error) {
                 throw new Error("Something failed", { cause: error });
             }"#,
+            None,
+        ),
+        // A later pass fixes the remaining throw while preserving the same catch binding.
+        (
+            r#"try {} catch (err) { if (err.code === "A") { throw new Error("Type A", { cause: err }); } throw new TypeError("Fallback error"); }"#,
+            r#"try {} catch (err) { if (err.code === "A") { throw new Error("Type A", { cause: err }); } throw new TypeError("Fallback error", { cause: err }); }"#,
             None,
         ),
     ];

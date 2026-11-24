@@ -4,6 +4,50 @@ All notable changes to this package will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0).
 
+## [0.160.0] - 2026-11-23
+
+No significant changes.
+
+Full release notes: [0.160.0](https://github.com/oxc-project/oxc/blob/main/crates/CHANGELOG.md#01600---2026-11-23)
+
+## [0.158.0] - 2026-11-09
+
+### 🐛 Bug Fixes
+
+- 6303df1 jsdoc: Preserve param tags after unmatched description delimiters (#28923) (Vishal Punjabi)
+- fd51bff jsdoc: Handle every line terminators as newline (#28902) (leaysgur)
+- 52f3e3d jsdoc: Do not treat `@word` containing `/` as tag (#28834) (leaysgur)
+
+## [0.155.0] - 2026-10-19
+
+### 🐛 Bug Fixes
+
+- a5d8184 jsdoc: Parse code spans after quotes in descriptions (#27955) (leaysgur)
+
+## [0.152.0] - 2026-09-28
+
+### 🐛 Bug Fixes
+
+- 8fbddb1 formatter/jsdoc: More alignment with original plugin (#27039) (leaysgur)
+
+## [0.143.0] - 2026-08-03
+
+### 💥 BREAKING CHANGES
+
+- 1bdedd1 ast: [**BREAKING**] Introduce `ExportDeclaration`, `ExportFromDeclaration` (#25095) (camc314)
+
+## [0.138.0] - 2026-06-29
+
+### 🐛 Bug Fixes
+
+- 8c07cad all: Enable `disable_old_builder` Cargo feature for `oxc_ast` crate in tests (#23888) (overlookmotel)
+
+## [0.132.0] - 2026-05-18
+
+### ⚡ Performance
+
+- dbbc059 jsdoc: Skip should_attach_jsdoc when no remaining comments (#22409) (Boshen)
+
 ## [0.122.0] - 2026-03-23
 
 ### 🚀 Features

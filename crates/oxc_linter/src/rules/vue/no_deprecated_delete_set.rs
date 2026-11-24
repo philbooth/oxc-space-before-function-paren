@@ -1,15 +1,17 @@
 use oxc_ast::{
     AstKind,
-    ast::{
-        BindingPattern, Expression, IdentifierReference, MemberExpression, StaticMemberExpression,
-    },
+    ast::{Expression, IdentifierReference, MemberExpression, StaticMemberExpression},
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_span::Span;
 
-use crate::module_record::ImportImportName;
-use crate::{AstNode, context::LintContext, rule::Rule};
+use crate::{
+    AstNode,
+    context::LintContext,
+    rule::Rule,
+    utils::{is_import_symbol, is_this_object},
+};
 
 fn no_deprecated_delete_set_diagnostic(span: Span) -> OxcDiagnostic {
     OxcDiagnostic::warn("`$delete` and `$set` are deprecated.").with_label(span)
@@ -60,7 +62,9 @@ declare_oxc_lint!(
     NoDeprecatedDeleteSet,
     vue,
     correctness,
+    recommended,
     version = "1.62.0",
+    short_description = "Disallow using deprecated `$set` / `$delete` (in Vue.js 3.0.0+).",
 );
 
 impl Rule for NoDeprecatedDeleteSet {
@@ -85,7 +89,7 @@ impl Rule for NoDeprecatedDeleteSet {
             }
 
             if matches!(prop_name, "$set" | "$delete")
-                && is_this_or_alias(object, ctx)
+                && is_this_object(object, ctx)
                 && is_in_vue_component(node, ctx)
             {
                 ctx.diagnostic(no_deprecated_delete_set_diagnostic(member.property.span));
@@ -106,25 +110,7 @@ fn is_imported_set_or_del_from_vue<'a>(
     ident: &IdentifierReference<'a>,
     ctx: &LintContext<'a>,
 ) -> bool {
-    let scoping = ctx.scoping();
-    let Some(ref_symbol) = scoping.get_reference(ident.reference_id()).symbol_id() else {
-        return false;
-    };
-    for import_entry in &ctx.module_record().import_entries {
-        if import_entry.module_request.name() != "vue" {
-            continue;
-        }
-        let ImportImportName::Name(name_span) = &import_entry.import_name else {
-            continue;
-        };
-        if !matches!(name_span.name(), "set" | "del") {
-            continue;
-        }
-        if scoping.get_root_binding(import_entry.local_name.name().into()) == Some(ref_symbol) {
-            return true;
-        }
-    }
-    false
+    is_import_symbol(ident, "vue", "set", ctx) || is_import_symbol(ident, "vue", "del", ctx)
 }
 
 /// Returns the callee as a `StaticMemberExpression`, peeling parens and an
@@ -132,31 +118,10 @@ fn is_imported_set_or_del_from_vue<'a>(
 fn static_member_callee<'a, 'b>(
     callee: &'b Expression<'a>,
 ) -> Option<&'b StaticMemberExpression<'a>> {
-    let inner = callee.get_inner_expression();
-    let member = match inner {
-        Expression::ChainExpression(chain) => chain.expression.as_member_expression()?,
-        _ => inner.as_member_expression()?,
-    };
+    let member = callee.get_member_expr()?;
     match member {
         MemberExpression::StaticMemberExpression(m) => Some(m),
         _ => None,
-    }
-}
-
-fn is_this_or_alias<'a>(expr: &Expression<'a>, ctx: &LintContext<'a>) -> bool {
-    match expr {
-        Expression::ThisExpression(_) => true,
-        Expression::Identifier(ident) => {
-            let scoping = ctx.scoping();
-            let reference = scoping.get_reference(ident.reference_id());
-            let Some(symbol_id) = reference.symbol_id() else { return false };
-            let declaration = ctx.symbol_declaration(symbol_id);
-            let AstKind::VariableDeclarator(decl) = declaration.kind() else { return false };
-            let BindingPattern::BindingIdentifier(_) = &decl.id else { return false };
-            let Some(init) = &decl.init else { return false };
-            matches!(init.get_inner_expression(), Expression::ThisExpression(_))
-        }
-        _ => false,
     }
 }
 
@@ -166,31 +131,8 @@ fn is_in_vue_component<'a>(node: &AstNode<'a>, ctx: &LintContext<'a>) -> bool {
         AstKind::CallExpression(call) => call
             .callee
             .get_identifier_reference()
-            .is_some_and(|ident| is_vue_define_component_reference(ident, ctx)),
+            .is_some_and(|ident| is_import_symbol(ident, "vue", "defineComponent", ctx)),
         _ => false,
-    })
-}
-
-fn is_vue_define_component_reference<'a>(
-    ident: &IdentifierReference<'a>,
-    ctx: &LintContext<'a>,
-) -> bool {
-    if ident.name != "defineComponent" {
-        return false;
-    }
-    let scoping = ctx.scoping();
-    let Some(symbol_id) = scoping.get_reference(ident.reference_id()).symbol_id() else {
-        return false;
-    };
-    let declaration = ctx.symbol_declaration(symbol_id);
-    if !matches!(declaration.kind(), AstKind::ImportSpecifier(_)) {
-        return false;
-    }
-    ctx.nodes().ancestors(declaration.id()).any(|ancestor| {
-        matches!(
-            ancestor.kind(),
-            AstKind::ImportDeclaration(import_decl) if import_decl.source.value == "vue"
-        )
     })
 }
 
@@ -344,6 +286,22 @@ fn test() {
             None,
             Some(PathBuf::from("test.vue")),
         ),
+        (
+            r"
+                <script>
+                export default {
+                  mounted() {
+                    let vm = this
+                    vm = other
+                    vm.$set(obj, key, value)
+                  }
+                }
+                </script>
+            ",
+            None,
+            None,
+            Some(PathBuf::from("test.vue")),
+        ),
     ];
 
     let fail = vec![
@@ -357,6 +315,23 @@ fn test() {
                     this.$delete(obj, key)
                   }
                 }
+                </script>
+            ",
+            None,
+            None,
+            Some(PathBuf::from("test.vue")),
+        ),
+        // Phase 2: aliased `defineComponent` import
+        (
+            "
+                <script>
+                import { defineComponent as dc } from 'vue'
+                dc({
+                  mounted () {
+                    this.$set(obj, key, value)
+                    this.$delete(obj, key)
+                  }
+                })
                 </script>
             ",
             None,

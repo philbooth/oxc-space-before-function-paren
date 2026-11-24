@@ -1,8 +1,9 @@
 use oxc_ast::{
     AstKind,
     ast::{
-        Argument, AssignmentTarget, BindingPattern, CallExpression, Expression, ForInStatement,
-        ForOfStatement, ForStatement, VariableDeclarationKind,
+        Argument, AssignmentExpression, AssignmentTarget, BindingIdentifier, CallExpression,
+        Expression, ForInStatement, ForOfStatement, ForStatement, MemberExpression,
+        VariableDeclarationKind,
     },
 };
 use oxc_diagnostics::OxcDiagnostic;
@@ -10,12 +11,7 @@ use oxc_macros::declare_oxc_lint;
 use oxc_semantic::{NodeId, SymbolId};
 use oxc_span::{GetSpan, Span};
 
-use crate::{
-    AstNode,
-    ast_util::{call_expr_method_callee_info, is_method_call},
-    context::LintContext,
-    rule::Rule,
-};
+use crate::{AstNode, ast_util::is_method_call, context::LintContext, rule::Rule};
 
 fn reduce_likely_array_spread_diagnostic(spread_span: Span, reduce_span: Span) -> OxcDiagnostic {
     OxcDiagnostic::warn("Do not spread accumulators in Array.prototype.reduce()")
@@ -58,7 +54,7 @@ fn loop_spread_likely_object_diagnostic(
         .with_labels([
             accumulator_decl_span.label("From this accumulator"),
             spread_span.label("From this spread"),
-            loop_span.label("For this loop"),
+            loop_span.primary_label("For this loop"),
         ])
 }
 fn loop_spread_likely_array_diagnostic(
@@ -72,7 +68,7 @@ fn loop_spread_likely_array_diagnostic(
         .with_labels([
             accumulator_decl_span.label("From this accumulator"),
             spread_span.label("From this spread"),
-            loop_span.label("For this loop"),
+            loop_span.primary_label("For this loop"),
         ])
 }
 
@@ -127,6 +123,7 @@ declare_oxc_lint!(
     oxc,
     perf,
     version = "0.0.19",
+    short_description = "Prevents using object or array spreads on accumulators in `Array.prototype.reduce()` and in loops.",
 );
 
 impl Rule for NoAccumulatingSpread {
@@ -174,15 +171,17 @@ fn check_reduce_usage<'a>(
 
     // We're only looking for the first parameter, since that's where acc is.
     // Skip non-parameter or non-first-parameter declarations.
-    let first_param_symbol_id =
-        params.items.first().and_then(|item| get_identifier_symbol_id(&item.pattern));
+    let first_param_symbol_id = params
+        .items
+        .first()
+        .and_then(|item| item.pattern.get_binding_identifier())
+        .map(BindingIdentifier::symbol_id);
     if first_param_symbol_id.is_none_or(|id| id != referenced_symbol_id) {
         return;
     }
 
-    // invalid number of parameters to reduce callback
     let params_count = params.parameters_count();
-    if params_count != 2 {
+    if !(2..=4).contains(&params_count) {
         return;
     }
 
@@ -190,6 +189,8 @@ fn check_reduce_usage<'a>(
     for parent in ctx.nodes().ancestors(declaration.id()) {
         if let AstKind::CallExpression(call_expr) = parent.kind()
             && is_method_call(call_expr, None, Some(&["reduce", "reduceRight"]), Some(1), Some(2))
+            && let Some((reduce_call_span, _)) =
+                call_expr.callee.get_member_expr().and_then(MemberExpression::static_property_info)
             && ctx
                 .nodes()
                 .ancestors(spread_node_id)
@@ -198,7 +199,7 @@ fn check_reduce_usage<'a>(
                     !matches!(n.kind(), AstKind::ArrowFunctionExpression(_) | AstKind::Function(_))
                 })
         {
-            ctx.diagnostic(get_reduce_diagnostic(call_expr, spread_span));
+            ctx.diagnostic(get_reduce_diagnostic(call_expr, spread_span, reduce_call_span));
             return;
         }
     }
@@ -246,7 +247,7 @@ fn check_loop_usage<'a>(
 fn find_assignment_expression<'a>(
     referenced_symbol_id: SymbolId,
     ctx: &LintContext<'a>,
-) -> Option<&'a oxc_ast::ast::AssignmentExpression<'a>> {
+) -> Option<&'a AssignmentExpression<'a>> {
     let write_reference =
         ctx.semantic().symbol_references(referenced_symbol_id).find(|r| r.is_write())?;
     let parent_node = ctx.nodes().parent_node(write_reference.node_id());
@@ -350,13 +351,11 @@ fn get_loop_span(ast_kind: AstKind) -> Option<Span> {
     }
 }
 
-fn get_reduce_diagnostic<'a>(
-    call_expr: &'a CallExpression<'a>,
+fn get_reduce_diagnostic(
+    call_expr: &CallExpression,
     spread_span: Span,
+    reduce_call_span: Span,
 ) -> OxcDiagnostic {
-    // unwrap is safe because we already checked that this is a reduce call
-    let (reduce_call_span, _) = call_expr_method_callee_info(call_expr).unwrap();
-
     if let Some(second_arg) = call_expr.arguments.get(1).and_then(Argument::as_expression) {
         let second_arg = second_arg.get_inner_expression();
         if matches!(second_arg, Expression::ObjectExpression(_)) {
@@ -367,14 +366,6 @@ fn get_reduce_diagnostic<'a>(
     }
 
     reduce_unknown(spread_span, reduce_call_span)
-}
-
-fn get_identifier_symbol_id(ident: &BindingPattern<'_>) -> Option<SymbolId> {
-    match ident {
-        BindingPattern::BindingIdentifier(ident) => Some(ident.symbol_id()),
-        BindingPattern::AssignmentPattern(ident) => get_identifier_symbol_id(&ident.left),
-        _ => None,
-    }
 }
 
 #[test]
@@ -392,6 +383,13 @@ fn test() {
         "let x = { ...a, ...b }; arr.reduce((x, y) => x + y, 0)",
         "arr.reduce((acc, x) => ({ ...x }), {})",
         "arr.reduce((acc, x) => ({ ...obj }), {})",
+        "(arr?.map)((acc, x) => [...acc, x], [])",
+        "(arr?.[method])((acc, x) => [...acc, x], [])",
+        "(arr?.reduce)((acc, x) => [...acc, x], [], 123)",
+        "(arr?.reduce)((acc, x) => [...x], [])",
+        "(arr?.reduce)((acc) => [...acc], [])",
+        "arr.reduce((acc, x, index, array, extra) => [...acc, x], [])",
+        "(arr?.reduce())((acc, x) => [...acc, x], [])",
         // bad practice, but not a spread on acc
         "arr.reduce((acc, x) => {
                 acc[x] = { ...x }
@@ -467,6 +465,17 @@ fn test() {
     ];
 
     let fail = vec![
+        "(arr?.reduce)((acc, x) => [...acc, x], []);",
+        "arr.reduce((acc, x, index) => [...acc, x], []);",
+        "arr.reduceRight((acc, x, index, array) => ({ ...acc, [x]: index }), {});",
+        "(arr?.reduceRight)((acc, x) => ({ ...acc, [x]: x }), {})",
+        "(arr?.['reduce'])((acc, x) => [...acc, x])",
+        "(arr?.[`reduceRight`])((acc, x) => ({ ...acc, [x]: x }), {})",
+        "((arr?.reduce)!)((acc, x) => [...acc, x], [])",
+        "(arr?.reduce as any)((acc, x) => [...acc, x], [])",
+        "arr?.reduce((acc, x) => [...acc, x], [])",
+        "(arr.reduce)((acc, x) => [...acc, x], [])",
+        "(arr['reduceRight'])((acc, x) => [...acc, x], [])",
         "Object.keys(obj).reduce((acc, key) => ({ ...acc, [key]: obj[key] }), {})",
         // check we get the correct diagnostic for parenthesized expressions + as
         "Object.keys(obj).reduce((acc, key) => ({ ...acc, [key]: obj[key] }), ({} as foo))",

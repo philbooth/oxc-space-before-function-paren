@@ -1,10 +1,11 @@
 use oxc_ast::AstKind;
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
+use oxc_semantic::AstNode;
 use oxc_span::{GetSpan, Span};
 
 use crate::{
-    context::LintContext,
+    context::{ContextHost, LintContext},
     fixer::RuleFixer,
     rule::Rule,
     utils::{
@@ -29,7 +30,7 @@ declare_oxc_lint!(
     /// ### What it does
     ///
     /// Requires [hoisted](https://developer.mozilla.org/en-US/docs/Glossary/Hoisting) Vitest APIs
-    /// (`vi.mock`, `vi.unmock`, and `vi.hoisted`) to appear in the top-level of the file.
+    /// (`vi.mock`, `vi.unmock`, and `vi.hoisted`) to appear at the top level of the file.
     ///
     /// ### Why is this bad?
     ///
@@ -111,27 +112,32 @@ declare_oxc_lint!(
     correctness,
     suggestion,
     version = "1.39.0",
+    short_description = "Requires hoisted Vitest APIs (`vi.mock`, `vi.unmock`, and `vi.hoisted`) to appear at the top level of the file.",
 );
 
 impl Rule for HoistedApisOnTop {
-    fn run_on_jest_node<'a, 'c>(
-        &self,
-        jest_node: &PossibleJestNode<'a, 'c>,
-        ctx: &'c LintContext<'a>,
-    ) {
-        Self::run(jest_node, ctx);
+    fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
+        let AstKind::CallExpression(_) = node.kind() else { return };
+        Self::run(node, ctx);
+    }
+
+    fn should_run(&self, ctx: &ContextHost) -> bool {
+        ctx.frameworks().is_test()
     }
 }
 
 impl HoistedApisOnTop {
-    fn run<'a>(possible_jest_node: &PossibleJestNode<'a, '_>, ctx: &LintContext<'a>) {
-        let node = possible_jest_node.node;
-
+    fn run<'a>(node: &AstNode<'a>, ctx: &LintContext<'a>) {
         let AstKind::CallExpression(call_expr) = node.kind() else {
             return;
         };
 
-        let Some(vitest_fn) = parse_general_jest_fn_call(call_expr, possible_jest_node, ctx) else {
+        let Some(possible_jest_node) = PossibleJestNode::from_call_expression(node, call_expr, ctx)
+        else {
+            return;
+        };
+        let Some(vitest_fn) = parse_general_jest_fn_call(call_expr, &possible_jest_node, ctx)
+        else {
             return;
         };
 

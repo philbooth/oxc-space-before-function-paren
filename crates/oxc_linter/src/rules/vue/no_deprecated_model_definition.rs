@@ -1,19 +1,20 @@
-use oxc_str::Str;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use oxc_ast::{
     AstKind,
-    ast::{CallExpression, Expression, MemberExpression, ObjectExpression, ObjectPropertyKind},
+    ast::{Expression, ObjectExpression, ObjectPropertyKind},
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_span::Span;
+use oxc_str::JSStr;
 
 use crate::{
     AstNode,
     context::LintContext,
     rule::{DefaultRuleConfig, Rule},
+    utils::is_vue_component_options_object,
 };
 
 fn deprecated_model_diagnostic(span: Span) -> OxcDiagnostic {
@@ -84,14 +85,16 @@ declare_oxc_lint!(
     NoDeprecatedModelDefinition,
     vue,
     correctness,
+    recommended,
     pending,
     config = NoDeprecatedModelDefinition,
-    version = "next",
+    version = "1.63.0",
+    short_description = "Disallow deprecated `model` definition (in Vue.js 3.0.0+).",
 );
 
 impl Rule for NoDeprecatedModelDefinition {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        serde_json::from_value::<DefaultRuleConfig<Self>>(value).map(DefaultRuleConfig::into_inner)
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
     }
 
     fn should_run(&self, ctx: &crate::context::ContextHost) -> bool {
@@ -109,14 +112,12 @@ impl Rule for NoDeprecatedModelDefinition {
             return;
         };
 
-        let mut ancestors = ctx.nodes().ancestors(node.id());
-        let Some(parent) = ancestors.next() else { return };
+        let parent = ctx.nodes().parent_node(node.id());
         if !matches!(parent.kind(), AstKind::ObjectExpression(_)) {
             return;
         }
 
-        let Some(grand) = ancestors.next() else { return };
-        if !is_vue_component_root(grand.kind()) {
+        if !is_vue_component_options_object(parent, ctx) {
             return;
         }
 
@@ -140,41 +141,6 @@ impl Rule for NoDeprecatedModelDefinition {
     }
 }
 
-fn is_vue_component_root(grand_kind: AstKind<'_>) -> bool {
-    match grand_kind {
-        AstKind::ExportDefaultDeclaration(_) => true,
-        AstKind::CallExpression(call) => is_vue_component_definition_call(call),
-        AstKind::NewExpression(new_expr) => {
-            new_expr.callee.get_identifier_reference().is_some_and(|ident| ident.name == "Vue")
-        }
-        _ => false,
-    }
-}
-
-fn is_vue_component_definition_call(call: &CallExpression<'_>) -> bool {
-    let callee = call.callee.get_inner_expression();
-
-    if let Expression::Identifier(ident) = callee {
-        return matches!(
-            ident.name.as_str(),
-            "defineComponent" | "component" | "createApp" | "defineNuxtComponent"
-        );
-    }
-
-    let Some(MemberExpression::StaticMemberExpression(static_member)) =
-        callee.as_member_expression()
-    else {
-        return false;
-    };
-    let prop_name = static_member.property.name.as_str();
-    if let Expression::Identifier(obj_ident) = static_member.object.get_inner_expression()
-        && obj_ident.name == "Vue"
-    {
-        return matches!(prop_name, "component" | "mixin" | "extend");
-    }
-    matches!(prop_name, "component" | "mixin")
-}
-
 fn find_string_property_value(obj: &ObjectExpression<'_>, key: &str) -> Option<String> {
     for property_kind in &obj.properties {
         let ObjectPropertyKind::ObjectProperty(p) = property_kind else { continue };
@@ -188,8 +154,10 @@ fn find_string_property_value(obj: &ObjectExpression<'_>, key: &str) -> Option<S
 
 fn string_literal_value(expr: &Expression<'_>) -> Option<String> {
     match expr {
-        Expression::StringLiteral(lit) => Some(lit.value.to_string()),
-        Expression::TemplateLiteral(tpl) => tpl.single_quasi().map(Str::into_string),
+        Expression::StringLiteral(lit) => lit.value.as_str().map(str::to_owned),
+        Expression::TemplateLiteral(tpl) => {
+            tpl.single_quasi().and_then(JSStr::as_str).map(str::to_owned)
+        }
         _ => None,
     }
 }
@@ -386,6 +354,21 @@ fn test() {
                 </script>
             ",
             Some(serde_json::json!([{ "allowVue3Compat": true }])),
+            None,
+            Some(PathBuf::from("test.vue")),
+        ),
+        (
+            "
+                <script>
+                new Vue({
+                  model: {
+                    prop: 'checked',
+                    event: 'change'
+                  }
+                })
+                </script>
+            ",
+            None,
             None,
             Some(PathBuf::from("test.vue")),
         ),

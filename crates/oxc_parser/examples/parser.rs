@@ -47,7 +47,11 @@ fn main() -> Result<(), String> {
     // Parse the source code
     let allocator = Allocator::default();
     let ret = Parser::new(&allocator, &source_text, source_type)
-        .with_options(ParseOptions { parse_regular_expression: true, ..ParseOptions::default() })
+        .with_options(ParseOptions {
+            parse_regular_expression: true,
+            enable_ident_hashes: false,
+            ..ParseOptions::default()
+        })
         .parse();
     let mut program = ret.program;
 
@@ -71,20 +75,18 @@ fn main() -> Result<(), String> {
         Utf8ToUtf16::new(&source_text).convert_program(&mut program);
         if source_type.is_javascript() {
             println!("ESTree AST:");
-            println!("{}", program.to_pretty_estree_js_json(false));
         } else {
             println!("TS-ESTree AST:");
-            println!("{}", program.to_pretty_estree_ts_json(false));
         }
+        println!("{}", program.to_pretty_estree_json(!source_type.is_javascript(), false));
     }
 
     // Report parsing results
-    if ret.errors.is_empty() {
+    if ret.diagnostics.is_empty() {
         println!("Parsed Successfully.");
     } else {
-        for error in ret.errors {
-            let error = error.with_source_code(source_text.clone());
-            println!("{error:?}");
+        for error in ret.diagnostics {
+            println!("{}", error.render_with_source_code(source_text.as_str()));
         }
         println!("Parsed with Errors.");
     }

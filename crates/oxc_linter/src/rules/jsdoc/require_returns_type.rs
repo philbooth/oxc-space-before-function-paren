@@ -12,7 +12,7 @@ use crate::{
 
 fn missing_type_diagnostic(span: Span) -> OxcDiagnostic {
     OxcDiagnostic::warn("Missing JSDoc `@returns` type.")
-        .with_help("Add {type} to `@returns` tag.")
+        .with_help("Add {type} to the `@returns` tag.")
         .with_label(span)
 }
 
@@ -22,7 +22,7 @@ pub struct RequireReturnsType;
 declare_oxc_lint!(
     /// ### What it does
     ///
-    /// Requires that `@returns` tag has a type value (in curly brackets).
+    /// Requires that the `@returns` tag has a type value (in curly brackets).
     ///
     /// ### Why is this bad?
     ///
@@ -45,6 +45,7 @@ declare_oxc_lint!(
     jsdoc,
     pedantic,
     version = "0.4.3",
+    short_description = "Requires that the `@returns` tag has a type value (in curly brackets).",
 );
 
 impl Rule for RequireReturnsType {
@@ -96,7 +97,7 @@ fn test() {
 			           * @returns {number}
 			           */
 			          function quux () {
-			
+
 			          }
 			      ",
             None,
@@ -131,7 +132,7 @@ fn test() {
 			           * @returns
 			           */
 			          function quux () {
-			
+
 			          }
 			      ",
             None,
@@ -143,7 +144,7 @@ fn test() {
 			           * @returns Foo.
 			           */
 			          function quux () {
-			
+
 			          }
 			      ",
             None,
@@ -155,7 +156,7 @@ fn test() {
 			           * @return Foo.
 			           */
 			          function quux () {
-			
+
 			          }
 			      ",
             None,

@@ -42,8 +42,10 @@ declare_oxc_lint!(
     PreferStringRaw,
     unicorn,
     style,
+    recommended,
     fix,
     version = "0.12.0",
+    short_description = "Prefers use of `String.raw` to avoid escaping `\\`.",
 );
 
 fn unescape_backslash(input: &str, quote: char) -> String {
@@ -87,10 +89,8 @@ impl Rule for PreferStringRaw {
             AstKind::ImportDeclaration(decl) if string_literal.span == decl.source.span => {
                 return;
             }
-            AstKind::ExportNamedDeclaration(decl) => {
-                if let Some(source) = &decl.source
-                    && string_literal.span == source.span
-                {
+            AstKind::ExportFromDeclaration(decl) => {
+                if string_literal.span == decl.source.span {
                     return;
                 }
             }
@@ -98,11 +98,25 @@ impl Rule for PreferStringRaw {
                 return;
             }
             AstKind::ObjectProperty(prop) => {
-                let PropertyKey::StringLiteral(key) = &prop.key else {
+                if let PropertyKey::StaticStringLiteral(key) = &prop.key
+                    && string_literal.span == key.span
+                {
                     return;
-                };
-
-                if !prop.computed && string_literal.span == key.span {
+                }
+            }
+            AstKind::TSPropertySignature(prop) => {
+                if let PropertyKey::StaticStringLiteral(key) | PropertyKey::StringLiteral(key) =
+                    &prop.key
+                    && string_literal.span == key.span
+                {
+                    return;
+                }
+            }
+            AstKind::TSMethodSignature(method) => {
+                if let PropertyKey::StaticStringLiteral(key) | PropertyKey::StringLiteral(key) =
+                    &method.key
+                    && string_literal.span == key.span
+                {
                     return;
                 }
             }
@@ -138,7 +152,9 @@ impl Rule for PreferStringRaw {
             return;
         }
 
-        let value = string_literal.value.as_str();
+        let Some(value) = string_literal.value.as_str() else {
+            return;
+        };
 
         // Cannot use String.raw if the value ends with an odd number of backslashes,
         // as the final backslash would escape the closing backtick.
@@ -198,11 +214,7 @@ fn ends_with_keyword(source: &str) -> bool {
         }
     }
 
-    if source.ends_with("of") {
-        return true;
-    }
-
-    false
+    source.ends_with("of")
 }
 
 #[test]
@@ -245,7 +257,10 @@ fn test() {
         r#"declare const POSIX_REGEX_SOURCE: { ascii: "\\x00-\\x7F"; };"#,
         r#"type Foo = { path: "C:\\windows\\path"; };"#,
         r#"interface Bar { regex: "foo\\.bar"; }"#,
+        r#"interface EventSchemas { "foo\\bar": Record<string, any>; }"#,
+        r#"interface Methods { "foo\\bar"(): void; }"#,
         r#"let x: "a\\b";"#,
+        r"const o = { newline: 'a\\b\nc', trail: 'a\\', interpolation: 'a\\b${foo}', tick: 'a\\b`' };",
     ];
 
     let fail = vec![
@@ -262,6 +277,12 @@ fn test() {
         r"for (const f of'a\\b') {}",
         // Non-ASCII characters without trailing backslash - should be fixed
         r"const a = 'c:\\someöäü\\path';",
+        r#"export const o = { b: "a\\b" };"#,
+        r#"export const s = "a\\b";"#,
+        r#"export const p = { "k": "a\\b" };"#,
+        r#"const o = { 0: "a\\b", [key]: "a\\b", [0]: "a\\b", 1n: "a\\b", ["k"]: "a\\b" };"#,
+        r#"const o = { "a\\b": "c\\d", ["a\\b"]: "c\\d" };"#,
+        r"const o = { blank: ' \\t' };",
     ];
 
     let fix = vec![
@@ -278,17 +299,24 @@ fn test() {
         (r"function a() {return'a\\b'}", r"function a() {return String.raw`a\b`}"),
         (r"const foo = 'foo \\x46';", r"const foo = String.raw`foo \x46`;"),
         (r"for (const f of'a\\b') {}", r"for (const f of String.raw`a\b`) {}"),
-        (r"a = 'a\\b'", r"a = String.raw`a\b`"),
-        (r"a = {['a\\b']: b}", r"a = {[String.raw`a\b`]: b}"),
-        (r"function a() {return'a\\b'}", r"function a() {return String.raw`a\b`}"),
         (r"function* a() {yield'a\\b'}", r"function* a() {yield String.raw`a\b`}"),
         (r"function a() {throw'a\\b'}", r"function a() {throw String.raw`a\b`}"),
         (r"if (typeof'a\\b' === 'string') {}", r"if (typeof String.raw`a\b` === 'string') {}"),
         (r"const a = () => void'a\\b';", r"const a = () => void String.raw`a\b`;"),
-        (r"const foo = 'foo \\x46';", r"const foo = String.raw`foo \x46`;"),
-        (r"for (const f of'a\\b') {}", r"for (const f of String.raw`a\b`) {}"),
         // Non-ASCII characters
         (r"const a = 'c:\\someöäü\\path';", r"const a = String.raw`c:\someöäü\path`;"),
+        (r#"export const o = { b: "a\\b" };"#, r"export const o = { b: String.raw`a\b` };"),
+        (r#"export const s = "a\\b";"#, r"export const s = String.raw`a\b`;"),
+        (r#"export const p = { "k": "a\\b" };"#, r#"export const p = { "k": String.raw`a\b` };"#),
+        (
+            r#"const o = { 0: "a\\b", [key]: "a\\b", [0]: "a\\b", 1n: "a\\b", ["k"]: "a\\b" };"#,
+            r#"const o = { 0: String.raw`a\b`, [key]: String.raw`a\b`, [0]: String.raw`a\b`, 1n: String.raw`a\b`, ["k"]: String.raw`a\b` };"#,
+        ),
+        (
+            r#"const o = { "a\\b": "c\\d", ["a\\b"]: "c\\d" };"#,
+            r#"const o = { "a\\b": String.raw`c\d`, [String.raw`a\b`]: String.raw`c\d` };"#,
+        ),
+        (r"const o = { blank: ' \\t' };", r"const o = { blank: String.raw` \t` };"),
     ];
 
     Tester::new(PreferStringRaw::NAME, PreferStringRaw::PLUGIN, pass, fail)

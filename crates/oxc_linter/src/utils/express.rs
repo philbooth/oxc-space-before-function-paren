@@ -1,10 +1,7 @@
-use oxc_ast::{
-    AstKind,
-    ast::{Argument, Expression, FormalParameter},
-};
+use oxc_ast::ast::{Argument, CallExpression, Expression, FormalParameter};
 use oxc_str::Str;
 
-/// Check if the given node is registering an endpoint handler or middleware to
+/// Check if the given call is registering an endpoint handler or middleware to
 /// a route or Express application object. If it is, it
 /// returns:
 /// - the endpoint path being handled, if found and statically analyzable
@@ -18,11 +15,10 @@ use oxc_str::Str;
 ///
 /// ```
 pub fn as_endpoint_registration<'a, 'n>(
-    node: &'n AstKind<'a>,
+    call: &'n CallExpression<'a>,
 ) -> Option<(Option<Str<'a>>, &'n [Argument<'a>])> {
-    let call = node.as_call_expression()?;
     let callee = call.callee.as_member_expression()?;
-    let method_name = callee.static_property_name()?;
+    let method_name = callee.static_property_name()?.as_str()?;
     if ROUTER_HANDLER_METHOD_NAMES.binary_search(&method_name).is_err() {
         return None;
     }
@@ -32,11 +28,11 @@ pub fn as_endpoint_registration<'a, 'n>(
     let first = call.arguments[0].as_expression()?;
     match first {
         Expression::StringLiteral(path) => {
-            Some((Some(path.value), &call.arguments.as_slice()[1..]))
+            Some((path.value.as_arena_str(), &call.arguments.as_slice()[1..]))
         }
-        Expression::TemplateLiteral(template) => {
-            template.single_quasi().map(|quasi| (Some(quasi), &call.arguments.as_slice()[1..]))
-        }
+        Expression::TemplateLiteral(template) => template
+            .single_quasi()
+            .map(|quasi| (quasi.as_arena_str(), &call.arguments.as_slice()[1..])),
         _ => Some((None, call.arguments.as_slice())),
     }
 }

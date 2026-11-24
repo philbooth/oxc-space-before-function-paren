@@ -9,7 +9,6 @@ pub fn generate_rules_enum(rule_entries: &[RuleEntry<'_>]) -> String {
     let header = quote! {
         #![expect(
             clippy::default_constructed_unit_structs,  // Many rules are unit structs
-            clippy::semicolon_if_nothing_returned,     // Match arms in void-returning methods
             clippy::wrong_self_convention,             // from_configuration takes &self
             clippy::missing_errors_doc,                // Generated code
             clippy::match_same_arms,                   // plugin_name() has many same-body arms
@@ -70,19 +69,14 @@ fn make_const_ident(rule: &RuleEntry<'_>) -> Ident {
     Ident::new(&name, Span::call_site())
 }
 
-/// Generate constants for rule IDs, each defined relative to the previous one.
+/// Generate constants for rule IDs as consecutive integer literals.
 fn generate_id_constants(rule_entries: &[RuleEntry<'_>]) -> TokenStream {
     let constants: Vec<TokenStream> = rule_entries
         .iter()
         .enumerate()
         .map(|(idx, rule)| {
             let const_name = make_const_ident(rule);
-            if idx == 0 {
-                quote! { const #const_name: usize = 0usize; }
-            } else {
-                let prev_const_name = make_const_ident(&rule_entries[idx - 1]);
-                quote! { const #const_name: usize = #prev_const_name + 1usize; }
-            }
+            quote! { const #const_name: usize = #idx; }
         })
         .collect();
 
@@ -111,10 +105,12 @@ fn generate_imports() -> TokenStream {
     quote! {
         use crate::{
             context::{ContextHost, LintContext},
-            rule::{Rule, RuleCategory, RuleFixMeta, RuleMeta, RuleRunner, RuleRunFunctionsImplemented},
-            utils::PossibleJestNode,
+            rule::{Rule, RuleCategory, RuleFixMeta, RuleFlags, RuleMeta, RuleRunner, RuleRunFunctionsImplemented},
+            timing::RuleTimingStat,
             AstNode
         };
+        #[cfg(feature = "ruledocs")]
+        use crate::rule::RuleInfo;
         use oxc_semantic::AstTypesBitset;
     }
 }
@@ -146,13 +142,14 @@ fn generate_rule_enum_impl(rule_entries: &[RuleEntry<'_>]) -> TokenStream {
         })
         .collect();
 
-    let name_arms: Vec<TokenStream> = rule_entries
+    let rule_names: Vec<TokenStream> = rule_entries
         .iter()
         .map(|rule| {
             let enum_name = make_enum_ident(rule);
-            quote! { Self::#enum_name(_) => #enum_name::NAME }
+            quote! { #enum_name::NAME }
         })
         .collect();
+    let rule_count = rule_entries.len();
 
     let category_arms: Vec<TokenStream> = rule_entries
         .iter()
@@ -197,6 +194,7 @@ fn generate_rule_enum_impl(rule_entries: &[RuleEntry<'_>]) -> TokenStream {
 
     let from_configuration_arms: Vec<TokenStream> = rule_entries
         .iter()
+        .filter(|rule| rule.has_custom_from_configuration)
         .map(|rule| {
             let enum_name = make_enum_ident(rule);
             quote! { Self::#enum_name(_) => Ok(Self::#enum_name(#enum_name::from_configuration(value)?)) }
@@ -205,6 +203,7 @@ fn generate_rule_enum_impl(rule_entries: &[RuleEntry<'_>]) -> TokenStream {
 
     let to_configuration_arms: Vec<TokenStream> = rule_entries
         .iter()
+        .filter(|rule| rule.has_custom_to_configuration)
         .map(|rule| {
             let enum_name = make_enum_ident(rule);
             quote! { Self::#enum_name(rule) => rule.to_configuration() }
@@ -227,14 +226,6 @@ fn generate_rule_enum_impl(rule_entries: &[RuleEntry<'_>]) -> TokenStream {
         })
         .collect();
 
-    let run_on_jest_node_arms: Vec<TokenStream> = rule_entries
-        .iter()
-        .map(|rule| {
-            let enum_name = make_enum_ident(rule);
-            quote! { Self::#enum_name(rule) => rule.run_on_jest_node(jest_node, ctx) }
-        })
-        .collect();
-
     let should_run_arms: Vec<TokenStream> = rule_entries
         .iter()
         .map(|rule| {
@@ -243,11 +234,11 @@ fn generate_rule_enum_impl(rule_entries: &[RuleEntry<'_>]) -> TokenStream {
         })
         .collect();
 
-    let is_tsgolint_rule_arms: Vec<TokenStream> = rule_entries
+    let flags_arms: Vec<TokenStream> = rule_entries
         .iter()
         .map(|rule| {
             let enum_name = make_enum_ident(rule);
-            quote! { Self::#enum_name(_) => #enum_name::IS_TSGOLINT_RULE }
+            quote! { Self::#enum_name(_) => #enum_name::FLAGS }
         })
         .collect();
 
@@ -259,11 +250,11 @@ fn generate_rule_enum_impl(rule_entries: &[RuleEntry<'_>]) -> TokenStream {
         })
         .collect();
 
-    let has_config_arms: Vec<TokenStream> = rule_entries
+    let info_arms: Vec<TokenStream> = rule_entries
         .iter()
         .map(|rule| {
             let enum_name = make_enum_ident(rule);
-            quote! { Self::#enum_name(_) => #enum_name::HAS_CONFIG }
+            quote! { Self::#enum_name(_) => #enum_name::INFO }
         })
         .collect();
 
@@ -283,9 +274,9 @@ fn generate_rule_enum_impl(rule_entries: &[RuleEntry<'_>]) -> TokenStream {
         })
         .collect();
 
-    // Whether a rule declares a configuration type (i.e. `config = FooConfig`)
-
     quote! {
+        static RULE_NAMES: [&str; #rule_count] = [#(#rule_names),*];
+
         impl RuleEnum {
             pub fn id(&self) -> usize {
                 match self {
@@ -294,9 +285,7 @@ fn generate_rule_enum_impl(rule_entries: &[RuleEntry<'_>]) -> TokenStream {
             }
 
             pub fn name(&self) -> &'static str {
-                match self {
-                    #(#name_arms),*
-                }
+                RULE_NAMES[self.id()]
             }
 
             pub fn category(&self) -> RuleCategory {
@@ -334,35 +323,61 @@ fn generate_rule_enum_impl(rule_entries: &[RuleEntry<'_>]) -> TokenStream {
 
             pub fn from_configuration(&self, value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
                 match self {
-                    #(#from_configuration_arms),*
+                    #(#from_configuration_arms,)*
+                    _ => Ok(RULES[self.id()].clone()),
                 }
             }
 
             pub fn to_configuration(&self) -> Option<Result<serde_json::Value, serde_json::Error>> {
                 match self {
-                    #(#to_configuration_arms),*
+                    #(#to_configuration_arms,)*
+                    _ => None,
                 }
             }
 
-            pub(crate) fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
+            // The dispatch `match` has one arm per rule, so it is large. Keep it in a
+            // single non-generic `#[inline(never)]` helper so the giant `match` is
+            // emitted *once*, rather than being duplicated across both arms of the
+            // `if TIMINGS` below *and* across both monomorphizations of the
+            // `const TIMINGS: bool` parameter (i.e. up to 4 copies per dispatcher).
+            // `--timing` is a cold diagnostic path, so paying one direct call on the
+            // hot path to share the table is a good size trade.
+            #[inline(never)]
+            fn run_dispatch<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
                 match self {
                     #(#run_arms),*
                 }
             }
 
-            pub(crate) fn run_once(&self, ctx: &LintContext<'_>) {
+            pub(crate) fn run<'a, const TIMINGS: bool>(
+                &self,
+                node: &AstNode<'a>,
+                ctx: &LintContext<'a>,
+                timing_stat: Option<&mut RuleTimingStat>,
+            ) {
+                if TIMINGS {
+                    timing_stat.expect("missing rule timing stat").time(|| self.run_dispatch(node, ctx));
+                } else {
+                    self.run_dispatch(node, ctx);
+                }
+            }
+
+            #[inline(never)]
+            fn run_once_dispatch(&self, ctx: &LintContext<'_>) {
                 match self {
                     #(#run_once_arms),*
                 }
             }
 
-            pub(crate) fn run_on_jest_node<'a, 'c>(
+            pub(crate) fn run_once<const TIMINGS: bool>(
                 &self,
-                jest_node: &PossibleJestNode<'a, 'c>,
-                ctx: &'c LintContext<'a>,
+                ctx: &LintContext<'_>,
+                timing_stat: Option<&mut RuleTimingStat>,
             ) {
-                match self {
-                    #(#run_on_jest_node_arms),*
+                if TIMINGS {
+                    timing_stat.expect("missing rule timing stat").time(|| self.run_once_dispatch(ctx));
+                } else {
+                    self.run_once_dispatch(ctx);
                 }
             }
 
@@ -372,10 +387,20 @@ fn generate_rule_enum_impl(rule_entries: &[RuleEntry<'_>]) -> TokenStream {
                 }
             }
 
-            pub fn is_tsgolint_rule(&self) -> bool {
+            /// Flags describing this rule's capabilities.
+            pub fn flags(&self) -> RuleFlags {
                 match self {
-                    #(#is_tsgolint_rule_arms),*
+                    #(#flags_arms),*
                 }
+            }
+
+            pub fn is_tsgolint_rule(&self) -> bool {
+                self.flags().contains(RuleFlags::IS_TSGOLINT_RULE)
+            }
+
+            /// Whether this rule is recommended.
+            pub fn is_recommended(&self) -> bool {
+                self.flags().contains(RuleFlags::IS_RECOMMENDED)
             }
 
             /// The version of oxlint in which this rule was first available.
@@ -388,9 +413,21 @@ fn generate_rule_enum_impl(rule_entries: &[RuleEntry<'_>]) -> TokenStream {
 
             /// Whether this rule declares a configuration type.
             pub fn has_config(&self) -> bool {
+                self.flags().contains(RuleFlags::HAS_CONFIG)
+            }
+
+            /// Additional information about this rule.
+            #[cfg(feature = "ruledocs")]
+            pub fn info(&self) -> RuleInfo {
                 match self {
-                    #(#has_config_arms),*
+                    #(#info_arms),*
                 }
+            }
+
+            /// A short, one-line summary of what this rule does.
+            #[cfg(feature = "ruledocs")]
+            pub fn short_description(&self) -> &'static str {
+                self.info().short_description
             }
 
             pub fn types_info(&self) -> Option<&'static AstTypesBitset> {

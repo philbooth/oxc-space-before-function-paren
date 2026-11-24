@@ -26,7 +26,7 @@ impl Deref for NoAsyncEndpointHandlers {
 }
 
 #[derive(Debug, Default, Clone, JsonSchema)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct NoAsyncEndpointHandlersConfig {
     /// An array of names that are allowed to be async.
     allowed_names: Vec<CompactStr>,
@@ -179,6 +179,7 @@ declare_oxc_lint!(
     suspicious,
     config = NoAsyncEndpointHandlersConfig,
     version = "0.9.2",
+    short_description = "Disallows the use of `async` functions as Express endpoint handlers.",
 );
 
 impl Rule for NoAsyncEndpointHandlers {
@@ -188,8 +189,9 @@ impl Rule for NoAsyncEndpointHandlers {
             .and_then(Value::as_object)
             .and_then(|config| config.get("allowedNames"))
             .and_then(Value::as_array)
-            .map(|names| names.iter().filter_map(Value::as_str).map(CompactStr::from).collect())
-            .unwrap_or_default();
+            .map_or_default(|names| {
+                names.iter().filter_map(Value::as_str).map(CompactStr::from).collect()
+            });
         allowed_names.sort_unstable();
         allowed_names.dedup();
 
@@ -197,8 +199,8 @@ impl Rule for NoAsyncEndpointHandlers {
     }
 
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
-        let kind = node.kind();
-        let Some((endpoint, args)) = utils::as_endpoint_registration(&kind) else {
+        let AstKind::CallExpression(call) = node.kind() else { return };
+        let Some((endpoint, args)) = utils::as_endpoint_registration(call) else {
             return;
         };
         for arg in
@@ -279,17 +281,12 @@ impl NoAsyncEndpointHandlers {
                     _ => {}
                 }
             }
-            func if utils::is_endpoint_handler(func) => {
-                match func {
-                    // `app.get('/', (async?) function (req, res) {}`
-                    Expression::FunctionExpression(f) => {
-                        self.check_function(ctx, endpoint, registered_at, id_name, f);
-                    }
-                    Expression::ArrowFunctionExpression(f) => {
-                        self.check_arrow(ctx, endpoint, registered_at, id_name, f);
-                    }
-                    _ => unreachable!(),
-                }
+            // `app.get('/', (async?) function (req, res) {}`
+            Expression::FunctionExpression(f) if utils::is_endpoint_handler(arg) => {
+                self.check_function(ctx, endpoint, registered_at, id_name, f);
+            }
+            Expression::ArrowFunctionExpression(f) if utils::is_endpoint_handler(arg) => {
+                self.check_arrow(ctx, endpoint, registered_at, id_name, f);
             }
             _ => {}
         }
@@ -357,12 +354,10 @@ fn test() {
     let pass = vec![
         ("app.get('/', fooController)", None),
         ("app.get('/', (req, res) => {})", None),
-        ("app.get('/', (req, res) => {})", None),
         ("app.get('/', function (req, res) {})", None),
         ("app.get('/', middleware, function (req, res) {})", None),
         ("app.get('/', (req, res, next) => {})", None),
         ("app.get('/', (err, req, res, next) => {})", None),
-        ("app.get('/', (err, req, res) => {})", None),
         ("app.get('/', (err, req, res) => {})", None),
         ("app.get('/', (req, res) => Promise.resolve())", None),
         ("app.get('/', (req, res) => new Promise((resolve, reject) => resolve()))", None),
@@ -403,7 +398,6 @@ fn test() {
         ("app.get('/', async function (req, res) {})", None),
         ("app.get('/', async (req, res) =>  {})", None),
         ("app.get('/', async (req, res, next) =>  {})", None),
-        ("weirdName.get('/', async (req, res) =>  {})", None),
         ("weirdName.get('/', async (req, res) =>  {})", None),
         (
             "

@@ -4,9 +4,7 @@ use oxc_ast::ast::*;
 use oxc_syntax::operator::UnaryOperator;
 
 use crate::{
-    GlobalContext, ToBoolean,
-    array_join::ArrayJoin,
-    constant_evaluation::{DetermineValueType, ValueType},
+    DetermineValueType, GlobalContext, ToBoolean, ValueType, array_join::ArrayJoin,
     to_primitive::maybe_object_with_to_primitive_related_properties_overridden,
 };
 
@@ -55,7 +53,8 @@ impl<'a> ToJsString<'a> for ArrayExpressionElement<'a> {
 
 impl<'a> ToJsString<'a> for StringLiteral<'a> {
     fn to_js_string(&self, _ctx: &impl GlobalContext<'a>) -> Option<Cow<'a, str>> {
-        Some(Cow::Borrowed(self.value.as_str()))
+        // This analysis returns UTF-8. Leave values containing lone surrogates unevaluated.
+        self.value.as_str().map(Cow::Borrowed)
     }
 }
 
@@ -63,7 +62,7 @@ impl<'a> ToJsString<'a> for TemplateLiteral<'a> {
     fn to_js_string(&self, ctx: &impl GlobalContext<'a>) -> Option<Cow<'a, str>> {
         let mut str = String::new();
         for (i, quasi) in self.quasis.iter().enumerate() {
-            str.push_str(quasi.value.cooked.as_ref()?);
+            str.push_str(quasi.value.cooked?.as_str()?);
 
             if i < self.expressions.len() {
                 let expr = &self.expressions[i];
@@ -141,10 +140,15 @@ impl<'a> ToJsString<'a> for ObjectExpression<'a> {
 
 impl<'a> ToJsString<'a> for RegExpLiteral<'a> {
     fn to_js_string(&self, _ctx: &impl GlobalContext<'a>) -> Option<Cow<'a, str>> {
-        if let Some(raw) = self.raw.as_ref() {
-            Some(Cow::Borrowed(raw.as_str()))
-        } else {
-            Some(Cow::Owned(self.regex.to_string()))
+        let pattern = self.regex.pattern.text.as_str();
+        if let Some(raw) = self.raw
+            && let Some((prefix, flags)) = raw.as_str().rsplit_once('/')
+            && flags == self.regex.flags.to_inline_string().as_str()
+            && let Some(raw_pattern) = prefix.strip_prefix('/')
+            && (std::ptr::eq(raw_pattern, pattern) || raw_pattern == pattern)
+        {
+            return Some(Cow::Borrowed(raw.as_str()));
         }
+        Some(Cow::Owned(self.regex.to_string()))
     }
 }

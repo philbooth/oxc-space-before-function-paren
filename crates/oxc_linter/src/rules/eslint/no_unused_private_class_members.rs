@@ -8,7 +8,10 @@ use oxc_syntax::class::ElementKind;
 
 use crate::{context::LintContext, rule::Rule};
 
-fn no_unused_private_class_members_diagnostic(name: &str, span: Span) -> OxcDiagnostic {
+fn no_unused_private_class_members_diagnostic(
+    name: impl std::fmt::Display,
+    span: Span,
+) -> OxcDiagnostic {
     OxcDiagnostic::warn(format!("'{name}' is defined but never used."))
         .with_help("Remove the declaration or use it in the code.")
         .with_label(span)
@@ -88,7 +91,10 @@ declare_oxc_lint!(
     NoUnusedPrivateClassMembers,
     eslint,
     correctness,
+    recommended,
+    pending,
     version = "0.1.1",
+    short_description = "Disallow unused private class members.",
 );
 
 impl Rule for NoUnusedPrivateClassMembers {
@@ -107,7 +113,7 @@ impl Rule for NoUnusedPrivateClassMembers {
                     })
                 {
                     ctx.diagnostic(no_unused_private_class_members_diagnostic(
-                        &element.name,
+                        element.name.display(),
                         element.span,
                     ));
                 }
@@ -183,7 +189,7 @@ fn is_read(current_node_id: NodeId, semantic: &Semantic) -> bool {
                 AstKind::PrivateFieldExpression(_),
                 AstKind::AssignmentTargetPropertyProperty(prop),
             ) => {
-                if prop.computed && prop.name.span() == curr.span() {
+                if prop.name.is_computed() && prop.name.span() == curr.span() {
                     return true;
                 }
             }
@@ -248,17 +254,7 @@ fn is_value_context(parent: &AstNode, child: &AstNode, semantic: &Semantic<'_>) 
             // The right-hand side of an assignment is always in a value context (being read for assignment)
             assign_expr.right.span().contains_inclusive(child.span())
         }
-        AstKind::ExpressionStatement(_) => {
-            let grandparent = semantic.nodes().parent_node(parent.id());
-            if let AstKind::FunctionBody(_) = grandparent.kind()
-                && let AstKind::ArrowFunctionExpression(arrow) =
-                    semantic.nodes().parent_kind(grandparent.id())
-                && arrow.expression
-            {
-                return true;
-            }
-            false
-        }
+        AstKind::ArrowFunctionExpression(arrow) => arrow.is_expression(),
         AstKind::ParenthesizedExpression(_)
         | AstKind::TSAsExpression(_)
         | AstKind::TSSatisfiesExpression(_)
@@ -515,6 +511,17 @@ fn test() {
         r"export class Foo { #fetch: typeof fetch; constructor() { this.#fetch = fetch; } async bar() { return (0, this.#fetch)('https://example.com'); } }",
         r"export class StateMachine { #state = 'idle'; step() { switch (this.#state) { case 'idle': { this.#state = 'running'; break; } case 'running': { this.#state = 'done'; break; } } } }",
         r"class Stopper { #promise; async stop() { this.#promise ??= this.makePromise(); await this.#promise; } makePromise() { return Promise.resolve(); } }",
+        "class C {
+            #usedInInnerClass;
+
+            method(a) {
+                return class {
+                    foo = a.#usedInInnerClass;
+                }
+            }
+        }",
+        "class C { #x; m() { return class { #y; n(o) { return o.#x + this.#y; } }; } }",
+        "class C { #m() {} run(o) { return class { go() { o.#m(); } }; } }",
     ];
 
     let fail = vec![
@@ -665,6 +672,7 @@ fn test() {
         r"class Foo { #x; #y; method(a, b, c) { a ? (b ? this.#x : c) : this.#y; } }",
         r"class Foo { #x; method() { a && (b ? this.#x : c); } }",
         r"class Foo { #a; #b; #c; method() { this.#a ? this.#b : this.#c; } }",
+        "class C { #x; m() { return class { #x; n(o) { return o.#x; } }; } }",
     ];
 
     Tester::new(NoUnusedPrivateClassMembers::NAME, NoUnusedPrivateClassMembers::PLUGIN, pass, fail)

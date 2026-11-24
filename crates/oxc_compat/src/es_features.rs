@@ -24,6 +24,7 @@ pub enum ESFeature {
     ES2015StickyRegex,
     ES2015UnicodeEscapes,
     ES2015UnicodeRegex,
+    ES2015RegExpConstructorCanAlterFlags,
     ES2015Spread,
     ES2015Destructuring,
     ES2015BlockScoping,
@@ -57,6 +58,7 @@ pub enum ESFeature {
     ES2020ExportNamespaceFrom,
     ES2020ArbitraryModuleNamespaceNames,
     ES2022TopLevelAwait,
+    StandardDecorators,
 }
 pub fn features() -> &'static FxHashMap<ESFeature, EngineTargets> {
     use ESFeature::*;
@@ -383,6 +385,24 @@ pub fn features() -> &'static FxHashMap<ESFeature, EngineTargets> {
                     (Deno, Version(1u16, 0u16, 0u16)),
                     (Electron, Version(1u16, 1u16, 0u16)),
                     (Opera, Version(37u16, 0u16, 0u16)),
+                    (Es, Version(2015u16, 0, 0)),
+                ])),
+            ),
+            (
+                ES2015RegExpConstructorCanAlterFlags,
+                EngineTargets::new(FxHashMap::from_iter([
+                    (Samsung, Version(5u16, 0u16, 0u16)),
+                    (Node, Version(6u16, 0u16, 0u16)),
+                    (Firefox, Version(39u16, 0u16, 0u16)),
+                    (Chrome, Version(49u16, 0u16, 0u16)),
+                    (Safari, Version(10u16, 0u16, 0u16)),
+                    (Ios, Version(10u16, 0u16, 0u16)),
+                    (Edge, Version(12u16, 0u16, 0u16)),
+                    (Rhino, Version(1u16, 8u16, 0u16)),
+                    (OperaMobile, Version(36u16, 0u16, 0u16)),
+                    (Deno, Version(1u16, 0u16, 0u16)),
+                    (Electron, Version(0u16, 37u16, 0u16)),
+                    (Opera, Version(36u16, 0u16, 0u16)),
                     (Es, Version(2015u16, 0, 0)),
                 ])),
             ),
@@ -940,6 +960,7 @@ pub fn features() -> &'static FxHashMap<ESFeature, EngineTargets> {
                     (Es, Version(2022u16, 0, 0)),
                 ])),
             ),
+            (StandardDecorators, EngineTargets::new(FxHashMap::from_iter([]))),
         ])
     })
 }

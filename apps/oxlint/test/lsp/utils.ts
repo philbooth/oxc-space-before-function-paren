@@ -9,6 +9,7 @@ import {
   DiagnosticSeverity,
   DidChangeConfigurationNotification,
   DidChangeTextDocumentNotification,
+  DidChangeWatchedFilesParams,
   DidChangeWatchedFilesNotification,
   DidOpenTextDocumentNotification,
   DocumentDiagnosticRequest,
@@ -16,6 +17,7 @@ import {
   FileChangeType,
   InitializedNotification,
   InitializeRequest,
+  MarkupContent,
   Position,
   RegistrationRequest,
   ShutdownRequest,
@@ -82,14 +84,24 @@ export function createLspConnection(env: Record<string, string> = {}) {
       return result;
     },
 
+    getShowMessage(): Promise<{ type: number; message: string }> {
+      return new Promise((resolve) => {
+        const disposer = connection.onNotification("window/showMessage", (params) => {
+          resolve(params);
+          disposer.dispose();
+        });
+      });
+    },
+
     async didChangeConfiguration(settings: unknown) {
       await connection.sendNotification(DidChangeConfigurationNotification.type, { settings });
     },
 
     async didChangeWatchedFiles(uris: string[]) {
-      await connection.sendNotification(DidChangeWatchedFilesNotification.type, {
+      const params: DidChangeWatchedFilesParams = {
         changes: uris.map((uri) => ({ uri, type: FileChangeType.Changed })),
-      });
+      };
+      await connection.sendNotification(DidChangeWatchedFilesNotification.type, params);
     },
 
     async didOpen(uri: string, languageId: string, text: string) {
@@ -165,6 +177,25 @@ export async function lintFixture(
     [{ path: fixturePath, languageId }],
     initializationOptions ? [initializationOptions] : undefined,
   );
+}
+
+export async function initializationMessagesFixture(
+  fixturesDir: string,
+  fixturePath: string,
+  initializationOptions?: OxlintLSPConfig,
+): Promise<string> {
+  const workspaceUri = pathToFileURL(dirname(join(fixturesDir, fixturePath))).href;
+  await using client = createLspConnection();
+  const messagePromise = client.getShowMessage();
+  await client.initialize(
+    [{ uri: workspaceUri, name: "workspace-0" }],
+    PULL_DIAGNOSTICS_CAPABILITY,
+    [{ workspaceUri, options: initializationOptions ?? null }],
+  );
+
+  const message = await messagePromise;
+
+  return snapshotShowMessages([message]);
 }
 
 export async function lintSingleFileFixture(
@@ -419,7 +450,36 @@ type OxlintLSPConfig = {
   fixKind?: string;
   configPath?: string;
   typeAware?: boolean;
+  rulesCustomization?: Record<
+    string,
+    {
+      autofix?: boolean;
+    }
+  >;
 };
+
+function snapshotShowMessages(messages: { type: number; message: string }[]): string {
+  if (messages.length === 0) {
+    return "--- Show Messages ---------\n(none)";
+  }
+
+  return [
+    "--- Show Messages ---------",
+    ...messages.map(
+      ({ type, message }, index) => `[${index}] type=${type}\n${sanitizeSnapshotText(message)}`,
+    ),
+  ].join("\n");
+}
+
+function sanitizeSnapshotText(text: string): string {
+  return text.replaceAll(
+    process
+      .cwd()
+      // replace current cwd with forward slashes, the `oxlint` backend output in test-mode uses forward slashes.
+      .replaceAll("\\", "/"),
+    "<cwd>",
+  );
+}
 
 async function getDiagnosticSnapshot(
   fixturePath: string,
@@ -520,11 +580,11 @@ function lspRangeToBabelLocation(range: Range) {
   return {
     start: {
       line: range.start.line + 1,
-      column: range.start.character + 1,
+      column: range.start.character,
     },
     end: {
       line: range.end.line + 1,
-      column: range.end.character + 1,
+      column: range.end.character,
     },
   };
 }
@@ -539,9 +599,13 @@ function snapshotDiagnostics(content: string, report: DocumentDiagnosticReport):
     const severity = getSeverityLabel(diagnostic.severity);
 
     return codeFrameColumns(content, babelLocation, {
-      message: `${severity}: ${diagnostic.message}`,
+      message: `${severity}: ${formatDiagnosticMessage(diagnostic.message)}`,
     });
   });
+}
+
+function formatDiagnosticMessage(message: string | MarkupContent): string {
+  return typeof message === "string" ? message : message.value;
 }
 
 function snapshotCodeAction(

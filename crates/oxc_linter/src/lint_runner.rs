@@ -6,12 +6,13 @@ use std::{
 
 use rustc_hash::FxHashMap;
 
-use oxc_diagnostics::{DiagnosticSender, DiagnosticService};
-use oxc_span::Span;
+use oxc_diagnostics::{DiagnosticSender, DiagnosticService, OxcDiagnostic};
+use oxc_span::{SourceType, Span};
 
 use crate::{
-    AllowWarnDeny, DisableDirectives, FixKind, LintService, LintServiceOptions, Linter, Message,
-    OsFileSystem, TsGoLintState,
+    AllowWarnDeny, DisableDirectives, FixKind, Fixer, LintService, LintServiceOptions, Linter,
+    Message, OsFileSystem, RuleTimingStore, RuntimeFileSystem, TsGoLintState,
+    create_unused_directives_messages, suppression::DiffManager,
 };
 
 /// Unified runner that orchestrates both regular (oxc) and type-aware (tsgolint) linting
@@ -25,7 +26,11 @@ pub struct LintRunner {
     directives_store: DirectivesStore,
     /// Current working directory
     cwd: PathBuf,
+    fix_kind: FixKind,
     type_check_only: bool,
+    /// The regular pass writes fixed files, so type-aware linting must wait until it is done to
+    /// read them.
+    regular_pass_writes_files: bool,
 }
 
 /// Manages disable directives across all linting engines.
@@ -84,24 +89,60 @@ impl DirectivesStore {
         self.map.lock().expect("DirectivesStore mutex poisoned in get").get(path).cloned()
     }
 
-    /// Report unused disable directives
+    /// Report unused disable directives, removing them according to `fix_kind`.
+    ///
+    /// Fixes are skipped for files that changed after their directives were collected
+    /// (e.g. by other fixes), because the directive spans would be stale.
     ///
     /// # Panics
     /// Panics if the mutex is poisoned or if sending to the error channel fails.
-    pub fn report_unused(&self, severity: AllowWarnDeny, cwd: &Path, tx_error: &DiagnosticSender) {
-        use crate::create_unused_directives_diagnostics;
-
+    pub fn report_unused(
+        &self,
+        severity: AllowWarnDeny,
+        fix_kind: FixKind,
+        cwd: &Path,
+        tx_error: &DiagnosticSender,
+    ) {
         let map = self.map.lock().expect("DirectivesStore mutex poisoned in report_unused");
         for (path, directives) in map.iter() {
-            let diagnostics = create_unused_directives_diagnostics(directives, severity);
+            let mut messages = create_unused_directives_messages(directives, severity, None);
+            if messages.is_empty() {
+                continue;
+            }
 
-            if !diagnostics.is_empty() {
-                let source_text = std::fs::read_to_string(path.as_path()).unwrap_or_default();
+            let source_text = std::fs::read_to_string(path.as_path()).unwrap_or_default();
+            if fix_kind.is_some() && directives.matches_source(&source_text) {
+                messages = create_unused_directives_messages(
+                    directives,
+                    severity,
+                    Some((fix_kind, &source_text)),
+                );
+                let source_type = SourceType::from_path(path)
+                    .ok()
+                    .map(|st| if st.is_javascript() { st.with_jsx(true) } else { st });
+                let fix_result = Fixer::new(&source_text, messages, source_type).fix();
+                if fix_result.fixed
+                    && let Err(error) = OsFileSystem.write_file(path, &fix_result.fixed_code)
+                {
+                    tx_error
+                        .send(vec![
+                            OxcDiagnostic::error(format!(
+                                "Failed to write file {} with error \"{error}\"",
+                                path.display()
+                            ))
+                            .into(),
+                        ])
+                        .expect("failed to send unused directive diagnostics");
+                }
+                messages = fix_result.messages;
+            }
+
+            if !messages.is_empty() {
                 let wrapped = DiagnosticService::wrap_diagnostics(
                     cwd,
                     path.clone(),
                     &source_text,
-                    diagnostics,
+                    messages.into_iter().map(Into::into).collect(),
                 );
                 tx_error.send(wrapped).expect("failed to send unused directive diagnostics");
             }
@@ -127,6 +168,14 @@ impl DirectivesStore {
     pub fn remove(&self, path: &Path) {
         self.map.lock().expect("DirectivesStore mutex poisoned in remove").remove(path);
     }
+
+    /// Take and remove disable directives for a specific file in a single lock acquisition.
+    ///
+    /// # Panics
+    /// Panics if the mutex is poisoned.
+    pub fn take(&self, path: &Path) -> Option<DisableDirectives> {
+        self.map.lock().expect("DirectivesStore mutex poisoned in take").remove(path)
+    }
 }
 
 impl Default for DirectivesStore {
@@ -144,6 +193,8 @@ pub struct LintRunnerBuilder {
     silent: bool,
     fix_kind: FixKind,
     type_check_only: bool,
+    timings: bool,
+    with_ignore_fixes: bool,
 }
 
 impl LintRunnerBuilder {
@@ -156,6 +207,8 @@ impl LintRunnerBuilder {
             silent: false,
             fix_kind: FixKind::None,
             type_check_only: false,
+            timings: false,
+            with_ignore_fixes: false,
         }
     }
 
@@ -189,6 +242,18 @@ impl LintRunnerBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_timings(mut self, timings: bool) -> Self {
+        self.timings = timings;
+        self
+    }
+
+    #[must_use]
+    pub fn with_ignore_fixes(mut self, with_ignore_fixes: bool) -> Self {
+        self.with_ignore_fixes = with_ignore_fixes;
+        self
+    }
+
     /// # Errors
     /// Returns an error if the type-aware linter fails to initialize.
     pub fn build(self) -> Result<LintRunner, String> {
@@ -200,7 +265,14 @@ impl LintRunnerBuilder {
                 self.regular_linter.config.clone(),
                 self.fix_kind,
             ) {
-                Ok(state) => Some(state.with_silent(self.silent).with_type_check(self.type_check)),
+                Ok(state) => Some(
+                    state
+                        .with_silent(self.silent)
+                        .with_type_check(self.type_check)
+                        .with_type_check_only(self.type_check_only)
+                        .with_timings(self.timings)
+                        .with_ignore_fixes(self.with_ignore_fixes),
+                ),
                 Err(e) => return Err(e),
             }
         } else {
@@ -208,6 +280,7 @@ impl LintRunnerBuilder {
         };
 
         let cwd = self.lint_service_options.cwd().to_path_buf();
+        let regular_pass_writes_files = self.regular_linter.options().fix.is_some();
         let mut lint_service = LintService::new(self.regular_linter, self.lint_service_options);
         lint_service.set_disable_directives_map(directives_coordinator.map());
 
@@ -216,7 +289,9 @@ impl LintRunnerBuilder {
             type_aware_linter,
             directives_store: directives_coordinator,
             cwd,
+            fix_kind: self.fix_kind,
             type_check_only: self.type_check_only,
+            regular_pass_writes_files,
         })
     }
 }
@@ -230,21 +305,44 @@ impl LintRunner {
     /// Run both regular and type-aware linting on files
     /// # Errors
     /// Returns an error if type-aware linting fails.
-    pub fn lint_files(
+    pub fn lint_files<const TIMINGS: bool>(
         mut self,
         files: &[Arc<OsStr>],
         tx_error: DiagnosticSender,
+        diff_manager: &Arc<DiffManager>,
+        rule_timing_store: Option<&RuleTimingStore>,
     ) -> Result<Self, String> {
         let fs: &(dyn crate::RuntimeFileSystem + Sync + Send) = &OsFileSystem;
+
+        // Start type-aware linting first so it runs alongside the regular pass. Its diagnostics
+        // are only filtered and reported after the regular pass has collected disable directives.
+        let mut type_aware_run = None;
+        if !self.regular_pass_writes_files {
+            type_aware_run = self.type_aware_linter.take().map(|linter| linter.start(files));
+        }
 
         if self.type_check_only {
             self.lint_service.collect_parse_diagnostics(fs, files.to_owned(), &tx_error);
         } else {
-            self.lint_service.run(fs, files.to_owned(), &tx_error);
+            self.lint_service.run::<TIMINGS>(
+                fs,
+                files.to_owned(),
+                &tx_error,
+                diff_manager,
+                rule_timing_store,
+            );
         }
 
-        if let Some(type_aware_linter) = self.type_aware_linter.take() {
-            type_aware_linter.lint(files, self.directives_store.map(), tx_error, fs)?;
+        let type_aware_run = type_aware_run
+            .or_else(|| self.type_aware_linter.take().map(|linter| linter.start(files)));
+        if let Some(type_aware_run) = type_aware_run {
+            type_aware_run.finish(
+                self.directives_store.map(),
+                tx_error,
+                fs,
+                diff_manager,
+                rule_timing_store,
+            )?;
         } else {
             drop(tx_error);
         }
@@ -264,7 +362,7 @@ impl LintRunner {
 
         if let Some(type_aware_linter) = &self.type_aware_linter {
             let tsgo_messages =
-                type_aware_linter.lint_source(files, file_system, self.directives_store.map())?;
+                type_aware_linter.lint_source(files, file_system, &self.directives_store.map())?;
             messages.extend(tsgo_messages);
         }
 
@@ -278,7 +376,7 @@ impl LintRunner {
         tx_error: &DiagnosticSender,
     ) {
         if let Some(severity) = severity {
-            self.directives_store.report_unused(severity, &self.cwd, tx_error);
+            self.directives_store.report_unused(severity, self.fix_kind, &self.cwd, tx_error);
         }
     }
 

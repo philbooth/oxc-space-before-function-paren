@@ -2,14 +2,15 @@ use oxc_ast::{
     AstKind,
     ast::{
         Argument, ArrayExpressionElement, AssignmentExpression, AssignmentTarget, CallExpression,
-        Expression, NewExpression, ObjectPropertyKind, Statement, VariableDeclaration,
-        VariableDeclarator,
+        Expression, NewExpression, ObjectPropertyKind, SimpleAssignmentTarget, Statement,
+        VariableDeclaration, VariableDeclarator,
     },
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_semantic::IsGlobalReference;
 use oxc_span::{GetSpan, Span};
+use oxc_str::JSStr;
 
 use crate::{AstNode, context::LintContext, rule::Rule};
 
@@ -93,6 +94,7 @@ declare_oxc_lint!(
     pedantic,
     pending,
     version = "1.35.0",
+    short_description = "Disallows mutating a variable immediately after initialization.",
 );
 
 /// The type of initialization
@@ -192,7 +194,7 @@ fn check_call_mutation<'a>(
         return;
     }
 
-    let Some(method_name) = member.static_property_name() else {
+    let Some(method_name) = member.static_property_name().and_then(JSStr::as_str) else {
         return;
     };
 
@@ -500,10 +502,9 @@ fn expression_references_variable(expr: &Expression<'_>, var_name: &str) -> bool
         Expression::ObjectExpression(obj) => obj.properties.iter().any(|prop| match prop {
             ObjectPropertyKind::ObjectProperty(p) => {
                 expression_references_variable(&p.value, var_name)
-                    || (p.computed
-                        && p.key
-                            .as_expression()
-                            .is_some_and(|e| expression_references_variable(e, var_name)))
+                    || p.key
+                        .as_expression()
+                        .is_some_and(|e| expression_references_variable(e, var_name))
             }
             ObjectPropertyKind::SpreadProperty(s) => {
                 expression_references_variable(&s.argument, var_name)
@@ -518,7 +519,10 @@ fn expression_references_variable(expr: &Expression<'_>, var_name: &str) -> bool
                 return false;
             }
             // Check the function body for references
-            arrow.body.statements.iter().any(|stmt| {
+            if let Some(expression) = arrow.get_expression() {
+                return expression_references_variable(expression, var_name);
+            }
+            arrow.get_function_body().unwrap().statements.iter().any(|stmt| {
                 if let Statement::ExpressionStatement(expr_stmt) = stmt {
                     expression_references_variable(&expr_stmt.expression, var_name)
                 } else if let Statement::ReturnStatement(ret) = stmt {
@@ -625,9 +629,7 @@ fn expression_references_variable(expr: &Expression<'_>, var_name: &str) -> bool
             .is_some_and(|e| expression_references_variable(e, var_name)),
         // Update expression: array++, ++array
         Expression::UpdateExpression(update) => {
-            if let oxc_ast::ast::SimpleAssignmentTarget::AssignmentTargetIdentifier(id) =
-                &update.argument
-            {
+            if let SimpleAssignmentTarget::AssignmentTargetIdentifier(id) = &update.argument {
                 id.name == var_name
             } else {
                 false

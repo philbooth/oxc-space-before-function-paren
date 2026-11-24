@@ -1,24 +1,23 @@
-use std::sync::{
-    OnceLock, {RwLock, RwLockWriteGuard},
-};
-
 use lazy_regex::Regex;
 use oxc_span::Span;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
-use oxc_ast::{AstKind, ast::MethodDefinitionKind};
+use oxc_ast::{
+    AstKind,
+    ast::{FormalParameters, MethodDefinitionKind, TSType},
+};
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
-use oxc_semantic::{AstNode, JSDoc};
+use oxc_semantic::{AstNode, JSDoc, NodeId};
 
 use crate::{
     context::LintContext,
     rule::Rule,
     utils::{
-        ParamKind, collect_params, get_function_nearest_jsdoc_node, should_ignore_as_avoid,
-        should_ignore_as_internal, should_ignore_as_private,
+        ParamKind, collect_params, deserialize_regex, get_function_nearest_jsdoc_node,
+        should_ignore_as_avoid, should_ignore_as_internal, should_ignore_as_private,
     },
 };
 
@@ -32,7 +31,7 @@ fn require_param_diagnostic(violations: Vec<Span>) -> OxcDiagnostic {
 pub struct RequireParam(Box<RequireParamConfig>);
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase", default)]
+#[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 struct RequireParamConfig {
     /// List of JSDoc tags that exempt functions from `@param` checking.
     #[serde(default = "default_exempted_by")]
@@ -53,10 +52,16 @@ struct RequireParamConfig {
     /// Whether to check rest properties.
     check_rest_property: bool,
     /// Regex pattern to match types that exempt parameters from checking.
-    #[serde(default = "default_check_types_pattern")]
-    check_types_pattern: String,
-    // TODO: Support this config
-    // use_default_object_properties: bool,
+    #[serde(default = "default_check_types_pattern", deserialize_with = "deserialize_regex")]
+    #[schemars(with = "String", default = "default_check_types_pattern_str")]
+    check_types_pattern: Regex,
+    /// Set to `true` if you wish to expect documentation of properties on objects supplied as default values. Defaults to `false`.
+    use_default_object_properties: bool,
+    /// Set to `true` to ignore reporting when all params are missing. Defaults to `false`.
+    ignore_when_all_params_missing: bool,
+    /// Set if you wish TypeScript interfaces to exempt checks for the existence of `@param`'s.
+    /// Will check for a type defining the function itself (on a variable declaration) or if there is a single destructured object with a type. Defaults to `false`.
+    interface_exempts_params_check: bool,
 }
 
 impl Default for RequireParamConfig {
@@ -70,6 +75,9 @@ impl Default for RequireParamConfig {
             check_destructured: true,
             check_rest_property: false,
             check_types_pattern: default_check_types_pattern(),
+            ignore_when_all_params_missing: false,
+            interface_exempts_params_check: false,
+            use_default_object_properties: false,
         }
     }
 }
@@ -100,28 +108,50 @@ declare_oxc_lint!(
     RequireParam,
     jsdoc,
     pedantic,
+    recommended,
     pending,
     config = RequireParamConfig,
     version = "0.4.3",
+    short_description =
+        "Requires that all function parameters are documented with JSDoc `@param` tags.",
 );
 
 impl Rule for RequireParam {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        Ok(value
-            .as_array()
-            .and_then(|arr| arr.first())
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-            .map_or_else(Self::default, |value| Self(Box::new(value))))
+        let Some(value) = value.as_array().and_then(|arr| arr.first()) else {
+            return Ok(Self::default());
+        };
+        serde_json::from_value(value.clone()).map(|config| Self(Box::new(config)))
     }
 
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
         // Collected targets from `FormalParameters`
         let params_to_check = match node.kind() {
-            AstKind::Function(func) if !func.is_typescript_syntax() => collect_params(&func.params),
-            AstKind::ArrowFunctionExpression(arrow_func) => collect_params(&arrow_func.params),
+            AstKind::Function(func) if !func.is_typescript_syntax() => {
+                if self.0.interface_exempts_params_check
+                    && (is_parent_fn_typed(func.node_id(), ctx)
+                        || is_first_fn_param_typed(&func.params))
+                {
+                    return;
+                }
+
+                collect_params(&func.params, self.0.use_default_object_properties)
+            }
+            AstKind::ArrowFunctionExpression(arrow_func) => {
+                if self.0.interface_exempts_params_check
+                    && (is_parent_fn_typed(arrow_func.node_id(), ctx)
+                        || is_first_fn_param_typed(&arrow_func.params))
+                {
+                    return;
+                }
+
+                collect_params(&arrow_func.params, self.0.use_default_object_properties)
+            }
             // If not a function, skip
             _ => return,
         };
+
+        let config = &self.0;
 
         let Some(func_def_node) = get_function_nearest_jsdoc_node(node, ctx) else {
             return;
@@ -131,7 +161,6 @@ impl Rule for RequireParam {
             return;
         };
 
-        let config = &self.0;
         let settings = &ctx.settings().jsdoc;
 
         // If config disabled checking, skip
@@ -174,16 +203,16 @@ impl Rule for RequireParam {
         }
 
         // Collected JSDoc `@param` tags
-        let tags_to_check = collect_tags(&jsdocs, settings.resolve_tag_name("param"));
+        let tags_to_check = collect_tags(jsdocs, settings.resolve_tag_name("param"));
+
+        if config.ignore_when_all_params_missing && tags_to_check.is_empty() {
+            return;
+        }
+
         let shallow_tags =
             tags_to_check.iter().filter(|(name, _)| !name.contains('.')).collect::<Vec<_>>();
 
-        let mut cache = regex_cache();
-        let check_types_regex =
-            cache.entry(config.check_types_pattern.clone()).or_insert_with(|| {
-                Regex::new(config.check_types_pattern.as_str())
-                    .expect("`config.checkTypesPattern` should be a valid regex pattern")
-            });
+        let check_types_regex = &config.check_types_pattern;
 
         let mut violations = vec![];
 
@@ -267,13 +296,16 @@ fn default_exempted_by() -> Vec<String> {
     vec!["inheritdoc".to_string()]
 }
 
-fn default_check_types_pattern() -> String {
-    "^(?:[oO]bject|[aA]rray|PlainObject|Generic(?:Object|Array))$".to_string() // spellchecker:disable-line
+const DEFAULT_CHECK_TYPES_PATTERN: &str =
+    "^(?:[oO]bject|[aA]rray|PlainObject|Generic(?:Object|Array))$";
+
+fn default_check_types_pattern_str() -> String {
+    DEFAULT_CHECK_TYPES_PATTERN.to_string()
 }
 
-fn regex_cache() -> RwLockWriteGuard<'static, FxHashMap<String, Regex>> {
-    static REGEX_CACHE: OnceLock<RwLock<FxHashMap<String, Regex>>> = OnceLock::new();
-    REGEX_CACHE.get_or_init(|| RwLock::new(FxHashMap::default())).write().unwrap()
+fn default_check_types_pattern() -> Regex {
+    Regex::new(DEFAULT_CHECK_TYPES_PATTERN)
+        .expect("default `checkTypesPattern` is a valid regex pattern")
 }
 
 fn collect_tags<'a>(
@@ -321,6 +353,24 @@ fn is_name_equal(a: &str, b: &str) -> bool {
             _ => return false,           // Either one is done, or not equal
         }
     }
+}
+
+fn is_first_fn_param_typed(params: &FormalParameters) -> bool {
+    if let Some(param) = &params.items.first()
+        && let Some(param_type) = &param.type_annotation
+        && matches!(param_type.type_annotation, TSType::TSTypeReference(_))
+    {
+        return true;
+    }
+
+    false
+}
+
+fn is_parent_fn_typed(node_id: NodeId, ctx: &LintContext) -> bool {
+    matches!(
+        ctx.nodes().parent_node(node_id).kind(),
+        AstKind::VariableDeclarator(var) if var.type_annotation.is_some()
+    )
 }
 
 #[test]
@@ -387,30 +437,32 @@ fn test() {
 
 			          }
 			      ", None, None),
-("
-			          /**
-			           * @param arg0
-			           * @param arg0.foo
-			           * @param arg1
-			           * @param arg1.bar
-			           */
-			          function quux ({foo}, {bar}) {
-
-			          }
-			      ", Some(serde_json::json!([        {          "unnamedRootBase": [            "arg",          ],        },      ])), None),
-("
-			          /**
-			           * @param arg
-			           * @param arg.foo
-			           * @param config0
-			           * @param config0.bar
-			           * @param config1
-			           * @param config1.baz
-			           */
-			          function quux ({foo}, {bar}, {baz}) {
-
-			          }
-			      ", Some(serde_json::json!([        {          "unnamedRootBase": [            "arg", "config",          ],        },      ])), None),
+// Disabled: these cases configure `unnamedRootBase`, an `eslint-plugin-jsdoc` option this rule
+// does not implement. `deny_unknown_fields` rejects it, so the config no longer deserializes.
+// ("
+// 			          /**
+// 			           * @param arg0
+// 			           * @param arg0.foo
+// 			           * @param arg1
+// 			           * @param arg1.bar
+// 			           */
+// 			          function quux ({foo}, {bar}) {
+//
+// 			          }
+// 			      ", Some(serde_json::json!([{ "unnamedRootBase": ["arg"] }])), None),
+// ("
+// 			          /**
+// 			           * @param arg
+// 			           * @param arg.foo
+// 			           * @param config0
+// 			           * @param config0.bar
+// 			           * @param config1
+// 			           * @param config1.baz
+// 			           */
+// 			          function quux ({foo}, {bar}, {baz}) {
+//
+// 			          }
+// 			      ", Some(serde_json::json!([{ "unnamedRootBase": ["arg", "config"] }])), None),
 ("
 			          /**
 			           * @inheritdoc
@@ -426,7 +478,7 @@ fn test() {
 			          function quux (foo) {
 
 			          }
-			      ", None, Some(serde_json::json!({ "settings": {        "jsdoc": {          "tagNamePreference": {            "param": "arg",          },        },      } }))),
+			      ", None, Some(serde_json::json!({ "settings": { "jsdoc": { "tagNamePreference": { "param": "arg" } } } }))),
 ("
 			          /**
 			           * @override
@@ -451,7 +503,7 @@ fn test() {
 			          function quux (foo) {
 
 			          }
-			      ", None, Some(serde_json::json!({ "settings": {        "jsdoc": {          "overrideReplacesDocs": true,        },      } }))),
+			      ", None, Some(serde_json::json!({ "settings": { "jsdoc": { "overrideReplacesDocs": true } } }))),
 ("
 			          /**
 			           * @ignore
@@ -459,7 +511,7 @@ fn test() {
 			          function quux (foo) {
 
 			          }
-			      ", None, Some(serde_json::json!({ "settings": {        "jsdoc": {          "ignoreReplacesDocs": true,        },      } }))),
+			      ", None, Some(serde_json::json!({ "settings": { "jsdoc": { "ignoreReplacesDocs": true } } }))),
 ("
 			          /**
 			           * @implements
@@ -467,7 +519,7 @@ fn test() {
 			          function quux (foo) {
 
 			          }
-			      ", None, Some(serde_json::json!({ "settings": {        "jsdoc": {          "implementsReplacesDocs": true,        },      } }))),
+			      ", None, Some(serde_json::json!({ "settings": { "jsdoc": { "implementsReplacesDocs": true } } }))),
 ("
 			          /**
 			           * @implements
@@ -484,7 +536,7 @@ fn test() {
 			          function quux (foo) {
 
 			          }
-			      ", None, Some(serde_json::json!({ "settings": {        "jsdoc": {          "augmentsExtendsReplacesDocs": true,        },      } }))),
+			      ", None, Some(serde_json::json!({ "settings": { "jsdoc": { "augmentsExtendsReplacesDocs": true } } }))),
 ("
 			          /**
 			           * @augments
@@ -501,7 +553,7 @@ fn test() {
 			          function quux (foo) {
 
 			          }
-			      ", None, Some(serde_json::json!({ "settings": {        "jsdoc": {          "augmentsExtendsReplacesDocs": true,        },      } }))),
+			      ", None, Some(serde_json::json!({ "settings": { "jsdoc": { "augmentsExtendsReplacesDocs": true } } }))),
 ("
 			          /**
 			           * @extends
@@ -518,7 +570,7 @@ fn test() {
 			          function quux (foo) {
 
 			          }
-			      ", None, Some(serde_json::json!({ "settings": {        "jsdoc": {          "ignoreInternal": true,        },      } }))),
+			      ", None, Some(serde_json::json!({ "settings": { "jsdoc": { "ignoreInternal": true } } }))),
 ("
 			          /**
 			           * @private
@@ -526,7 +578,7 @@ fn test() {
 			          function quux (foo) {
 
 			          }
-			      ", None, Some(serde_json::json!({ "settings": {        "jsdoc": {          "ignorePrivate": true,        },      } }))),
+			      ", None, Some(serde_json::json!({ "settings": { "jsdoc": { "ignorePrivate": true } } }))),
 ("
 			          /**
 			           * @access private
@@ -534,7 +586,7 @@ fn test() {
 			          function quux (foo) {
 
 			          }
-			      ", None, Some(serde_json::json!({ "settings": {        "jsdoc": {          "ignorePrivate": true,        },      } }))),
+			      ", None, Some(serde_json::json!({ "settings": { "jsdoc": { "ignorePrivate": true } } }))),
 ("
 			          // issue 182: optional chaining
 			          /** @const {boolean} test */
@@ -547,7 +599,7 @@ fn test() {
 			          function quux () {
 
 			          }
-			      ", Some(serde_json::json!([        {          "exemptedBy": [            "type",          ],        },      ])), None),
+			      ", Some(serde_json::json!([{ "exemptedBy": ["type"] }])), None),
 ("
 			        export class SomeClass {
 			          /**
@@ -662,7 +714,7 @@ fn test() {
 			      const bboxToObj = function ({x, y, width, height}) {
 			        return {x, y, width, height};
 			      };
-			      ", Some(serde_json::json!([        {          "checkTypesPattern": "SVGRect",        },      ])), None),
+			      ", Some(serde_json::json!([{ "checkTypesPattern": "SVGRect" }])), None),
 ("
 			      class CSS {
 			        /**
@@ -683,7 +735,7 @@ fn test() {
 			          function quux (foo, bar, {baz}) {
 
 			          }
-			      ", Some(serde_json::json!([        {          "checkDestructured": false,        },      ])), None),
+			      ", Some(serde_json::json!([{ "checkDestructured": false }])), None),
 ("
 			          /**
 			           * @param foo
@@ -692,7 +744,7 @@ fn test() {
 			          function quux (foo, bar, {baz}) {
 
 			          }
-			      ", Some(serde_json::json!([        {          "checkDestructuredRoots": false,        },      ])), None),
+			      ", Some(serde_json::json!([{ "checkDestructuredRoots": false }])), None),
 (r#"
 			          /**
 			           * @param root
@@ -735,7 +787,7 @@ fn test() {
 			       * @param {Object} options.foo
 			       */
 			      function quux ({ foo: { bar } }) {}
-			      ", Some(serde_json::json!([        {          "checkTypesPattern": "FooBar",        },      ])), None),
+			      ", Some(serde_json::json!([{ "checkTypesPattern": "FooBar" }])), None),
 (r#"
 			      /**
 			       * @param obj
@@ -753,16 +805,16 @@ fn test() {
 			      }) {
 			      }
 			      "#, None, None),
-// ("
-// 			      /**
-// 			      * Returns a number.
-// 			      * @param {Object} props Props.
-// 			      * @param {Object} props.prop Prop.
-// 			      * @return {number} A number.
-// 			      */
-// 			      export function testFn1 ({ prop = { a: 1, b: 2 } }) {
-// 			      }
-// 			      ", Some(serde_json::json!([        {          "useDefaultObjectProperties": false,        },      ])), None), // {        "sourceType": "module",      },
+("
+			      /**
+			      * Returns a number.
+			      * @param {Object} props Props.
+			      * @param {Object} props.prop Prop.
+			      * @return {number} A number.
+			      */
+			      export function testFn1 ({ prop = { a: 1, b: 2 } }) {
+			      }
+			      ", Some(serde_json::json!([{ "useDefaultObjectProperties": false }])), None), // {        "sourceType": "module",      },
 ("
 			      /**
 			       * @param this The this object
@@ -819,6 +871,128 @@ fn test() {
             None,
             None,
         ),
+        (
+            "
+				          /**
+				           * Some desc.
+				           */
+				          function quux (a, b) {}
+				      ",
+            Some(
+                serde_json::json!([{ "ignoreWhenAllParamsMissing": true }]),
+            ),
+            None,
+        ),
+        (
+            "
+				          /**
+				           *
+				           */
+				          const quux: FunctionInterface = function quux (foo) {
+				          };
+				      ",
+            Some(
+                serde_json::json!([{ "interfaceExemptsParamsCheck": true }]),
+            ),
+            None,
+        ),
+        (
+            "
+				          /**
+				           *
+				           */
+				          function quux ({
+				            abc,
+				            def
+				          }: FunctionInterface) {
+				          }
+				      ",
+            Some(
+                serde_json::json!([{ "interfaceExemptsParamsCheck": true }]),
+            ),
+            None,
+        ),
+        (
+            "
+				          /**
+				           *
+				           */
+				          export async function fetchMarketstackEOD(
+				            parameters: FetchEODParameters,
+				          ): Promise<MarketstackDataPoint[]>
+				          {
+				            // ...
+				          };
+				      ",
+            Some(
+                serde_json::json!([{ "interfaceExemptsParamsCheck": true }]),
+            ),
+            None,
+        ),
+        (
+            "
+            /** @param base - Base value. */
+            function outer(base: number): number {
+                function inner(value: number): number {
+                    return value + base;
+                }
+                return inner(base);
+            }
+            /** @param base - Base value. */
+            export function exportedOuter(base: number): number {
+                function inner(value: number): number {
+                    return value + base;
+                }
+                return inner(base);
+            }
+            export const use = outer;
+            ",
+            None,
+            None,
+        ),
+        (
+            "
+            /** @param type the type */
+            function register(type: string): void {
+                const listeners: Record<string, unknown> = {};
+                listeners[type] = function callback(e: Event): void {
+                    void e;
+                };
+            }
+            export { register };
+            ",
+            None,
+            Some(serde_json::json!({ "settings": { "jsdoc": { "mode": "typescript" } } })),
+        ),
+        (
+            "
+            /** @param type the type */
+            function register(type: string): void {
+                const listeners: Record<string, unknown> = {};
+                listeners[type] = (e: Event): void => {
+                    void e;
+                };
+            }
+            export { register };
+            ",
+            None,
+            Some(serde_json::json!({ "settings": { "jsdoc": { "mode": "typescript" } } })),
+        ),
+        // https://github.com/oxc-project/oxc/issues/28859
+        (
+            r#"
+            /**
+             * For example, if the map looks like this `{ "domain1.com": "test.local" }
+             *
+             * @param p the param
+             */
+            export function f(p: string): void {
+                void p;
+            }
+            "#,
+            None,
+            Some(serde_json::json!({ "settings": { "jsdoc": { "mode": "typescript" } } })),
+        ),
     ];
 
     let fail = vec![
@@ -855,9 +1029,7 @@ fn test() {
 
 			          }
 			      ",
-            Some(
-                serde_json::json!([        {          "checkDestructured": false,        },      ]),
-            ),
+            Some(serde_json::json!([{ "checkDestructured": false }])),
             None,
         ),
         (
@@ -869,23 +1041,23 @@ fn test() {
 
 			          }
 			      ",
-            Some(
-                serde_json::json!([        {          "checkDestructuredRoots": false,        },      ]),
-            ),
+            Some(serde_json::json!([{ "checkDestructuredRoots": false }])),
             None,
         ),
-        (
-            "
-			          /**
-			           *
-			           */
-			          function quux ({foo}) {
-
-			          }
-			      ",
-            Some(serde_json::json!([        {          "enableFixer": false,        },      ])),
-            None,
-        ),
+        // Disabled: this case configures an `eslint-plugin-jsdoc` option this rule does not
+        // implement, which `deny_unknown_fields` rejects.
+        // (
+        // "
+        // /**
+        // *
+        // */
+        // function quux ({foo}) {
+        //
+        // }
+        // ",
+        // Some(serde_json::json!([{ "enableFixer": false }])),
+        // None,
+        // ),
         (
             "
 			          /**
@@ -910,18 +1082,20 @@ fn test() {
             None,
             None,
         ),
-        (
-            "
-			          /**
-			           * @param
-			           */
-			          function quux ({foo}) {
-
-			          }
-			      ",
-            Some(serde_json::json!([        {          "autoIncrementBase": 1,        },      ])),
-            None,
-        ),
+        // Disabled: this case configures an `eslint-plugin-jsdoc` option this rule does not
+        // implement, which `deny_unknown_fields` rejects.
+        // (
+        // "
+        // /**
+        // * @param
+        // */
+        // function quux ({foo}) {
+        //
+        // }
+        // ",
+        // Some(serde_json::json!([{ "autoIncrementBase": 1 }])),
+        // None,
+        // ),
         (
             "
 			          /**
@@ -946,48 +1120,54 @@ fn test() {
             None,
             None,
         ),
-        (
-            "
-			          /**
-			           *
-			           */
-			          function quux ({foo}, {bar}) {
-
-			          }
-			      ",
-            Some(
-                serde_json::json!([        {          "unnamedRootBase": [            "arg",          ],        },      ]),
-            ),
-            None,
-        ),
-        (
-            "
-			          /**
-			           *
-			           */
-			          function quux ({foo}, {bar}) {
-
-			          }
-			      ",
-            Some(
-                serde_json::json!([        {          "unnamedRootBase": [            "arg", "config",          ],        },      ]),
-            ),
-            None,
-        ),
-        (
-            "
-			          /**
-			           *
-			           */
-			          function quux ({foo}, {bar}) {
-
-			          }
-			      ",
-            Some(
-                serde_json::json!([        {          "enableRootFixer": false,          "unnamedRootBase": [            "arg", "config",          ],        },      ]),
-            ),
-            None,
-        ),
+        // Disabled: this case configures an `eslint-plugin-jsdoc` option this rule does not
+        // implement, which `deny_unknown_fields` rejects.
+        // (
+        // "
+        // /**
+        // *
+        // */
+        // function quux ({foo}, {bar}) {
+        //
+        // }
+        // ",
+        // Some(
+        // serde_json::json!([{ "unnamedRootBase": ["arg"] }]),
+        // ),
+        // None,
+        // ),
+        // Disabled: this case configures an `eslint-plugin-jsdoc` option this rule does not
+        // implement, which `deny_unknown_fields` rejects.
+        // (
+        // "
+        // /**
+        // *
+        // */
+        // function quux ({foo}, {bar}) {
+        //
+        // }
+        // ",
+        // Some(
+        // serde_json::json!([{ "unnamedRootBase": ["arg", "config"] }]),
+        // ),
+        // None,
+        // ),
+        // Disabled: this case configures an `eslint-plugin-jsdoc` option this rule does not
+        // implement, which `deny_unknown_fields` rejects.
+        // (
+        // "
+        // /**
+        // *
+        // */
+        // function quux ({foo}, {bar}) {
+        //
+        // }
+        // ",
+        // Some(
+        // serde_json::json!([{ "enableRootFixer": false, "unnamedRootBase": ["arg", "config"] }]),
+        // ),
+        // None,
+        // ),
         (
             "
 			          /**
@@ -1060,7 +1240,7 @@ fn test() {
 			      ",
             None,
             Some(
-                serde_json::json!({ "settings": {        "jsdoc": {          "tagNamePreference": {            "param": "arg",          },        },      } }),
+                serde_json::json!({ "settings": { "jsdoc": { "tagNamePreference": { "param": "arg" } } } }),
             ),
         ),
         (
@@ -1073,9 +1253,7 @@ fn test() {
 			          }
 			      ",
             None,
-            Some(
-                serde_json::json!({ "settings": {        "jsdoc": {          "overrideReplacesDocs": false,        },      } }),
-            ),
+            Some(serde_json::json!({ "settings": { "jsdoc": { "overrideReplacesDocs": false } } })),
         ),
         (
             "
@@ -1087,9 +1265,7 @@ fn test() {
 			          }
 			      ",
             None,
-            Some(
-                serde_json::json!({ "settings": {        "jsdoc": {          "ignoreReplacesDocs": false,        },      } }),
-            ),
+            Some(serde_json::json!({ "settings": { "jsdoc": { "ignoreReplacesDocs": false } } })),
         ),
         (
             "
@@ -1102,7 +1278,7 @@ fn test() {
 			      ",
             None,
             Some(
-                serde_json::json!({ "settings": {        "jsdoc": {          "implementsReplacesDocs": false,        },      } }),
+                serde_json::json!({ "settings": { "jsdoc": { "implementsReplacesDocs": false } } }),
             ),
         ),
         (
@@ -1170,9 +1346,7 @@ fn test() {
 			          function quux (foo) {
 			          }
 			      ",
-            Some(
-                serde_json::json!([        {          "exemptedBy": [            "notPresent",          ],        },      ]),
-            ),
+            Some(serde_json::json!([{ "exemptedBy": ["notPresent"] }])),
             None,
         ),
         (
@@ -1184,7 +1358,7 @@ fn test() {
 
 			          }
 			      ",
-            Some(serde_json::json!([        {          "exemptedBy": [],        },      ])),
+            Some(serde_json::json!([{ "exemptedBy": [] }])),
             None,
         ),
         (
@@ -1215,18 +1389,20 @@ fn test() {
             None,
             None,
         ),
-        (
-            "
-			          /**
-			           *
-			           */
-			          function quux (foo) {
-
-			          }
-			      ",
-            Some(serde_json::json!([        {          "enableFixer": false,        },      ])),
-            None,
-        ),
+        // Disabled: this case configures an `eslint-plugin-jsdoc` option this rule does not
+        // implement, which `deny_unknown_fields` rejects.
+        // (
+        // "
+        // /**
+        // *
+        // */
+        // function quux (foo) {
+        //
+        // }
+        // ",
+        // Some(serde_json::json!([{ "enableFixer": false }])),
+        // None,
+        // ),
         (
             "
 			      class Client {
@@ -1251,9 +1427,7 @@ fn test() {
 			      function quux ({num, ...extra}) {
 			      }
 			      ",
-            Some(
-                serde_json::json!([        {          "checkRestProperty": true,        },      ]),
-            ),
+            Some(serde_json::json!([{ "checkRestProperty": true }])),
             None,
         ),
         (
@@ -1266,9 +1440,7 @@ fn test() {
 			      function quux ({opts: {num, ...extra}}) {
 			      }
 			      ",
-            Some(
-                serde_json::json!([        {          "checkRestProperty": true,        },      ]),
-            ),
+            Some(serde_json::json!([{ "checkRestProperty": true }])),
             None,
         ),
         (
@@ -1281,9 +1453,7 @@ fn test() {
 			        //
 			      }
 			      "#,
-            Some(
-                serde_json::json!([        {          "checkRestProperty": true,        },      ]),
-            ),
+            Some(serde_json::json!([{ "checkRestProperty": true }])),
             None,
         ),
         (
@@ -1295,9 +1465,7 @@ fn test() {
 			        //
 			      }
 			      ",
-            Some(
-                serde_json::json!([        {          "checkRestProperty": true,        },      ]),
-            ),
+            Some(serde_json::json!([{ "checkRestProperty": true }])),
             None,
         ),
         (
@@ -1310,9 +1478,7 @@ fn test() {
 			        return {x, y, width, height};
 			      };
 			      ",
-            Some(
-                serde_json::json!([        {          "checkTypesPattern": "SVGRect",        },      ]),
-            ),
+            Some(serde_json::json!([{ "checkTypesPattern": "SVGRect" }])),
             None,
         ),
         (
@@ -1339,9 +1505,7 @@ fn test() {
 			        }
 			      };
 			      ",
-            Some(
-                serde_json::json!([        {          "checkRestProperty": true,        },      ]),
-            ),
+            Some(serde_json::json!([{ "checkRestProperty": true }])),
             None,
         ), // {        "parser": babelEslintParser,      },
         (
@@ -1379,9 +1543,7 @@ fn test() {
 			       */
 			      function quux ({ foo: { bar } }) {}
 			      ",
-            Some(
-                serde_json::json!([        {          "checkTypesPattern": "FooBar",        },      ]),
-            ),
+            Some(serde_json::json!([{ "checkTypesPattern": "FooBar" }])),
             None,
         ),
         (
@@ -1421,22 +1583,20 @@ fn test() {
             None,
             None,
         ),
-        // (
-        //     "
-        // 			      /**
-        // 			      * Returns a number.
-        // 			      * @param {Object} props Props.
-        // 			      * @param {Object} props.prop Prop.
-        // 			      * @return {number} A number.
-        // 			      */
-        // 			      export function testFn1 ({ prop = { a: 1, b: 2 } }) {
-        // 			      }
-        // 			      ",
-        //     Some(
-        //         serde_json::json!([        {          "useDefaultObjectProperties": true,        },      ]),
-        //     ),
-        //     None,
-        // ), // {        "sourceType": "module",      },
+        (
+            "
+			      /**
+			      * Returns a number.
+			      * @param {Object} props Props.
+			      * @param {Object} props.prop Prop.
+			      * @return {number} A number.
+			      */
+			      export function testFn1 ({ prop = { a: 1, b: 2 } }) {
+			      }
+			      ",
+            Some(serde_json::json!([{ "useDefaultObjectProperties": true }])),
+            None,
+        ), // {        "sourceType": "module",      },
         (
             "
 			        /** Foo. */
@@ -1459,6 +1619,58 @@ fn test() {
 			      "#,
             None,
             None,
+        ),
+        (
+            "
+				          /**
+				           * Some desc.
+				           * @param a
+				           */
+				          function quux (a, b) {}
+				      ",
+            Some(serde_json::json!([{ "ignoreWhenAllParamsMissing": true }])),
+            None,
+        ),
+        (
+            "
+				          /**
+				           *
+				           */
+				          const quux = function quux (foo) {
+				          };
+				      ",
+            Some(serde_json::json!([{ "interfaceExemptsParamsCheck": true }])),
+            None,
+        ),
+        (
+            "
+				          /**
+				           *
+				           */
+				          function quux ({
+				            abc,
+				            def
+				          }) {
+				          }
+				      ",
+            Some(serde_json::json!([{ "interfaceExemptsParamsCheck": true }])),
+            None,
+        ),
+        // https://github.com/oxc-project/oxc/issues/28859
+        (
+            "
+            /**
+             * Example { a
+             *
+             * @param p the param
+             */
+            export function f(p: string, q: string): void {
+                void p;
+                void q;
+            }
+            ",
+            None,
+            Some(serde_json::json!({ "settings": { "jsdoc": { "mode": "typescript" } } })),
         ),
     ];
 

@@ -2,7 +2,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use oxc_ast::{
-    AstKind,
+    AstKind, StaticPropertyName,
     ast::{Class, ClassElement},
 };
 use oxc_diagnostics::OxcDiagnostic;
@@ -88,11 +88,12 @@ declare_oxc_lint!(
     restriction,
     config = PreferFunctionComponent,
     version = "1.59.0",
+    short_description = "Enforces that React components are written as function components instead of class components.",
 );
 
 impl Rule for PreferFunctionComponent {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        serde_json::from_value::<DefaultRuleConfig<Self>>(value).map(DefaultRuleConfig::into_inner)
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
     }
 
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
@@ -134,7 +135,7 @@ fn is_error_boundary(class: &Class) -> bool {
             ClassElement::PropertyDefinition(p) => (p.r#static, &p.key),
             _ => return false,
         };
-        match key.static_name().as_deref() {
+        match key.static_name().and_then(StaticPropertyName::into_cow_str).as_deref() {
             Some("componentDidCatch") => !is_static,
             Some("getDerivedStateFromError") => is_static,
             _ => false,

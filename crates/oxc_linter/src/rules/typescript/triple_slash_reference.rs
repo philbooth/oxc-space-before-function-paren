@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     context::{ContextHost, LintContext},
     rule::{DefaultRuleConfig, Rule},
+    utils::AlwaysNever,
 };
 
 fn triple_slash_reference_diagnostic(ref_kind: &str, span: Span) -> OxcDiagnostic {
@@ -24,21 +25,11 @@ pub struct TripleSlashReference(Box<TripleSlashReferenceConfig>);
 #[serde(rename_all = "camelCase", default, deny_unknown_fields)]
 pub struct TripleSlashReferenceConfig {
     /// What to enforce for `/// <reference lib="..." />` references.
-    lib: LibOption,
+    lib: AlwaysNever,
     /// What to enforce for `/// <reference path="..." />` references.
     path: PathOption,
     /// What to enforce for `/// <reference types="..." />` references.
     types: TypesOption,
-}
-
-#[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-enum LibOption {
-    /// Allow triple-slash `lib` references.
-    #[default]
-    Always,
-    /// Disallow triple-slash `lib` references.
-    Never,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -97,13 +88,16 @@ declare_oxc_lint!(
     TripleSlashReference,
     typescript,
     correctness,
+    recommended,
     config = TripleSlashReferenceConfig,
     version = "0.2.0",
+    short_description =
+        "Disallow certain triple slash directives in favor of ES module import declarations.",
 );
 
 impl Rule for TripleSlashReference {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        serde_json::from_value::<DefaultRuleConfig<Self>>(value).map(DefaultRuleConfig::into_inner)
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
     }
 
     fn run_once(&self, ctx: &LintContext) {
@@ -119,9 +113,9 @@ impl Rule for TripleSlashReference {
             if let Some((group1, group2)) = get_attr_key_and_value(raw) {
                 if (group1 == "types" && self.types == TypesOption::Never)
                     || (group1 == "path" && self.path == PathOption::Never)
-                    || (group1 == "lib" && self.lib == LibOption::Never)
+                    || (group1 == "lib" && self.lib == AlwaysNever::Never)
                 {
-                    ctx.diagnostic(triple_slash_reference_diagnostic(&group2, comment.span));
+                    ctx.diagnostic(triple_slash_reference_diagnostic(group2, comment.span));
                 }
 
                 if group1 == "types" && self.types == TypesOption::PreferImport {
@@ -135,23 +129,20 @@ impl Rule for TripleSlashReference {
                 match stmt {
                     Statement::TSImportEqualsDeclaration(decl) => match &decl.module_reference {
                         TSModuleReference::ExternalModuleReference(mod_ref) => {
-                            if let Some(v) = refs_for_import.get(mod_ref.expression.value.as_str())
+                            if let Some(value) = mod_ref.expression.value.as_str()
+                                && let Some(v) = refs_for_import.get(value)
                             {
-                                ctx.diagnostic(triple_slash_reference_diagnostic(
-                                    &mod_ref.expression.value,
-                                    *v,
-                                ));
+                                ctx.diagnostic(triple_slash_reference_diagnostic(value, *v));
                             }
                         }
                         TSModuleReference::IdentifierReference(_)
                         | TSModuleReference::QualifiedName(_) => {}
                     },
                     Statement::ImportDeclaration(decl) => {
-                        if let Some(v) = refs_for_import.get(decl.source.value.as_str()) {
-                            ctx.diagnostic(triple_slash_reference_diagnostic(
-                                &decl.source.value,
-                                *v,
-                            ));
+                        if let Some(value) = decl.source.value.as_str()
+                            && let Some(v) = refs_for_import.get(value)
+                        {
+                            ctx.diagnostic(triple_slash_reference_diagnostic(value, *v));
                         }
                     }
                     _ => {}
@@ -165,7 +156,7 @@ impl Rule for TripleSlashReference {
     }
 }
 
-fn get_attr_key_and_value(raw: &str) -> Option<(String, String)> {
+fn get_attr_key_and_value(raw: &str) -> Option<(&str, &str)> {
     if !raw.starts_with('/') {
         return None;
     }
@@ -173,34 +164,23 @@ fn get_attr_key_and_value(raw: &str) -> Option<(String, String)> {
     let reference_start = "<reference ";
     let reference_end = "/>";
 
-    if let Some(start_idx) = raw.find(reference_start) {
-        // Check if the string contains '/>' after the start index
-        if let Some(end_idx) = raw[start_idx..].find(reference_end) {
-            let reference_str = &raw[start_idx + reference_start.len()..start_idx + end_idx];
+    if let Some(start_idx) = raw.find(reference_start)
+        && let Some(end_idx) = raw[start_idx..].find(reference_end)
+    {
+        let reference_str = &raw[start_idx + reference_start.len()..start_idx + end_idx];
 
-            // Split the string by whitespaces
-            let parts = reference_str.split_whitespace();
+        let (key, value) = reference_str
+            .split_whitespace()
+            .find(|part| {
+                part.starts_with("types=") || part.starts_with("path=") || part.starts_with("lib=")
+            })?
+            .split_once('=')?;
 
-            // Filter parts that start with attribute key pattern
-            let filtered_parts: Vec<&str> = parts
-                .into_iter()
-                .filter(|part| {
-                    part.starts_with("types=")
-                        || part.starts_with("path=")
-                        || part.starts_with("lib=")
-                })
-                .collect();
-
-            if let Some(attr) = filtered_parts.first() {
-                // Split the attribute by '=' to get key and value
-                let attr_parts: Vec<&str> = attr.split('=').collect();
-                if attr_parts.len() == 2 {
-                    let key = attr_parts[0].trim().trim_matches('"').to_string();
-                    let value = attr_parts[1].trim_matches('"').trim_end_matches('/').to_string();
-                    return Some((key, value));
-                }
-            }
+        // Preserve rejection of attributes containing additional equals signs.
+        if value.contains('=') {
+            return None;
         }
+        return Some((key.trim().trim_matches('"'), value.trim_matches('"').trim_end_matches('/')));
     }
     None
 }
@@ -324,4 +304,15 @@ fn test() {
 
     Tester::new(TripleSlashReference::NAME, TripleSlashReference::PLUGIN, pass, fail)
         .test_and_snapshot();
+}
+
+#[test]
+fn test_first_reference_attribute() {
+    assert_eq!(
+        get_attr_key_and_value(r#"/ <reference types="first" path="second" />"#),
+        Some(("types", "first")),
+    );
+    assert_eq!(get_attr_key_and_value(r#"/ <reference types="a=b" path="valid" />"#), None);
+    assert_eq!(get_attr_key_and_value(r#"/ <reference unrelated="value" />"#), None);
+    assert_eq!(get_attr_key_and_value(r#"/ <reference path="pkg"/>"#), Some(("path", "pkg")),);
 }

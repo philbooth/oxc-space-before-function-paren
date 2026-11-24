@@ -17,7 +17,7 @@ pub struct NoEmptyStaticBlock;
 declare_oxc_lint!(
     /// ### What it does
     ///
-    /// Disallows the usages of empty static blocks.
+    /// Disallow empty static blocks.
     ///
     /// ### Why is this bad?
     ///
@@ -51,8 +51,10 @@ declare_oxc_lint!(
     NoEmptyStaticBlock,
     eslint,
     correctness,
+    recommended,
     suggestion,
     version = "0.0.19",
+    short_description = "Disallow empty static blocks.",
 );
 
 impl Rule for NoEmptyStaticBlock {

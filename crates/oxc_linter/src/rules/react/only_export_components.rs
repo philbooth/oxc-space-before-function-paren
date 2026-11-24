@@ -1,8 +1,8 @@
 use oxc_ast::{AstKind, ast::*};
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
-use oxc_semantic::NodeId;
 use oxc_span::{GetSpan, Span};
+use oxc_str::JSChar;
 use rustc_hash::FxHashSet;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     context::LintContext,
     rule::{DefaultRuleConfig, Rule},
-    utils::is_react_component_name,
+    utils::{is_es6_component_class, is_react_component_name},
 };
 
 fn export_all_components_diagnostic(span: Span) -> OxcDiagnostic {
@@ -74,6 +74,18 @@ pub struct OnlyExportComponentsConfig {
     /// export const Foo = () => null;
     /// ```
     allow_constant_export: bool,
+    /// Allow an exported object when every property is a React component.
+    /// This matches Vite's compound component support. The object must be non-empty,
+    /// contain no nested objects, spreads, or accessors, and anonymous functions
+    /// must use a component name as a static property key.
+    ///
+    /// ```jsx
+    /// // Allowed when allowCompoundComponents: true
+    /// const Root = () => <div />;
+    /// const Label = () => <span />;
+    /// export const Tag = { Root, Label };
+    /// ```
+    allow_compound_components: bool,
     /// If you export components wrapped in custom higher-order components, list their
     /// identifiers here to avoid false positives.
     #[serde(rename = "customHOCs")]
@@ -165,13 +177,14 @@ declare_oxc_lint!(
     restriction,
     config = OnlyExportComponentsConfig,
     version = "1.23.0",
+    short_description = "Ensure modules only export React components (and related HMR-safe items) for Fast Refresh compatibility.",
 );
 
 static DEFAULT_REACT_HOCS: &[&str] = &["memo", "forwardRef", "lazy"];
 
 impl Rule for OnlyExportComponents {
     fn from_configuration(value: serde_json::Value) -> Result<Self, serde_json::error::Error> {
-        serde_json::from_value::<DefaultRuleConfig<Self>>(value).map(DefaultRuleConfig::into_inner)
+        DefaultRuleConfig::<Self>::from_value(value).map(DefaultRuleConfig::into_inner)
     }
 
     fn should_run(&self, ctx: &crate::context::ContextHost) -> bool {
@@ -216,22 +229,95 @@ impl OnlyExportComponents {
     }
 
     fn can_be_react_function_component(&self, init: Option<&Expression>) -> bool {
-        if let Some(raw_init) = init {
-            let js_init = Self::skip_ts_expression(raw_init);
+        let Some(init) = init else { return false };
+        let init = init.get_inner_expression();
+        if self.allow_compound_components
+            && let Expression::ObjectExpression(object) = init
+        {
+            return self.is_compound_component(object);
+        }
 
-            match js_init {
-                Expression::ArrowFunctionExpression(_) => true,
-                Expression::CallExpression(call_expr) => {
-                    if let Expression::Identifier(callee) = &call_expr.callee {
-                        self.is_react_hoc(&callee.name)
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
+        match init {
+            Expression::ArrowFunctionExpression(_) => true,
+            Expression::FunctionExpression(func) => {
+                func.body.is_some()
+                    && func.params.parameters_count() <= 2
+                    && func.id.as_ref().is_none_or(|id| is_react_component_name(&id.name))
             }
-        } else {
-            false
+            Expression::CallExpression(call_expr) => self.is_callee_hoc(&call_expr.callee),
+            _ => false,
+        }
+    }
+
+    fn is_compound_component(&self, object: &ObjectExpression) -> bool {
+        !object.properties.is_empty()
+            && object.properties.iter().all(|property| {
+                let ObjectPropertyKind::ObjectProperty(property) = property else {
+                    return false;
+                };
+                if property.kind != PropertyKind::Init {
+                    return false;
+                }
+
+                // An anonymous function gets its name from a static property key.
+                let has_component_name = match &property.key {
+                    PropertyKey::StaticIdentifier(ident) => is_react_component_name(&ident.name),
+                    // Only the first character decides a component name.
+                    PropertyKey::StaticStringLiteral(literal) => literal
+                        .value
+                        .chars()
+                        .next()
+                        .and_then(JSChar::to_char)
+                        .is_some_and(|c| c.is_ascii_uppercase()),
+                    _ => false,
+                };
+                self.is_compound_component_value(&property.value, has_component_name)
+            })
+    }
+
+    fn is_compound_component_value(&self, expr: &Expression, has_component_name: bool) -> bool {
+        match expr.get_inner_expression() {
+            Expression::Identifier(ident) => is_react_component_name(&ident.name),
+            Expression::StaticMemberExpression(member) => {
+                is_react_component_name(&member.property.name)
+            }
+            Expression::ArrowFunctionExpression(func) => {
+                func.params.parameters_count() <= 2 && has_component_name
+            }
+            Expression::FunctionExpression(func) => {
+                func.body.is_some()
+                    && func.params.parameters_count() <= 2
+                    && func
+                        .id
+                        .as_ref()
+                        .map_or(has_component_name, |id| is_react_component_name(&id.name))
+            }
+            Expression::ConditionalExpression(cond) => {
+                self.is_compound_component_value(&cond.consequent, has_component_name)
+                    && self.is_compound_component_value(&cond.alternate, has_component_name)
+            }
+            Expression::CallExpression(call) => {
+                if !self.is_callee_hoc(&call.callee) {
+                    return false;
+                }
+                let validate_argument = match &call.callee {
+                    Expression::Identifier(ident) => {
+                        matches!(ident.name.as_str(), "memo" | "forwardRef")
+                    }
+                    Expression::StaticMemberExpression(member) => {
+                        matches!(member.property.name.as_str(), "memo" | "forwardRef")
+                    }
+                    _ => false,
+                };
+                !validate_argument
+                    || call.arguments.first().and_then(Argument::as_expression).is_some_and(|arg| {
+                        self.is_compound_component_value(arg, has_component_name)
+                    })
+            }
+            Expression::TaggedTemplateExpression(tagged) => {
+                has_component_name && self.is_callee_hoc(&tagged.tag)
+            }
+            _ => false,
         }
     }
 
@@ -241,22 +327,6 @@ impl OnlyExportComponents {
             Expression::TSSatisfiesExpression(ts_expr) => &ts_expr.expression,
             _ => exp,
         }
-    }
-
-    fn is_exported(ctx: &LintContext, node_id: NodeId) -> bool {
-        let semantic = ctx.semantic();
-        let nodes = semantic.nodes();
-
-        std::iter::successors(Some(node_id), |&id| {
-            let parent = nodes.parent_id(id);
-            if parent == id { None } else { Some(parent) }
-        })
-        .any(|id| {
-            matches!(
-                nodes.get_node(id).kind(),
-                AstKind::ExportDefaultDeclaration(_) | AstKind::ExportNamedDeclaration(_)
-            )
-        })
     }
 
     fn analyze_exports(&self, ctx: &LintContext) -> ExportAnalysis {
@@ -278,16 +348,27 @@ impl OnlyExportComponents {
                     ctx.diagnostic(export_all_components_diagnostic(export_all.span));
                 }
                 AstKind::ExportDefaultDeclaration(export_default) => {
-                    let result = self.analyze_export_default(export_default);
+                    let result = self.analyze_export_default(ctx, export_default);
                     if let Some(span) = result.anonymous_span {
                         ctx.diagnostic(anonymous_components_diagnostic(span));
                     }
                     analysis.merge(result);
                 }
+                AstKind::ExportDeclaration(export_decl) => {
+                    let result = self.analyze_export_declaration(ctx, export_decl);
+                    analysis.merge(result);
+                }
                 AstKind::ExportNamedDeclaration(export_named)
                     if export_named.export_kind.is_value() =>
                 {
-                    let result = self.analyze_export_named(ctx, export_named);
+                    let result =
+                        self.analyze_export_specifiers(&export_named.specifiers, Some(ctx));
+                    analysis.merge(result);
+                }
+                AstKind::ExportFromDeclaration(export_from)
+                    if export_from.export_kind.is_value() =>
+                {
+                    let result = self.analyze_export_specifiers(&export_from.specifiers, None);
                     analysis.merge(result);
                 }
                 _ => {}
@@ -298,28 +379,24 @@ impl OnlyExportComponents {
     }
 
     fn find_local_components(&self, ctx: &LintContext) -> Vec<Span> {
-        ctx.semantic()
-            .nodes()
+        ctx.nodes()
+            .program()
+            .body
             .iter()
-            .filter_map(|node| match node.kind() {
-                AstKind::VariableDeclaration(var_decl) => {
+            .filter_map(|statement| match statement {
+                Statement::VariableDeclaration(var_decl) => {
                     var_decl.declarations.iter().find_map(|declarator| {
                         if let BindingPattern::BindingIdentifier(binding_id) = &declarator.id
                             && is_react_component_name(&binding_id.name)
                             && self.can_be_react_function_component(declarator.init.as_ref())
-                            && !Self::is_exported(ctx, node.id())
                         {
                             return Some(binding_id.span);
                         }
                         None
                     })
                 }
-                AstKind::Function(func) => func.id.as_ref().and_then(|id| {
-                    if is_react_component_name(&id.name) && !Self::is_exported(ctx, node.id()) {
-                        Some(id.span)
-                    } else {
-                        None
-                    }
+                Statement::FunctionDeclaration(func) => func.id.as_ref().and_then(|id| {
+                    if is_react_component_name(&id.name) { Some(id.span) } else { None }
                 }),
                 _ => None,
             })
@@ -356,8 +433,24 @@ impl OnlyExportComponents {
         }
     }
 
-    fn analyze_export_default(&self, export_default: &ExportDefaultDeclaration) -> ExportAnalysis {
+    fn analyze_export_default(
+        &self,
+        ctx: &LintContext,
+        export_default: &ExportDefaultDeclaration,
+    ) -> ExportAnalysis {
         let mut analysis = ExportAnalysis::default();
+
+        if self.allow_compound_components
+            && let Some(expr) = export_default.declaration.as_expression()
+            && let Expression::ObjectExpression(object) = expr.get_inner_expression()
+        {
+            analysis.add_export(if self.is_compound_component(object) {
+                ExportType::ReactComponent
+            } else {
+                ExportType::NonComponent(object.span)
+            });
+            return analysis;
+        }
 
         match &export_default.declaration {
             ExportDefaultDeclarationKind::TSInterfaceDeclaration(_) => return analysis,
@@ -371,8 +464,13 @@ impl OnlyExportComponents {
             }
             ExportDefaultDeclarationKind::ClassDeclaration(class) => {
                 if let Some(id) = class.id.as_ref() {
-                    let export_type = self.classify_export(id.name.as_str(), id.span, false, None);
-                    analysis.add_export(export_type);
+                    analysis.add_export(
+                        if is_react_component_name(&id.name) && is_es6_component_class(class) {
+                            ExportType::ReactComponent
+                        } else {
+                            ExportType::NonComponent(id.span)
+                        },
+                    );
                 } else {
                     analysis.anonymous_span = Some(class.span);
                 }
@@ -383,16 +481,25 @@ impl OnlyExportComponents {
                 analysis.has_react_export = true;
             }
             ExportDefaultDeclarationKind::Identifier(ident) => {
-                let export_type =
-                    self.classify_export(ident.name.as_str(), ident.span, false, None);
+                let export_type = self.classify_export_reference(
+                    Some(ctx),
+                    ident.name.as_str(),
+                    ident.name.as_str(),
+                    ident.span,
+                    true,
+                );
                 analysis.add_export(export_type);
             }
             ExportDefaultDeclarationKind::TSAsExpression(ts_as_expr) => {
-                return self
-                    .analyze_export_default_expression(&ts_as_expr.expression, export_default);
+                return self.analyze_export_default_expression(
+                    ctx,
+                    &ts_as_expr.expression,
+                    export_default,
+                );
             }
             ExportDefaultDeclarationKind::TSSatisfiesExpression(ts_satisfies_expr) => {
                 return self.analyze_export_default_expression(
+                    ctx,
                     &ts_satisfies_expr.expression,
                     export_default,
                 );
@@ -407,6 +514,7 @@ impl OnlyExportComponents {
 
     fn analyze_export_default_expression(
         &self,
+        ctx: &LintContext,
         expr: &Expression,
         export_default: &ExportDefaultDeclaration,
     ) -> ExportAnalysis {
@@ -417,8 +525,13 @@ impl OnlyExportComponents {
                 analysis.has_react_export = true;
             }
             Expression::Identifier(ident) => {
-                let export_type =
-                    self.classify_export(ident.name.as_str(), ident.span, false, None);
+                let export_type = self.classify_export_reference(
+                    Some(ctx),
+                    ident.name.as_str(),
+                    ident.name.as_str(),
+                    ident.span,
+                    true,
+                );
                 analysis.add_export(export_type);
             }
             _ => {
@@ -429,80 +542,107 @@ impl OnlyExportComponents {
         analysis
     }
 
-    fn analyze_export_named(
+    fn analyze_export_declaration(
         &self,
         ctx: &LintContext,
-        export_named: &ExportNamedDeclaration,
+        export_decl: &ExportDeclaration,
     ) -> ExportAnalysis {
         let mut analysis = ExportAnalysis::default();
-        if let Some(declaration) = &export_named.declaration {
-            let exports = match declaration {
-                Declaration::VariableDeclaration(var_decl) => var_decl
-                    .declarations
-                    .iter()
-                    .map(|declarator| match &declarator.id {
-                        BindingPattern::BindingIdentifier(binding_id) => {
-                            let is_func =
-                                self.can_be_react_function_component(declarator.init.as_ref());
-                            self.classify_export(
-                                binding_id.name.as_str(),
-                                binding_id.span,
-                                is_func,
-                                declarator.init.as_ref(),
-                            )
-                        }
-                        _ => ExportType::NonComponent(declarator.id.span()),
-                    })
-                    .collect::<Vec<_>>(),
-                Declaration::FunctionDeclaration(func) => func.id.as_ref().map_or_else(
-                    || {
-                        ctx.diagnostic(anonymous_components_diagnostic(func.span));
-                        vec![]
-                    },
-                    |id| vec![self.classify_export(id.name.as_str(), id.span, true, None)],
-                ),
-                Declaration::ClassDeclaration(class) => class.id.as_ref().map_or(vec![], |id| {
-                    vec![self.classify_export(id.name.as_str(), id.span, false, None)]
-                }),
-                Declaration::TSEnumDeclaration(ts_enum) => {
-                    vec![ExportType::NonComponent(ts_enum.id.span)]
-                }
-                _ => vec![],
-            };
-
-            for export in exports {
-                analysis.add_export(export);
-            }
-        }
-
-        let specifier_exports: Vec<ExportType> = export_named
-            .specifiers
-            .iter()
-            .map(|export_spec| {
-                let exported_name = match &export_spec.exported {
-                    ModuleExportName::IdentifierName(name) => Some(name.name.as_str()),
-                    ModuleExportName::IdentifierReference(ident) => Some(ident.name.as_str()),
-                    ModuleExportName::StringLiteral(_) => None,
-                };
-
-                let local_name = export_spec.local.name();
-                let span = export_spec.local.span();
-
-                if exported_name == Some("default") {
-                    self.classify_export(local_name.as_str(), span, false, None)
-                } else if let Some(name) = exported_name {
-                    self.classify_export(name, span, false, None)
+        let exports = match &export_decl.declaration {
+            Declaration::VariableDeclaration(var_decl) => var_decl
+                .declarations
+                .iter()
+                .map(|declarator| match &declarator.id {
+                    BindingPattern::BindingIdentifier(binding_id) => {
+                        let is_func =
+                            self.can_be_react_function_component(declarator.init.as_ref());
+                        self.classify_export(
+                            binding_id.name.as_str(),
+                            binding_id.span,
+                            is_func,
+                            declarator.init.as_ref(),
+                        )
+                    }
+                    _ => ExportType::NonComponent(declarator.id.span()),
+                })
+                .collect::<Vec<_>>(),
+            Declaration::FunctionDeclaration(func) => func.id.as_ref().map_or_else(
+                || {
+                    ctx.diagnostic(anonymous_components_diagnostic(func.span));
+                    vec![]
+                },
+                |id| vec![self.classify_export(id.name.as_str(), id.span, true, None)],
+            ),
+            Declaration::ClassDeclaration(class) => class.id.as_ref().map_or(vec![], |id| {
+                vec![if is_react_component_name(&id.name) && is_es6_component_class(class) {
+                    ExportType::ReactComponent
                 } else {
-                    ExportType::NonComponent(span)
-                }
-            })
-            .collect();
+                    ExportType::NonComponent(id.span)
+                }]
+            }),
+            Declaration::TSEnumDeclaration(ts_enum) => {
+                vec![ExportType::NonComponent(ts_enum.id.span)]
+            }
+            _ => vec![],
+        };
 
-        for export in specifier_exports {
+        for export in exports {
             analysis.add_export(export);
         }
 
         analysis
+    }
+
+    fn analyze_export_specifiers(
+        &self,
+        specifiers: &[ExportSpecifier],
+        ctx: Option<&LintContext>,
+    ) -> ExportAnalysis {
+        let mut analysis = ExportAnalysis::default();
+
+        for export_spec in specifiers {
+            let exported_name = export_spec.exported.identifier_name();
+
+            let local_name = export_spec.local.name();
+            let span = export_spec.local.span();
+
+            let export = exported_name.map_or(ExportType::NonComponent(span), |name| {
+                let name = if name == "default" { local_name.as_str() } else { name.as_str() };
+                self.classify_export_reference(ctx, name, local_name.as_str(), span, false)
+            });
+            analysis.add_export(export);
+        }
+
+        analysis
+    }
+
+    fn classify_export_reference(
+        &self,
+        ctx: Option<&LintContext>,
+        name: &str,
+        local_name: &str,
+        span: Span,
+        is_default_export: bool,
+    ) -> ExportType {
+        let init = ctx.and_then(|ctx| {
+            let scoping = ctx.scoping();
+            let symbol_id = scoping.get_binding(scoping.root_scope_id(), local_name.into())?;
+            let AstKind::VariableDeclarator(declarator) =
+                ctx.semantic().symbol_declaration(symbol_id).kind()
+            else {
+                return None;
+            };
+            if !matches!(declarator.id, BindingPattern::BindingIdentifier(_)) {
+                return None;
+            }
+            let init = declarator.init.as_ref()?;
+            if is_default_export {
+                let inner = init.get_inner_expression();
+                return matches!(inner, Expression::ObjectExpression(_)).then_some(inner);
+            }
+            Some(init)
+        });
+        self.classify_export(name, span, self.can_be_react_function_component(init), init)
     }
 
     fn classify_export(
@@ -512,6 +652,25 @@ impl OnlyExportComponents {
         is_function: bool,
         init: Option<&Expression>,
     ) -> ExportType {
+        if let Some(init_expr) = init
+            && let Expression::CallExpression(call_expr) = Self::skip_ts_expression(init_expr)
+            && self.is_callee_hoc(&call_expr.callee)
+            && !call_expr.arguments.is_empty()
+            && is_react_component_name(name)
+        {
+            return ExportType::ReactComponent;
+        }
+
+        if let Some(init_expr) = init
+            && let Expression::ConditionalExpression(cond_expr) =
+                Self::skip_ts_expression(init_expr)
+            && is_react_component_name(name)
+            && self.is_react_component_initializer(&cond_expr.consequent)
+            && self.is_react_component_initializer(&cond_expr.alternate)
+        {
+            return ExportType::ReactComponent;
+        }
+
         if self.allow_export_names.contains(name) {
             return ExportType::Allowed;
         }
@@ -535,6 +694,15 @@ impl OnlyExportComponents {
         }
 
         if let Some(init_expr) = init {
+            if matches!(
+                init_expr.get_inner_expression(),
+                Expression::ObjectExpression(_)
+                    | Expression::JSXElement(_)
+                    | Expression::JSXFragment(_)
+            ) {
+                return ExportType::NonComponent(span);
+            }
+
             if let Expression::CallExpression(call_expr) = Self::skip_ts_expression(init_expr) {
                 let is_create_context = match &call_expr.callee {
                     Expression::Identifier(ident) => ident.name == "createContext",
@@ -547,16 +715,6 @@ impl OnlyExportComponents {
                     return ExportType::ReactContext(span);
                 }
 
-                // For named exports the binding name already provides a
-                // stable component identity, so only the callee needs to be
-                // a recognized HOC. The argument shape (arrow function,
-                // identifier, etc.) does not matter.
-                if self.is_callee_hoc(&call_expr.callee)
-                    && !call_expr.arguments.is_empty()
-                    && is_react_component_name(name)
-                {
-                    return ExportType::ReactComponent;
-                }
                 return ExportType::NonComponent(span);
             }
 
@@ -594,21 +752,28 @@ impl OnlyExportComponents {
         }
     }
 
+    fn is_react_component_initializer(&self, expr: &Expression) -> bool {
+        match Self::skip_ts_expression(expr) {
+            Expression::ArrowFunctionExpression(_) => true,
+            Expression::FunctionExpression(func) => func.id.is_some(),
+            Expression::Identifier(ident) => is_react_component_name(&ident.name),
+            Expression::CallExpression(call_expr) => {
+                self.is_callee_hoc(&call_expr.callee) && !call_expr.arguments.is_empty()
+            }
+            _ => false,
+        }
+    }
+
     fn is_callee_hoc(&self, callee: &Expression) -> bool {
         match callee {
             Expression::CallExpression(inner_call) => {
-                if let Expression::Identifier(ident) = &inner_call.callee {
-                    ident.name == "connect"
-                } else {
-                    false
-                }
+                matches!(&inner_call.callee, Expression::Identifier(ident) if ident.name == "connect")
+                    || self.is_callee_hoc(&inner_call.callee)
             }
             Expression::StaticMemberExpression(member) => {
-                if let Expression::Identifier(_) = &member.object {
-                    self.is_react_hoc(&member.property.name)
-                } else {
-                    false
-                }
+                self.is_react_hoc(&member.property.name)
+                    || matches!(&member.object, Expression::Identifier(ident) if self.is_react_hoc(&ident.name))
+                    || matches!(&member.object, Expression::CallExpression(call_expr) if self.is_callee_hoc(&call_expr.callee))
             }
             Expression::Identifier(ident) => self.is_react_hoc(&ident.name),
             _ => false,
@@ -703,6 +868,7 @@ fn test() {
         ("export default function Foo() {}", None),
         ("export const Foo = () => {};", None),
         ("export const Foo2 = () => {};", None),
+        ("export const Foo_ = () => {};", None),
         ("export function CMS() {};", None),
         ("export const SVG = forwardRef(() => <svg/>);", None),
         ("export const CMS = () => {};", None),
@@ -711,6 +877,22 @@ fn test() {
         ("const foo = 4; export const Bar = () => {}; export const Baz = () => {};", None),
         ("const foo = () => {}; export const Bar = () => {}; export const Baz = () => {};", None),
         ("export const Foo = () => {}; export const Bar = styled.div`padding-bottom: 6px;`;", None),
+        (
+            "export const Foo = () => {}; export const Flex = styled.div({ display: 'flex' });",
+            Some(serde_json::json!([{ "customHOCs": ["styled"] }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Flex = styled('div')({display: 'flex'});",
+            Some(serde_json::json!([{ "customHOCs": ["styled"] }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Flex = styled('div')`display: flex;`;",
+            Some(serde_json::json!([{ "customHOCs": ["styled"] }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Flex = styled('div');",
+            Some(serde_json::json!([{ "customHOCs": ["styled"] }])),
+        ),
         ("export const foo = 3;", None),
         ("const foo = 3; const bar = 'Hello'; export { foo, bar };", None),
         ("export const foo = () => {};", None),
@@ -723,6 +905,8 @@ fn test() {
         ("function Foo() {}; export default React.memo(Foo);", None),
         ("function Foo() {}; export default React.memo(Foo) as typeof Foo;", None),
         ("export type * from './module';", None),
+        ("export { Foo } from './mod';", None),
+        ("export type { Foo, helper } from './mod';", None),
         ("type foo = string; export const Foo = () => null; export type { foo };", None),
         ("export type foo = string; export const Foo = () => null;", None),
         (
@@ -753,6 +937,10 @@ fn test() {
             "export const loader = () => {}; export const meta = { title: 'Home' };",
             Some(serde_json::json!([{ "allowExportNames": ["loader", "meta"] }])),
         ),
+        (
+            "export const viewport = { width: 'device-width', initialScale: 1 }; export const Page = () => {};",
+            Some(serde_json::json!([{ "allowExportNames": ["viewport"] }])),
+        ),
         ("export { App as default }; const App = () => <>Test</>;", None),
         ("const MyComponent = () => {}; export default connect(() => ({}))(MyComponent);", None),
         ("export const MyComponent = () => {}; export const ChatContext = () => {};", None),
@@ -761,6 +949,16 @@ fn test() {
         (
             "const MyComponent = () => {}; export default observer(MyComponent);",
             Some(serde_json::json!([{ "customHOCs": ["observer"] }])),
+        ),
+        (
+            "export const Route = createFileRoute('/profile')({ component: Component }); function Component() { return <div />; }",
+            Some(serde_json::json!([{ "customHOCs": ["createFileRoute"] }])),
+        ),
+        (
+            "export const Route = createFileRoute('/profile')({ component: Component }); function Component() { return <div />; }",
+            Some(
+                serde_json::json!([{ "customHOCs": ["createFileRoute"], "allowExportNames": ["Route"] }]),
+            ),
         ),
         ("const SomeConstant = 42; export function someUtility() { return SomeConstant }", None),
         (
@@ -773,6 +971,35 @@ fn test() {
             "export const MyComponent = () => {}; export default memo(forwardRef(MyComponent));",
             None,
         ),
+        (
+            "export const Devtools = import.meta.env.PROD ? () => null : React.lazy(() => import('devtools')); export const OtherComponent = () => {};",
+            None,
+        ),
+        (
+            "const RootComponent = () => {}; export const Route = createRootRoute()({ component: RootComponent });",
+            Some(serde_json::json!([{ "customHOCs": ["createRootRoute"] }])),
+        ),
+        ("export const Link = () => {}; export const RenamedLink = Link;", None),
+        ("export const Link = () => {}; export const TypedLink = Link<RouteParams>;", None),
+        (
+            "export class MyComponent extends React.Component<Props, State> { render() { return <div>Hello</div>; } }",
+            None,
+        ),
+        (
+            "export default class MyComponent extends Component { render() { return <div>Hello</div>; } }",
+            None,
+        ),
+        (
+            "export function Button(props: PropsWithChildren<{ onClick: () => void }>): ReactNode;
+export function Button(props: PropsWithChildren): ReactNode {
+  return <button {...props}>{props.children}</button>;
+}",
+            None,
+        ),
+        (
+            "export const Link = () => {}; export const Styles = styled('div').attrs((props) => ({ className: 'form-control' }))``;",
+            Some(serde_json::json!([{ "customHOCs": ["styled"] }])),
+        ),
         // Named export with React.memo member expression HOC call
         ("export const MyComponent = React.memo(function MyComponent() { return null; });", None),
         // React.lazy with arrow function
@@ -783,10 +1010,175 @@ fn test() {
         ),
         // Named HOC export with anonymous arrow function argument
         ("export const Foo = React.memo(() => <div/>); export const Bar = () => null;", None),
+        (
+            "const Root = () => <div />; export const Tag = { Root };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "const Root = () => <div />; const Label = () => <span />; const Tag = { Root, Label } as const; export { Tag };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "const Tag = { Root: () => <div /> }; export { Tag as Components };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "const Tag = { Root: () => <div /> }; export { Tag as default };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "const Tag = { Root: () => <div /> }; export default Tag as Components;",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            r#"export const Foo = () => {}; const Tag = { "R\uD800": () => <div /> }; export { Tag };"#,
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "const Tag = {}; export { Tag } from './components';",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "const { Root } = { Root: () => <div /> }; export { Root }; export const App = () => <div />;",
+            None,
+        ),
+        (
+            "const Root = () => <div />; export const Tag = { root: Root };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "const Root = () => <div />; const Label = () => <span />; export default { Root, Label };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Tag = { Root: () => <div />, Label: function () { return <span />; } };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Tag = { 'Root': () => <div />, Label() { return <span />; } };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Tag = { root: function Root() { return <div />; } };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "const Root = () => <div />; export const Tag = { [key]: Root };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Tag = { Root: Namespace.Root };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Tag = { Root: (() => <div />) as React.FC } as const satisfies Components;",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export default ({ Root: () => <div /> } as const) satisfies Components;",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Tag = { Root: React.memo(forwardRef(() => <div />)) };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "const Root = () => <div />; export const Tag = { root: memo(Root) };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Tag = { root: lazy(() => import('./Root')) };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Tag = { Root: observer(() => <div />), Label: styled.span`` };",
+            Some(
+                serde_json::json!([{ "allowCompoundComponents": true, "customHOCs": ["observer", "styled"] }]),
+            ),
+        ),
+        (
+            "export const Tag = { Root: enabled ? () => <div /> : () => null };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Tag = { Root: () => <div /> }; export const VERSION = 1;",
+            Some(
+                serde_json::json!([{ "allowCompoundComponents": true, "allowConstantExport": true }]),
+            ),
+        ),
+        (
+            "export const Foo = () => {}; export const Config = {};",
+            Some(
+                serde_json::json!([{ "allowCompoundComponents": true, "allowExportNames": ["Config"] }]),
+            ),
+        ),
+        (
+            "export const CLOSED_ICON = <span>closed</span>;
+            export const STATUS_LABELS = { open: 'Open', closed: 'Closed' };
+            export function formatDate(date: Date): string {
+                return date.toLocaleDateString();
+            }",
+            Some(serde_json::json!([{ "allowConstantExport": true }])),
+        ),
+        ("export const Icon = <span />; export const labels = {};", None),
+        ("export const CLOSED_ICON = <>closed</>; export const labels = {};", None),
+        (
+            "export const Icon = <span /> as React.ReactNode;
+            export const Fragment = <>closed</> satisfies React.ReactNode;
+            export const labels = {};",
+            None,
+        ),
+        (
+            "const CLOSED_ICON = <span />; const FRAGMENT = <>closed</>; const labels = {};
+            export { CLOSED_ICON, FRAGMENT, labels };",
+            None,
+        ),
+        ("const Icon = <span />; export { Icon as default }; export const labels = {};", None),
+        (
+            "const Icon = <Renderer>{function Content() { return <span />; }}</Renderer>;
+            export { Icon };",
+            None,
+        ),
+        (
+            "const Icon = <Renderer render={() => {
+                function Content() { return <span />; }
+                const Label = () => <span />;
+                return <><Content /><Label /></>;
+            }} />;
+            export { Icon };",
+            None,
+        ),
+        (
+            "const Icon = <span />;
+            const Content = function helper() { return <span />; };
+            export { Icon };",
+            None,
+        ),
+        (
+            "const Icon = <span />;
+            const Content = function Content(a, b, c) { return <span />; };
+            export { Icon };",
+            None,
+        ),
+        ("const App = React.unknown(() => <div />);", None),
+        (
+            "export const createThing = () => {\n  const Inner = (): unknown => null;\n  return { Inner };\n};",
+            None,
+        ),
+        (
+            "const createThing = () => {\n  const Inner = (): unknown => null;\n  return { Inner };\n};\n\nexport { createThing };",
+            None,
+        ),
+        ("export const ACCEPT = 'x';\nexport const useThing = (): unknown => null;", None),
+        (
+            "const ACCEPT = 'x';\nconst useThing = (): unknown => null;\n\nexport { ACCEPT, useThing };",
+            None,
+        ),
     ];
 
     let fail = vec![
         ("export const foo = () => {}; export const Bar = () => {};", None),
+        ("export const _Foo = () => {}; export const Foo = () => {};", None),
         (
             "export const foo = () => {}; export const Bar = () => {};",
             Some(serde_json::json!([{ "allowConstantExport": true }])),
@@ -794,6 +1186,7 @@ fn test() {
         ("export const foo = 4; export const Bar = () => {};", None),
         ("export function Component() {}; export const Aa = 'a'", None),
         ("const foo = 4; const Bar = () => {}; export { foo, Bar };", None),
+        ("export { Foo, helper } from './mod';", None),
         ("export * from './foo';", None),
         ("export default () => {};", None),
         ("export default memo(() => {});", None),
@@ -812,7 +1205,7 @@ fn test() {
         ",
             Some(serde_json::json!([{ "checkJS": true }])),
         ),
-        ("export default compose()(MainView);", None),
+        ("const MainView = () => {}; export default compose()(MainView);", None),
         (
             "export const loader = () => {}; export const Bar = () => {}; export const foo = () => {};",
             Some(serde_json::json!([{ "allowExportNames": ["loader", "meta"] }])),
@@ -827,6 +1220,19 @@ fn test() {
             None,
         ),
         ("const MyComponent = () => {}; export default observer(MyComponent);", None),
+        (
+            "const MyComponent = () => {}; export const ENUM = Object.keys(TABLE) as EnumType[];",
+            None,
+        ),
+        (
+            "export const DevtoolsNotComponentInProd = import.meta.env.PROD ? null : React.lazy(() => import('devtools')); export const OtherComponent = () => {};",
+            None,
+        ),
+        (
+            "export const Foo = () => {}; export class MyComponent { bar() { return <div>Hello</div>; } }",
+            None,
+        ),
+        ("export default class { bar() { return <div>Hello</div>; } }", None),
         // Call expression initializer is not a constant or component (#20455)
         (
             "export const Route = createFileRoute('/example')({ component: RouteComponent }); function RouteComponent() { return <div>Hello</div>; }",
@@ -839,6 +1245,151 @@ fn test() {
         // Lowercase name with HOC callee
         (
             "export const foo = React.lazy(() => import('./Foo')); export const Bar = () => null;",
+            None,
+        ),
+        ("const Root = () => <div />; export const Tag = { Root };", None),
+        (
+            "const Root = () => <div />; export const Tag = { Root };",
+            Some(serde_json::json!([{ "allowCompoundComponents": false }])),
+        ),
+        ("const Root = () => <div />; export default { Root };", None),
+        (
+            "export const Foo = () => {}; export const Tag = { Root: () => <div /> } as const satisfies Components;",
+            None,
+        ),
+        (
+            "const Root = () => <div />; const Label = () => <span />; const Tag = { Root, Label } as const; export { Tag };",
+            None,
+        ),
+        ("const Root = () => <div />; const Tag = { Root }; export default Tag;", None),
+        (
+            "export const Foo = () => {}; const Tag = { Root: () => <div />, size: 1 }; export { Tag };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; const Tag = {}; export default Tag;",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Tag = { size: 1 } as const satisfies Config;",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "const Root = () => <div />; export default { Root, size: 1 };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Config = { limit: 1 };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Empty = {};",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => <div />; export const Tag = { Nested: { Root } };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => <div />; export const Tag = { Nested: ({ Root } as const) };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "const Tag = { Root: () => <div /> }; export const helper = 1;",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "const Tag = { Root: () => <div /> };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Tag = { get Root() { return <div />; } };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Tag = { set Root(value) {} };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Tag = { root: () => <div /> };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Tag = { ['Root']: () => <div /> };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Tag = { 1: () => <div /> };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Tag = { ...Components };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Tag = { Root: function helper() {} };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Tag = { Root: (a, b, c) => <div /> };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Tag = { Root: Namespace.helper };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Tag = { Root: unknownHoc(() => <div />) };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Tag = { root: memo(() => <div />) };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const Foo = () => {}; export const Tag = { Root: enabled ? () => <div /> : null };",
+            Some(serde_json::json!([{ "allowCompoundComponents": true }])),
+        ),
+        (
+            "export const App = () => <div />;
+            export const CLOSED_ICON = <span />; export const FRAGMENT = <>closed</>;",
+            Some(serde_json::json!([{ "allowConstantExport": true }])),
+        ),
+        (
+            "const Icon = <span />; const Fragment = <>closed</>; export { Icon, Fragment };
+            export const App = () => <div />;",
+            None,
+        ),
+        ("const Icon = <span />; export default Icon; export const labels = {};", None),
+        (
+            "const Icon = <span />;
+            function Content() { return <span />; }
+            const Label = () => <span />;
+            export { Icon };",
+            None,
+        ),
+        ("const App = function App() { return <span />; };", None),
+        (
+            "const Icon = <span />;
+            const Content = function Content() { return <span />; };
+            const Label = function () { return <span />; };
+            export { Icon };",
+            None,
+        ),
+        ("const App = (function App() { return <div />; });", None),
+        ("const App = ((() => <div />) as React.FC);", None),
+        (
+            "const App = ((function App() { return <div />; }) as React.FC) satisfies React.FC;",
+            None,
+        ),
+        ("const App = React.memo(function App() { return <div />; });", None),
+        (
+            "const App = React.forwardRef(function App(props, ref) { return <div ref={ref} />; });",
+            None,
+        ),
+        ("const App = React.memo(() => <div />);", None),
+        (
+            "const App = React.memo(function App() { return <div />; }); export const labels = {};",
             None,
         ),
     ];
@@ -864,11 +1415,21 @@ fn test_js_file_extension() {
         // Also passes both cases when checkJS is false.
         ("export default () => {};", Some(serde_json::json!([{ "checkJS": false }]))),
         (
+            "export const foo = () => {}; export const Bar = () => {};",
+            Some(serde_json::json!([{ "checkJS": false }])),
+        ),
+        (
             "import React from 'react'; export function Foo() {};",
             Some(serde_json::json!([{ "checkJS": false }])),
         ),
+        // Passes with checkJS enabled because React is not imported.
+        (
+            "export const foo = () => {}; export const Bar = () => {};",
+            Some(serde_json::json!([{ "checkJS": true }])),
+        ),
         // And with no config, as checkJS defaults to false.
         ("export default () => {};", None),
+        ("export const foo = () => {}; export const Bar = () => {};", None),
         ("import React from 'react'; export function Foo() {};", None),
     ];
 
@@ -889,6 +1450,10 @@ fn test_js_file_extension() {
         ),
         (
             "import React from 'react'; export default function () {};",
+            Some(serde_json::json!([{ "checkJS": true }])),
+        ),
+        (
+            "import React from 'react'; export const CONSTANT = 3; export const Foo = () => {};",
             Some(serde_json::json!([{ "checkJS": true }])),
         ),
     ];

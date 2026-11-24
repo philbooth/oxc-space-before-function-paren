@@ -5,6 +5,7 @@ use oxc_ast::{
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_span::Span;
+use oxc_str::JSStr;
 use rustc_hash::FxHashMap;
 
 use crate::{context::LintContext, rule::Rule};
@@ -61,40 +62,42 @@ declare_oxc_lint!(
     import,
     style,
     version = "0.16.6",
+    short_description =
+        "Reports when named exports are not grouped together in a single export declaration.",
 );
 
 impl Rule for GroupExports {
     fn run_once(&self, ctx: &LintContext<'_>) {
         let semantic = ctx.semantic();
-        let mut modules_source_record: FxHashMap<String, Vec<Span>> = FxHashMap::default();
+        let mut modules_source_record: FxHashMap<JSStr, Vec<Span>> = FxHashMap::default();
         let mut modules_nodes = Vec::new();
-        let mut type_source_record: FxHashMap<String, Vec<Span>> = FxHashMap::default();
+        let mut type_source_record: FxHashMap<JSStr, Vec<Span>> = FxHashMap::default();
         let mut type_nodes = Vec::new();
         let mut commonjs_nodes = Vec::new();
 
         for node in semantic.nodes() {
             match node.kind() {
-                AstKind::ExportNamedDeclaration(export_decl) => match export_decl.export_kind {
+                AstKind::ExportFromDeclaration(export_decl) => match export_decl.export_kind {
                     ImportOrExportKind::Value => {
-                        if let Some(source) = &export_decl.source {
-                            modules_source_record
-                                .entry(source.value.to_string())
-                                .or_default()
-                                .push(export_decl.span);
-                        } else {
-                            modules_nodes.push(export_decl.span);
-                        }
+                        modules_source_record
+                            .entry(export_decl.source.value)
+                            .or_default()
+                            .push(export_decl.span);
                     }
                     ImportOrExportKind::Type => {
-                        if let Some(source) = &export_decl.source {
-                            type_source_record
-                                .entry(source.value.to_string())
-                                .or_default()
-                                .push(export_decl.span);
-                        } else {
-                            type_nodes.push(export_decl.span);
-                        }
+                        type_source_record
+                            .entry(export_decl.source.value)
+                            .or_default()
+                            .push(export_decl.span);
                     }
+                },
+                AstKind::ExportNamedDeclaration(export_decl) => match export_decl.export_kind {
+                    ImportOrExportKind::Value => modules_nodes.push(export_decl.span),
+                    ImportOrExportKind::Type => type_nodes.push(export_decl.span),
+                },
+                AstKind::ExportDeclaration(export_decl) => match export_decl.export_kind() {
+                    ImportOrExportKind::Value => modules_nodes.push(export_decl.span),
+                    ImportOrExportKind::Type => type_nodes.push(export_decl.span),
                 },
                 AstKind::AssignmentExpression(assignment_expr) => {
                     let Some(member_expr) = assignment_expr.left.as_member_expression() else {
@@ -154,10 +157,7 @@ fn check_module_export(member_expr: &MemberExpression) -> bool {
     let Some(property_name) = member_expr.static_property_name() else {
         return false;
     };
-    if member_expr.object().is_specific_id("module") && property_name == "exports" {
-        return true;
-    }
-    false
+    member_expr.object().is_specific_id("module") && property_name == "exports"
 }
 
 #[test]

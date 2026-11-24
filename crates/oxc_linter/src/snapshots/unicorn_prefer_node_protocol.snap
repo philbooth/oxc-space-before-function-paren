@@ -2,35 +2,35 @@
 source: crates/oxc_linter/src/tester.rs
 ---
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:16]
  1 │ import fs from "fs";
    ·                ────
    ╰────
   help: Prefer `node:fs` over `fs`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:21]
  1 │ import * as fs from "fs";
    ·                     ────
    ╰────
   help: Prefer `node:fs` over `fs`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:21]
  1 │ import fs = require("fs");
    ·                     ────
    ╰────
   help: Prefer `node:fs` over `fs`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:24]
  1 │ export {promises} from "fs";
    ·                        ────
    ╰────
   help: Prefer `node:fs` over `fs`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:2:41]
  1 │ async function foo() {
  2 │                 const fs = await import('fs');
@@ -39,21 +39,21 @@ source: crates/oxc_linter/src/tester.rs
    ╰────
   help: Prefer `node:fs` over `fs`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:16]
  1 │ import fs from "fs/promises";
    ·                ─────────────
    ╰────
   help: Prefer `node:fs/promises` over `fs/promises`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:23]
  1 │ export {default} from "fs/promises";
    ·                       ─────────────
    ╰────
   help: Prefer `node:fs/promises` over `fs/promises`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:2:41]
  1 │ async function foo() {
  2 │                 const fs = await import('fs/promises');
@@ -62,28 +62,28 @@ source: crates/oxc_linter/src/tester.rs
    ╰────
   help: Prefer `node:fs/promises` over `fs/promises`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:24]
  1 │ import {promises} from "fs";
    ·                        ────
    ╰────
   help: Prefer `node:fs` over `fs`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:35]
  1 │ export {default as promises} from "fs";
    ·                                   ────
    ╰────
   help: Prefer `node:fs` over `fs`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:24]
  1 │ import {promises} from 'fs';
    ·                        ────
    ╰────
   help: Prefer `node:fs` over `fs`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:2:41]
  1 │ async function foo() {
  2 │                 const fs = await import("fs/promises");
@@ -92,40 +92,47 @@ source: crates/oxc_linter/src/tester.rs
    ╰────
   help: Prefer `node:fs/promises` over `fs/promises`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:8]
  1 │ import "buffer";
    ·        ────────
    ╰────
   help: Prefer `node:buffer` over `buffer`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:8]
  1 │ import "child_process";
    ·        ───────────────
    ╰────
   help: Prefer `node:child_process` over `child_process`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:8]
  1 │ import "timers/promises";
    ·        ─────────────────
    ╰────
   help: Prefer `node:timers/promises` over `timers/promises`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:28]
  1 │ const {promises} = require("fs")
    ·                            ────
    ╰────
   help: Prefer `node:fs` over `fs`.
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:20]
  1 │ const fs = require('fs/promises')
    ·                    ─────────────
    ╰────
   help: Prefer `node:fs/promises` over `fs/promises`.
+
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
+   ╭─[prefer_node_protocol.tsx:1:37]
+ 1 │ const fs = process.getBuiltinModule("fs")
+   ·                                     ────
+   ╰────
+  help: Prefer `node:fs` over `fs`.
 
   × Unexpected token
    ╭─[prefer_node_protocol.tsx:1:8]
@@ -133,9 +140,86 @@ source: crates/oxc_linter/src/tester.rs
    ·        ──
    ╰────
 
-  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js builtin modules.
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
    ╭─[prefer_node_protocol.tsx:1:14]
  1 │ await import('assert/strict')
    ·              ───────────────
    ╰────
   help: Prefer `node:assert/strict` over `assert/strict`.
+
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
+   ╭─[prefer_node_protocol.tsx:1:37]
+ 1 │ const fs = process.getBuiltinModule('fs/promises')
+   ·                                     ─────────────
+   ╰────
+  help: Prefer `node:fs/promises` over `fs/promises`.
+
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
+   ╭─[prefer_node_protocol.tsx:1:40]
+ 1 │ const fs = (process).getBuiltinModule(("fs"))
+   ·                                        ────
+   ╰────
+  help: Prefer `node:fs` over `fs`.
+
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
+   ╭─[prefer_node_protocol.tsx:1:39]
+ 1 │ const fs = (process.getBuiltinModule)("fs")
+   ·                                       ────
+   ╰────
+  help: Prefer `node:fs` over `fs`.
+
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
+   ╭─[prefer_node_protocol.tsx:1:73]
+ 1 │ import process from "node:process"; const fs = process.getBuiltinModule("fs");
+   ·                                                                         ────
+   ╰────
+  help: Prefer `node:fs` over `fs`.
+
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
+   ╭─[prefer_node_protocol.tsx:1:18]
+ 1 │ type Fs = import("fs");
+   ·                  ────
+   ╰────
+  help: Prefer `node:fs` over `fs`.
+
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
+   ╭─[prefer_node_protocol.tsx:1:18]
+ 1 │ type Fs = import('fs/promises');
+   ·                  ─────────────
+   ╰────
+  help: Prefer `node:fs/promises` over `fs/promises`.
+
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
+   ╭─[prefer_node_protocol.tsx:1:18]
+ 1 │ type Fs = import("fs").fs<"fs">;
+   ·                  ────
+   ╰────
+  help: Prefer `node:fs` over `fs`.
+
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
+   ╭─[prefer_node_protocol.tsx:1:18]
+ 1 │ type Fs = import("fs", { with: { "resolution-mode": "import" } });
+   ·                  ────
+   ╰────
+  help: Prefer `node:fs` over `fs`.
+
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
+   ╭─[prefer_node_protocol.tsx:1:20]
+ 1 │ const fs = require("fs") as typeof import("fs");
+   ·                    ────
+   ╰────
+  help: Prefer `node:fs` over `fs`.
+
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
+   ╭─[prefer_node_protocol.tsx:1:43]
+ 1 │ const fs = require("fs") as typeof import("fs");
+   ·                                           ────
+   ╰────
+  help: Prefer `node:fs` over `fs`.
+
+  ⚠ unicorn(prefer-node-protocol): Prefer using the `node:` protocol when importing Node.js built-in modules.
+   ╭─[prefer_node_protocol.tsx:1:49]
+ 1 │ const fs = someFunc() as SomeType<typeof import("fs")>;
+   ·                                                 ────
+   ╰────
+  help: Prefer `node:fs` over `fs`.

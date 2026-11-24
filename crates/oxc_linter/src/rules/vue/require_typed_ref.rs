@@ -45,6 +45,7 @@ declare_oxc_lint!(
     vue,
     style,
     version = "1.17.0",
+    short_description = "Require `ref` and `shallowRef` functions to be strongly typed.",
 );
 
 impl Rule for RequireTypedRef {
@@ -63,7 +64,7 @@ impl Rule for RequireTypedRef {
 
         let is_valid_first_arg = match call_expr.arguments.first() {
             Some(Argument::NullLiteral(_)) | None => false,
-            Some(Argument::Identifier(ident)) if ident.name == "undefined" => false,
+            Some(Argument::Identifier(ident)) if ident.is_undefined() => false,
             _ => true,
         };
 

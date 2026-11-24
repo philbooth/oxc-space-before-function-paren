@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { format, defineConfig } from "../../dist/index.js";
-import type { FormatConfig } from "../../dist/index.js";
+import { format, defineConfig, type FormatConfig } from "../../dist/index.js";
 
 describe("defineConfig() API", () => {
   it("`defineConfig()` function exists", () => {
@@ -51,45 +50,11 @@ describe("format() API", () => {
     expect(result.code).toBe("const x = { y: 1 }\n");
     expect(result.errors).toStrictEqual([]);
 
-    const { errors } = await format("a.ts", "const x={'y':1}", {
+    const { code, errors } = await format("a.ts", "const x={'y':1}", {
       // @ts-expect-error: Test invalid options is validated
       semi: "invalid",
     });
-    expect(errors.length).toBe(1);
-  });
-
-  it("should format non-js files with options", async () => {
-    const jsoncCode = `
-{
-  // Package name
-  "foo": "my",
-  // Trailing comma test
-  "bar": "1",
-}
-`.trim();
-    const result1 = await format("foo.jsonc", jsoncCode, {
-      insertFinalNewline: false,
-    });
-    expect(result1.code).toBe(`${jsoncCode}`);
-    expect(result1.errors).toStrictEqual([]);
-
-    const vueCode = `
-<template><div>Vue</div></template>
-<style>div{color:red;}</style>
-`.trim();
-    const result3 = await format("Component.vue", vueCode, {
-      vueIndentScriptAndStyle: true,
-    });
-    expect(result3.code).toBe(
-      `
-<template><div>Vue</div></template>
-<style>
-  div {
-    color: red;
-  }
-</style>
-`.trimStart(),
-    );
-    expect(result3.errors).toStrictEqual([]);
+    expect(errors).toHaveLength(1);
+    expect(code).toBe("const x={'y':1}");
   });
 });

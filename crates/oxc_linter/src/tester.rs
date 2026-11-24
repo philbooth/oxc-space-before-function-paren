@@ -182,6 +182,21 @@ impl<S: Into<String>> From<(S, (S, S))> for ExpectFixTestCase {
     }
 }
 
+impl<S: Into<String>> From<(S, (S, S), Option<Value>)> for ExpectFixTestCase {
+    fn from(value: (S, (S, S), Option<Value>)) -> Self {
+        Self {
+            source: value.0.into(),
+            expected: vec![
+                ExpectFix { expected: value.1.0.into(), kind: ExpectFixKind::Any },
+                ExpectFix { expected: value.1.1.into(), kind: ExpectFixKind::Any },
+            ],
+            rule_config: value.2,
+            path: None,
+            eslint_config: None,
+        }
+    }
+}
+
 impl<S: Into<String>> From<(S, (S, S, S))> for ExpectFixTestCase {
     fn from(value: (S, (S, S, S))) -> Self {
         Self {
@@ -190,6 +205,23 @@ impl<S: Into<String>> From<(S, (S, S, S))> for ExpectFixTestCase {
                 ExpectFix { expected: value.1.0.into(), kind: ExpectFixKind::Any },
                 ExpectFix { expected: value.1.1.into(), kind: ExpectFixKind::Any },
                 ExpectFix { expected: value.1.2.into(), kind: ExpectFixKind::Any },
+            ],
+            rule_config: None,
+            path: None,
+            eslint_config: None,
+        }
+    }
+}
+
+impl<S: Into<String>> From<(S, (S, S, S, S))> for ExpectFixTestCase {
+    fn from(value: (S, (S, S, S, S))) -> Self {
+        Self {
+            source: value.0.into(),
+            expected: vec![
+                ExpectFix { expected: value.1.0.into(), kind: ExpectFixKind::Any },
+                ExpectFix { expected: value.1.1.into(), kind: ExpectFixKind::Any },
+                ExpectFix { expected: value.1.2.into(), kind: ExpectFixKind::Any },
+                ExpectFix { expected: value.1.3.into(), kind: ExpectFixKind::Any },
             ],
             rule_config: None,
             path: None,
@@ -499,7 +531,17 @@ impl Tester {
         // but we only want to show the diagnostic for this test case
         let mut output_index = 0;
         let mut failed = vec![];
+
+        let rule: &RuleEnum = self.find_rule();
+        let rule_has_config = rule.has_config();
+        let rule_name = format!("{}/{}", rule.plugin_name(), rule.name());
+
         for TestCase { source, rule_config, eslint_config, path } in self.expect_pass.clone() {
+            assert!(
+                rule_config.is_none() || rule_has_config,
+                "Rule {rule_name} has no config schema, but a rule config was provided in the test case.\n{rule_config:?}"
+            );
+
             let result =
                 self.run(&source, rule_config.clone(), eslint_config, path, ExpectFixKind::None, 0);
             let passed = result == TestResult::Passed;
@@ -516,8 +558,16 @@ impl Tester {
     }
 
     fn test_fail(&mut self) -> Vec<TestFailure> {
+        let rule: &RuleEnum = self.find_rule();
+        let rule_has_config = rule.has_config();
+        let rule_name = format!("{}/{}", rule.plugin_name(), rule.name());
+
         let mut passed = vec![];
         for TestCase { source, rule_config, eslint_config, path } in self.expect_fail.clone() {
+            assert!(
+                rule_config.is_none() || rule_has_config,
+                "Rule {rule_name} has no config schema, but a rule config was provided in the test case.\n{rule_config:?}"
+            );
             let result =
                 self.run(&source, rule_config.clone(), eslint_config, path, ExpectFixKind::None, 0);
             let failed = result == TestResult::Failed;
@@ -534,6 +584,8 @@ impl Tester {
 
         // If auto-fixes are reported, make sure some fix test cases are provided
         let rule: &RuleEnum = self.find_rule();
+        let rule_has_config = rule.has_config();
+        let rule_name = format!("{}/{}", rule.plugin_name(), rule.name());
         let Some(fix_test_cases) = self.expect_fix.clone() else {
             assert!(
                 !rule.fix().has_fix(),
@@ -547,6 +599,12 @@ impl Tester {
         for fix in fix_test_cases {
             let ExpectFixTestCase { source, expected, rule_config: config, path, eslint_config } =
                 fix;
+
+            assert!(
+                config.is_none() || rule_has_config,
+                "Rule {rule_name} has no config schema, but a rule config was provided in the test case.\n{config:?}"
+            );
+
             for (index, expect) in expected.iter().enumerate() {
                 let result = self.run(
                     &source,
@@ -681,11 +739,9 @@ impl Tester {
         let handler = GraphicalReportHandler::new()
             .with_links(false)
             .with_theme(GraphicalTheme::unicode_nocolor());
+        let named_source = NamedSource::new(diagnostic_path, source_text);
         for diagnostic in result {
-            let diagnostic = diagnostic.error.with_source_code(NamedSource::new(
-                diagnostic_path.clone(),
-                source_text.to_string(),
-            ));
+            let diagnostic = diagnostic.error.with_source_code(&named_source);
             handler.render_report(&mut self.snapshot, diagnostic.as_ref()).unwrap();
         }
         TestResult::Failed
@@ -696,7 +752,7 @@ impl Tester {
             .iter()
             .find(|rule| rule.plugin_name() == self.plugin_name && rule.name() == self.rule_name)
             .unwrap_or_else(|| {
-                panic!("Rule in plugin {} not found: {}", &self.plugin_name, &self.rule_name)
+                panic!("Rule in plugin {} not found: {}", self.plugin_name, self.rule_name)
             })
     }
 }

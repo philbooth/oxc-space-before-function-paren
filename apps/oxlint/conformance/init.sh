@@ -5,6 +5,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPOS_JSON="$SCRIPT_DIR/repos.json"
 
+# Don't fail `pnpm install` when dependencies' build scripts are skipped.
+# pnpm v12 ignores `--config.strict-dep-builds=false` on the command line, but respects the env var.
+export pnpm_config_strict_dep_builds=false
+
 # Read a field from repos.json for a given repo key.
 # Usage: repo_field <key> <field>
 # e.g. `repo_field eslint commitSha`
@@ -38,6 +42,14 @@ cd submodules
 
 # Clone ESLint repo into `submodules/eslint`
 clone_repo eslint
+
+# ESLint depends on itself via `"eslint": "file:."`. pnpm v12 fails to install that
+# ("Empty path after `file:` scheme"), so convert it to a `link:` dependency.
+if [[ "$OSTYPE" == darwin* ]]; then
+  sed -i '' 's/"eslint": "file:\."/"eslint": "link:."/' package.json
+else
+  sed -i 's/"eslint": "file:\."/"eslint": "link:."/' package.json
+fi
 
 # Install dependencies
 pnpm install --ignore-workspace

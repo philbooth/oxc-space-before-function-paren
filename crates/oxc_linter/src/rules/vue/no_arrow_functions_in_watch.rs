@@ -70,7 +70,9 @@ declare_oxc_lint!(
     NoArrowFunctionsInWatch,
     vue,
     correctness,
+    recommended,
     version = "1.39.0",
+    short_description = "This rule disallows using arrow functions when defining a watcher.",
 );
 
 impl Rule for NoArrowFunctionsInWatch {
@@ -131,16 +133,8 @@ fn check_define_component_function<'a>(call_expr: &'a CallExpression<'a>, ctx: &
 fn get_watch_object_expression<'a>(
     obj_expr: &'a ObjectExpression<'a>,
 ) -> Option<&'a ObjectExpression<'a>> {
-    let watch_obj = obj_expr.properties.iter().find_map(|item| {
-        if let ObjectPropertyKind::ObjectProperty(prop) = item
-            && prop.key.static_name().is_some_and(|key| key == "watch")
-        {
-            Some(&prop.value)
-        } else {
-            None
-        }
-    })?;
-    let Expression::ObjectExpression(watch_obj) = watch_obj.get_inner_expression() else {
+    let watch_prop = obj_expr.find_property("watch")?;
+    let Expression::ObjectExpression(watch_obj) = watch_prop.value.get_inner_expression() else {
         return None;
     };
     Some(watch_obj)
@@ -151,7 +145,7 @@ fn handle_watch_inner_property<'a>(inner_prop: &ObjectPropertyKind<'a>, ctx: &Li
         return;
     };
 
-    if obj_prop.key.static_name().is_some_and(|key| key == "handler")
+    if obj_prop.key.is_specific_static_name("handler")
         && matches!(obj_prop.value.get_inner_expression(), Expression::ArrowFunctionExpression(_))
     {
         ctx.diagnostic(no_arrow_functions_in_watch_diagnostic(obj_prop.value.span()));

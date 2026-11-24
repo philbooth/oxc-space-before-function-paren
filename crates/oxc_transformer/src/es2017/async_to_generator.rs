@@ -51,14 +51,14 @@
 //! * Babel implementation: <https://github.com/babel/babel/blob/v7.26.2/packages/babel-plugin-transform-async-to-generator>
 //! * Async / Await TC39 proposal: <https://github.com/tc39/proposal-async-await>
 
-use std::{borrow::Cow, mem};
+use std::mem;
 
-use oxc_allocator::{Box as ArenaBox, StringBuilder as ArenaStringBuilder, TakeIn};
-use oxc_ast::{NONE, ast::*};
-use oxc_ast_visit::Visit;
+use oxc_allocator::{ArenaBox, ArenaStringBuilder, ArenaVec, GetAllocator, TakeIn};
+use oxc_ast::{StaticPropertyName, ast::*};
+use oxc_ast_visit::VisitJs;
 use oxc_semantic::{ReferenceFlags, ScopeFlags, ScopeId, SymbolFlags};
 use oxc_span::{GetSpan, SPAN};
-use oxc_str::Ident;
+use oxc_str::{Ident, static_ident};
 use oxc_syntax::{
     identifier::{is_identifier_name, is_identifier_part, is_identifier_start},
     keyword::is_reserved_keyword,
@@ -69,6 +69,7 @@ use crate::{
     common::helper_loader::{Helper, helper_call_expr},
     context::TraverseCtx,
     state::TransformState,
+    utils::{ast_builder::arrow_function_body_as_function_body_mut, sync_function_symbol_flags},
 };
 
 pub struct AsyncToGenerator<'a> {
@@ -121,8 +122,8 @@ impl<'a> Traverse<'a, TransformState<'a>> for AsyncToGenerator<'a> {
                     None
                 }
             }
-            Statement::ExportNamedDeclaration(decl) => {
-                if let Some(Declaration::FunctionDeclaration(func)) = &mut decl.declaration {
+            Statement::ExportDeclaration(decl) => {
+                if let Declaration::FunctionDeclaration(func) = &mut decl.declaration {
                     Some(func)
                 } else {
                     None
@@ -179,7 +180,12 @@ impl<'a> AsyncToGenerator<'a> {
     ) -> Option<Expression<'a>> {
         // We don't need to handle top-level await.
         if Self::is_inside_async_function(ctx) {
-            Some(ctx.ast.expression_yield(expr.span, false, Some(expr.argument.take_in(ctx.ast))))
+            Some(Expression::new_yield_expression(
+                expr.span,
+                false,
+                Some(expr.argument.take_in(ctx)),
+                ctx,
+            ))
         } else {
             None
         }
@@ -234,7 +240,7 @@ impl<'a> AsyncGeneratorExecutor<'a> {
             let scope_id = func.scope_id.replace(Some(new_scope_id)).unwrap();
             // We need to change the parent id to new scope id because we need to this function's body inside the wrapper function,
             // and then the new scope id will be wrapper function's scope id.
-            ctx.scoping_mut().change_scope_parent_id(scope_id, Some(new_scope_id));
+            Self::change_scope_parent_id(scope_id, new_scope_id, ctx);
             if !needs_move_parameters_to_inner_function {
                 // We need to change formal parameters's scope back to the original scope,
                 // because we only move out the function body.
@@ -260,7 +266,8 @@ impl<'a> AsyncGeneratorExecutor<'a> {
             //   }
             //
             // The "_x" and "_x1" are dummy variables to ensure "foo.length" is 2.
-            let new_params = Self::create_placeholder_params(&func.params, wrapper_scope_id, ctx);
+            let new_params =
+                Self::create_placeholder_params(&func.params, wrapper_scope_id, None, ctx);
             mem::replace(&mut func.params, new_params)
         } else {
             Self::create_empty_params(ctx)
@@ -269,31 +276,32 @@ impl<'a> AsyncGeneratorExecutor<'a> {
         let callee = self.create_async_to_generator_call(params, body, generator_scope_id, ctx);
         let (callee, arguments) = if needs_move_parameters_to_inner_function {
             // callee.apply(this, arguments)
-            let property = ctx.ast.identifier_name(SPAN, "apply");
+            let property = IdentifierName::new(SPAN, "apply", ctx);
             let callee =
-                Expression::from(ctx.ast.member_expression_static(SPAN, callee, property, false));
+                Expression::new_static_member_expression(SPAN, callee, property, false, ctx);
 
             // this, arguments
-            let this_argument = Argument::from(ctx.ast.expression_this(SPAN));
+            let this_argument = Argument::new_this_expression(SPAN, ctx);
             let arguments_argument = Argument::from(ctx.create_unbound_ident_expr(
                 SPAN,
-                ctx.ast.ident("arguments"),
+                static_ident!("arguments"),
                 ReferenceFlags::Read,
             ));
-            (callee, ctx.ast.vec_from_array([this_argument, arguments_argument]))
+            (callee, ArenaVec::from_array_in([this_argument, arguments_argument], ctx))
         } else {
             // callee()
-            (callee, ctx.ast.vec())
+            (callee, ArenaVec::new_in(ctx))
         };
 
-        let expression = ctx.ast.expression_call(SPAN, callee, NONE, arguments, false);
-        let statement = ctx.ast.statement_return(SPAN, Some(expression));
+        let expression = Expression::new_call_expression(SPAN, callee, None, arguments, false, ctx);
+        let statement = Statement::new_return_statement(SPAN, Some(expression), ctx);
 
         // Modify the wrapper function
         func.r#async = false;
         func.generator = false;
-        func.body = Some(ctx.ast.alloc_function_body(SPAN, ctx.ast.vec(), ctx.ast.vec1(statement)));
+        func.body = Some(FunctionBody::boxed(SPAN, [], [statement], ctx));
         func.scope_id.set(Some(wrapper_scope_id));
+        sync_function_symbol_flags(func, ctx);
     }
 
     /// Transforms [`Function`] whose type is [`FunctionType::FunctionExpression`] to a generator function
@@ -305,7 +313,7 @@ impl<'a> AsyncGeneratorExecutor<'a> {
     ) -> Expression<'a> {
         let span = wrapper_function.span;
         let body = wrapper_function.body.take().unwrap();
-        let params = wrapper_function.params.take_in_box(ctx.ast);
+        let params = wrapper_function.params.take_in_box(ctx);
         let id = wrapper_function.id.take();
         let has_function_id = id.is_some();
 
@@ -323,7 +331,7 @@ impl<'a> AsyncGeneratorExecutor<'a> {
                 ctx.create_child_scope(ctx.current_scope_id(), ScopeFlags::Function);
             let scope_id = wrapper_function.scope_id.replace(Some(wrapper_scope_id)).unwrap();
             // Change the parent scope of the function scope with the current scope.
-            ctx.scoping_mut().change_scope_parent_id(scope_id, Some(wrapper_scope_id));
+            Self::change_scope_parent_id(scope_id, wrapper_scope_id, ctx);
             // If there is an id, then we will use it as the name of caller_function,
             // and the caller_function is inside the wrapper function.
             // so we need to move the id to the new scope.
@@ -335,18 +343,23 @@ impl<'a> AsyncGeneratorExecutor<'a> {
             (scope_id, wrapper_scope_id)
         };
 
+        let inferred_name =
+            if id.is_none() { Self::infer_function_name_from_parent_node(ctx) } else { None };
+
         let bound_ident = Self::create_bound_identifier(
             id.as_ref(),
             wrapper_scope_id,
             SymbolFlags::FunctionScopedVariable,
+            inferred_name,
             ctx,
         );
 
         let caller_function = {
             let scope_id = ctx.create_child_scope(wrapper_scope_id, ScopeFlags::Function);
-            let params = Self::create_placeholder_params(&params, scope_id, ctx);
-            let statements = ctx.ast.vec1(Self::create_apply_call_statement(&bound_ident, ctx));
-            let body = ctx.ast.alloc_function_body(SPAN, ctx.ast.vec(), statements);
+            let params = Self::create_placeholder_params(&params, scope_id, inferred_name, ctx);
+            let statements =
+                ArenaVec::from_value_in(Self::create_apply_call_statement(&bound_ident, ctx), ctx);
+            let body = FunctionBody::boxed(SPAN, [], statements, ctx);
             let (r#type, id) = if id.is_some() {
                 // Caller is emitted as a function declaration inside the wrapper; its binding
                 // was already moved to `wrapper_scope_id` above.
@@ -355,10 +368,11 @@ impl<'a> AsyncGeneratorExecutor<'a> {
                 // Caller is emitted as a named function expression; per the JS spec, its name
                 // binds only inside the function itself — place the inferred id's binding in
                 // the caller's own scope, not the wrapper scope.
-                (
-                    FunctionType::FunctionExpression,
-                    Self::infer_function_id_from_parent_node(scope_id, ctx),
-                )
+                let id = inferred_name.map(|name| {
+                    ctx.generate_binding(name, scope_id, SymbolFlags::Function)
+                        .create_binding_identifier(ctx)
+                });
+                (FunctionType::FunctionExpression, id)
             };
             Self::create_function(r#type, id, params, body, scope_id, ctx)
         };
@@ -383,29 +397,27 @@ impl<'a> AsyncGeneratorExecutor<'a> {
                     ReferenceFlags::Read,
                 );
                 let func_decl = Statement::FunctionDeclaration(caller_function);
-                let statement_return = ctx.ast.statement_return(SPAN, Some(reference));
-                ctx.ast.vec_from_array([async_to_gen_decl, func_decl, statement_return])
+                let statement_return = Statement::new_return_statement(SPAN, Some(reference), ctx);
+                ArenaVec::from_array_in([async_to_gen_decl, func_decl, statement_return], ctx)
             } else {
                 // If the function doesn't have an id, then we need to return the function itself.
                 // `function() { ... }` -> `return function() { ... };`
-                let statement_return = ctx
-                    .ast
-                    .statement_return(SPAN, Some(Expression::FunctionExpression(caller_function)));
-                ctx.ast.vec_from_array([async_to_gen_decl, statement_return])
+                let statement_return = Statement::new_return_statement(
+                    SPAN,
+                    Some(Expression::FunctionExpression(caller_function)),
+                    ctx,
+                );
+                ArenaVec::from_array_in([async_to_gen_decl, statement_return], ctx)
             };
             debug_assert!(wrapper_function.body.is_none());
             wrapper_function.r#async = false;
             wrapper_function.generator = false;
-            wrapper_function.body.replace(ctx.ast.alloc_function_body(
-                SPAN,
-                ctx.ast.vec(),
-                statements,
-            ));
+            wrapper_function.body.replace(FunctionBody::boxed(SPAN, [], statements, ctx));
         }
 
         // Construct the IIFE
-        let callee = Expression::FunctionExpression(wrapper_function.take_in_box(ctx.ast));
-        ctx.ast.expression_call_with_pure(span, callee, NONE, ctx.ast.vec(), false, true)
+        let callee = Expression::FunctionExpression(wrapper_function.take_in_box(ctx));
+        Expression::new_call_expression_with_pure(span, callee, None, [], false, true, ctx)
     }
 
     /// Transforms async function declarations into generator functions wrapped in the asyncToGenerator helper.
@@ -424,13 +436,22 @@ impl<'a> AsyncGeneratorExecutor<'a> {
         };
         let body = wrapper_function.body.take().unwrap();
         let params =
-            Self::create_placeholder_params(&wrapper_function.params, wrapper_scope_id, ctx);
+            Self::create_placeholder_params(&wrapper_function.params, wrapper_scope_id, None, ctx);
         let params = mem::replace(&mut wrapper_function.params, params);
+
+        let function_binding_scope_id =
+            Self::function_declaration_binding_scope_id(wrapper_function.id.as_ref(), ctx);
+        if function_binding_scope_id != ctx.current_scope_id()
+            && let Some(id) = &wrapper_function.id
+        {
+            Self::move_binding_identifier_to_target_scope(function_binding_scope_id, id, ctx);
+        }
 
         let bound_ident = Self::create_bound_identifier(
             wrapper_function.id.as_ref(),
-            ctx.current_scope_id(),
+            Self::function_declaration_binding_scope_id(None, ctx),
             SymbolFlags::Function,
+            None,
             ctx,
         );
 
@@ -438,33 +459,34 @@ impl<'a> AsyncGeneratorExecutor<'a> {
         {
             wrapper_function.r#async = false;
             wrapper_function.generator = false;
-            let statements = ctx.ast.vec1(Self::create_apply_call_statement(&bound_ident, ctx));
+            sync_function_symbol_flags(wrapper_function, ctx);
+            let statements =
+                ArenaVec::from_value_in(Self::create_apply_call_statement(&bound_ident, ctx), ctx);
             debug_assert!(wrapper_function.body.is_none());
-            wrapper_function.body.replace(ctx.ast.alloc_function_body(
-                SPAN,
-                ctx.ast.vec(),
-                statements,
-            ));
+            wrapper_function.body.replace(FunctionBody::boxed(SPAN, [], statements, ctx));
         }
 
         // function _name() { _ref.apply(this, arguments); }
         {
-            let statements = ctx.ast.vec_from_array([
-                self.create_async_to_generator_assignment(
-                    &bound_ident,
-                    params,
-                    body,
-                    generator_scope_id,
-                    ctx,
-                ),
-                Self::create_apply_call_statement(&bound_ident, ctx),
-            ]);
-            let body = ctx.ast.alloc_function_body(SPAN, ctx.ast.vec(), statements);
+            let statements = ArenaVec::from_array_in(
+                [
+                    self.create_async_to_generator_assignment(
+                        &bound_ident,
+                        params,
+                        body,
+                        generator_scope_id,
+                        ctx,
+                    ),
+                    Self::create_apply_call_statement(&bound_ident, ctx),
+                ],
+                ctx,
+            );
+            let body = FunctionBody::boxed(SPAN, [], statements, ctx);
 
             let scope_id = ctx.create_child_scope(ctx.current_scope_id(), ScopeFlags::Function);
             // The generator function will move to this function, so we need
             // to change the parent scope of the generator function to the scope of this function.
-            ctx.scoping_mut().change_scope_parent_id(generator_scope_id, Some(scope_id));
+            Self::change_scope_parent_id(generator_scope_id, scope_id, ctx);
 
             let params = Self::create_empty_params(ctx);
             let id = Some(bound_ident.create_binding_identifier(ctx));
@@ -480,6 +502,31 @@ impl<'a> AsyncGeneratorExecutor<'a> {
         }
     }
 
+    /// Returns the binding scope a rebuilt semantic tree would use for a plain function
+    /// declaration emitted at the current position.
+    fn function_declaration_binding_scope_id(
+        id: Option<&BindingIdentifier<'a>>,
+        ctx: &TraverseCtx<'a>,
+    ) -> ScopeId {
+        if ctx.state.source_type.is_typescript() {
+            return ctx.current_scope_id();
+        }
+
+        let scope_flags = ctx.current_scope_flags();
+        if scope_flags.is_var() || scope_flags.is_strict_mode() {
+            return ctx.current_scope_id();
+        }
+
+        let hoist_scope_id = ctx.current_hoist_scope_id();
+        if let Some(id) = id
+            && ctx.scoping().scope_has_binding(hoist_scope_id, id.name)
+        {
+            ctx.current_scope_id()
+        } else {
+            hoist_scope_id
+        }
+    }
+
     /// Transforms async arrow functions into generator functions wrapped in the asyncToGenerator helper.
     pub(self) fn transform_arrow_function(
         &self,
@@ -487,19 +534,9 @@ impl<'a> AsyncGeneratorExecutor<'a> {
         ctx: &mut TraverseCtx<'a>,
     ) -> Expression<'a> {
         let arrow_span = arrow.span;
-        let mut body = arrow.body.take_in_box(ctx.ast);
+        let body = arrow_function_body_as_function_body_mut(&mut arrow.body, ctx).take_in_box(ctx);
 
-        // If the arrow's expression is true, we need to wrap the only one expression with return statement.
-        if arrow.expression {
-            let statement = body.statements.first_mut().unwrap();
-            let expression = match statement {
-                Statement::ExpressionStatement(es) => es.expression.take_in(ctx.ast),
-                _ => unreachable!(),
-            };
-            *statement = ctx.ast.statement_return(expression.span(), Some(expression));
-        }
-
-        let params = arrow.params.take_in_box(ctx.ast);
+        let params = arrow.params.take_in_box(ctx);
         let generator_function_id = arrow.scope_id();
         ctx.scoping_mut().scope_flags_mut(generator_function_id).remove(ScopeFlags::Arrow);
         let function_name = Self::infer_function_name_from_parent_node(ctx);
@@ -512,20 +549,22 @@ impl<'a> AsyncGeneratorExecutor<'a> {
 
         // The generator function will move to inside wrapper, so we need
         // to change the parent scope of the generator function to the wrapper function.
-        ctx.scoping_mut().change_scope_parent_id(generator_function_id, Some(wrapper_scope_id));
+        Self::change_scope_parent_id(generator_function_id, wrapper_scope_id, ctx);
 
         let bound_ident = Self::create_bound_identifier(
             None,
             wrapper_scope_id,
             SymbolFlags::FunctionScopedVariable,
+            function_name,
             ctx,
         );
 
         let caller_function = {
             let scope_id = ctx.create_child_scope(wrapper_scope_id, ScopeFlags::Function);
-            let params = Self::create_placeholder_params(&params, scope_id, ctx);
-            let statements = ctx.ast.vec1(Self::create_apply_call_statement(&bound_ident, ctx));
-            let body = ctx.ast.alloc_function_body(SPAN, ctx.ast.vec(), statements);
+            let params = Self::create_placeholder_params(&params, scope_id, function_name, ctx);
+            let statements =
+                ArenaVec::from_value_in(Self::create_apply_call_statement(&bound_ident, ctx), ctx);
+            let body = FunctionBody::boxed(SPAN, [], statements, ctx);
             let id = function_name.map(|name| {
                 ctx.generate_binding(name, scope_id, SymbolFlags::Function)
                     .create_binding_identifier(ctx)
@@ -539,7 +578,7 @@ impl<'a> AsyncGeneratorExecutor<'a> {
                 ctx,
             );
             let argument = Some(Expression::FunctionExpression(function));
-            ctx.ast.statement_return(SPAN, argument)
+            Statement::new_return_statement(SPAN, argument, ctx)
         };
 
         // Wrapper function
@@ -551,8 +590,7 @@ impl<'a> AsyncGeneratorExecutor<'a> {
                 generator_function_id,
                 ctx,
             );
-            let statements = ctx.ast.vec_from_array([statement, caller_function]);
-            let body = ctx.ast.alloc_function_body(SPAN, ctx.ast.vec(), statements);
+            let body = FunctionBody::boxed(SPAN, [], [statement, caller_function], ctx);
             let params = Self::create_empty_params(ctx);
             let wrapper_function = Self::create_function(
                 FunctionType::FunctionExpression,
@@ -564,20 +602,8 @@ impl<'a> AsyncGeneratorExecutor<'a> {
             );
             // Construct the IIFE
             let callee = Expression::FunctionExpression(wrapper_function);
-            ctx.ast.expression_call(arrow_span, callee, NONE, ctx.ast.vec(), false)
+            Expression::new_call_expression(arrow_span, callee, None, [], false, ctx)
         }
-    }
-
-    /// Infers the function id from [`TraverseCtx::parent`].
-    fn infer_function_id_from_parent_node(
-        scope_id: ScopeId,
-        ctx: &mut TraverseCtx<'a>,
-    ) -> Option<BindingIdentifier<'a>> {
-        let name = Self::infer_function_name_from_parent_node(ctx)?;
-        Some(
-            ctx.generate_binding(name, scope_id, SymbolFlags::Function)
-                .create_binding_identifier(ctx),
-        )
     }
 
     /// Infers the function name from the [`TraverseCtx::parent`].
@@ -589,7 +615,7 @@ impl<'a> AsyncGeneratorExecutor<'a> {
             }
             // infer `foo` from `({ foo: async function() {} })`
             Ancestor::ObjectPropertyValue(property) if !*property.method() => {
-                property.key().static_name().map(|key| Self::normalize_function_name(&key, ctx))
+                property.key().static_name().map(|key| Self::normalize_function_name(key, ctx))
             }
             _ => None,
         }
@@ -597,34 +623,49 @@ impl<'a> AsyncGeneratorExecutor<'a> {
 
     /// Normalizes the function name.
     ///
+    /// Based on Babel's [`ensureFunctionName`] and [`toIdentifier`].
+    ///
     /// Examples:
     ///
-    /// // Valid
-    /// * `foo` -> `foo`
-    ///   // Contains space
-    /// * `foo bar` -> `foo_bar`
-    ///   // Reserved keyword
-    /// * `this` -> `_this`
-    /// * `arguments` -> `_arguments`
-    fn normalize_function_name(input: &Cow<'a, str>, ctx: &TraverseCtx<'a>) -> Ident<'a> {
-        let input_str = input.as_ref();
-        if !is_reserved_keyword(input_str) && is_identifier_name(input_str) {
-            return ctx.ast.ident_from_cow(input);
+    /// * Valid: `foo` -> `foo`
+    /// * Contains space or `/`: `foo bar` -> `foo_bar`, `a/b` -> `a_b`
+    /// * Starts with digits: `12a` -> `a`, `12` -> `_`
+    /// * Reserved keyword: `this` -> `_this`
+    /// * Not allowed as a binding name in strict mode: `arguments` -> `_arguments`,
+    ///   `eval` -> `_eval`
+    ///
+    /// [`ensureFunctionName`]: https://github.com/babel/babel/blob/16a2d6718c7905bedab7324677b9b9881a00b954/packages/babel-traverse/src/path/conversion.ts#L922
+    /// [`toIdentifier`]: https://github.com/babel/babel/blob/16a2d6718c7905bedab7324677b9b9881a00b954/packages/babel-types/src/converters/toIdentifier.ts#L13-L14
+    fn normalize_function_name(input: StaticPropertyName<'a>, ctx: &TraverseCtx<'a>) -> Ident<'a> {
+        let input_str = input.into_js_str_in(ctx);
+        if let Some(name) = input_str.as_str()
+            && !Self::is_invalid_binding_name(name)
+            && is_identifier_name(name)
+        {
+            return Ident::from(name);
         }
 
-        let mut name = ArenaStringBuilder::with_capacity_in(input_str.len() + 1, ctx.ast.allocator);
+        let mut name = ArenaStringBuilder::with_capacity_in(input_str.len() + 1, ctx.allocator());
         let mut capitalize_next = false;
 
-        let mut chars = input_str.chars();
-        if let Some(first) = chars.next()
-            && is_identifier_start(first)
-        {
-            name.push(first);
-        }
+        // Like Babel, first change each space and `/` to `_`. Then remove the leading ASCII digits
+        // and the leading characters that cannot be part of an identifier. A `_` from a space or
+        // `/` does not make the next letter uppercase: `a- b` -> `a_b`.
+        let becomes_underscore = |c: char| c == ' ' || c == '/';
+        let chars = input_str.chars().skip_while(|ch| {
+            ch.to_char().is_none_or(|c| {
+                !becomes_underscore(c) && (c.is_ascii_digit() || !is_identifier_part(c))
+            })
+        });
 
-        for c in chars {
-            if c == ' ' {
+        for ch in chars {
+            let Some(c) = ch.to_char() else {
+                capitalize_next = true;
+                continue;
+            };
+            if becomes_underscore(c) {
                 name.push('_');
+                capitalize_next = false;
             } else if !is_identifier_part(c) {
                 capitalize_next = true;
             } else if capitalize_next {
@@ -636,14 +677,23 @@ impl<'a> AsyncGeneratorExecutor<'a> {
         }
 
         if name.is_empty() {
-            return ctx.ast.ident("_");
+            return static_ident!("_");
         }
 
-        if is_reserved_keyword(name.as_str()) {
+        // The name can still start with a character that cannot start an identifier,
+        // such as U+0661 (ARABIC-INDIC DIGIT ONE) from `"\u0661a"`.
+        let starts_identifier = name.as_str().chars().next().is_some_and(is_identifier_start);
+        if !starts_identifier || Self::is_invalid_binding_name(name.as_str()) {
             name.push_ascii_byte_start(b'_');
         }
 
         Ident::from(name)
+    }
+
+    /// Returns `true` if `name` is a reserved keyword, or `eval` or `arguments`, which strict mode
+    /// code does not allow as binding names.
+    fn is_invalid_binding_name(name: &str) -> bool {
+        is_reserved_keyword(name) || matches!(name, "eval" | "arguments")
     }
 
     /// Creates a [`Function`] with the specified params, body and scope_id.
@@ -654,22 +704,37 @@ impl<'a> AsyncGeneratorExecutor<'a> {
         params: ArenaBox<'a, FormalParameters<'a>>,
         body: ArenaBox<'a, FunctionBody<'a>>,
         scope_id: ScopeId,
-        ctx: &TraverseCtx<'a>,
+        ctx: &mut TraverseCtx<'a>,
     ) -> ArenaBox<'a, Function<'a>> {
-        ctx.ast.alloc_function_with_scope_id(
+        let function = Function::boxed_with_scope_id(
             SPAN,
             r#type,
             id,
             false,
             false,
             false,
-            NONE,
-            NONE,
+            None,
+            None,
             params,
-            NONE,
+            None,
             Some(body),
             scope_id,
-        )
+            ctx,
+        );
+        sync_function_symbol_flags(&function, ctx);
+        function
+    }
+
+    fn change_scope_parent_id(
+        scope_id: ScopeId,
+        parent_scope_id: ScopeId,
+        ctx: &mut TraverseCtx<'a>,
+    ) {
+        let has_direct_eval = ctx.scoping().scope_flags(scope_id).contains_direct_eval();
+        ctx.scoping_mut().change_scope_parent_id(scope_id, Some(parent_scope_id));
+        if has_direct_eval {
+            ctx.scoping_mut().scope_flags_mut(parent_scope_id).insert(ScopeFlags::DirectEval);
+        }
     }
 
     /// Creates a [`Statement`] that calls the `apply` method on the bound identifier.
@@ -682,23 +747,25 @@ impl<'a> AsyncGeneratorExecutor<'a> {
         bound_ident: &BoundIdentifier<'a>,
         ctx: &mut TraverseCtx<'a>,
     ) -> Statement<'a> {
-        let arguments = ctx.ast.ident("arguments");
-        let symbol_id = ctx.scoping().find_binding(ctx.current_scope_id(), arguments);
-        let arguments_ident =
-            Argument::from(ctx.create_ident_expr(SPAN, arguments, symbol_id, ReferenceFlags::Read));
+        let arguments_ident = Argument::from(ctx.create_unbound_ident_expr(
+            SPAN,
+            static_ident!("arguments"),
+            ReferenceFlags::Read,
+        ));
 
         // (this, arguments)
-        let this = Argument::from(ctx.ast.expression_this(SPAN));
-        let arguments = ctx.ast.vec_from_array([this, arguments_ident]);
+        let this = Argument::new_this_expression(SPAN, ctx);
+        let arguments = ArenaVec::from_array_in([this, arguments_ident], ctx);
         // _ref.apply
-        let callee = Expression::from(ctx.ast.member_expression_static(
+        let callee = Expression::new_static_member_expression(
             SPAN,
             bound_ident.create_read_expression(ctx),
-            ctx.ast.identifier_name(SPAN, "apply"),
+            IdentifierName::new(SPAN, "apply", ctx),
             false,
-        ));
-        let argument = ctx.ast.expression_call(SPAN, callee, NONE, arguments, false);
-        ctx.ast.statement_return(SPAN, Some(argument))
+            ctx,
+        );
+        let argument = Expression::new_call_expression(SPAN, callee, None, arguments, false, ctx);
+        Statement::new_return_statement(SPAN, Some(argument), ctx)
     }
 
     /// Creates an [`Expression`] that calls the [`AsyncGeneratorExecutor::helper`] helper function.
@@ -728,7 +795,7 @@ impl<'a> AsyncGeneratorExecutor<'a> {
             ctx,
         );
         function.generator = true;
-        let arguments = ctx.ast.vec1(Argument::FunctionExpression(function));
+        let arguments = ArenaVec::from_value_in(Argument::FunctionExpression(function), ctx);
         helper_call_expr(self.helper, arguments, ctx)
     }
 
@@ -749,20 +816,24 @@ impl<'a> AsyncGeneratorExecutor<'a> {
         ctx: &mut TraverseCtx<'a>,
     ) -> Statement<'a> {
         let init = self.create_async_to_generator_call(params, body, scope_id, ctx);
-        let declarations = ctx.ast.vec1(ctx.ast.variable_declarator(
-            SPAN,
-            VariableDeclarationKind::Var,
-            bound_ident.create_binding_pattern(ctx),
-            NONE,
-            Some(init),
-            false,
-        ));
-        Statement::from(ctx.ast.declaration_variable(
+        let declarations = ArenaVec::from_value_in(
+            VariableDeclarator::new(
+                SPAN,
+                bound_ident.create_binding_pattern(ctx),
+                None,
+                Some(init),
+                false,
+                ctx,
+            ),
+            ctx,
+        );
+        Statement::new_variable_declaration(
             SPAN,
             VariableDeclarationKind::Var,
             declarations,
             false,
-        ))
+            ctx,
+        )
     }
 
     /// Creates a helper assignment statement for async-to-generator transformation.
@@ -782,61 +853,86 @@ impl<'a> AsyncGeneratorExecutor<'a> {
         ctx: &mut TraverseCtx<'a>,
     ) -> Statement<'a> {
         let right = self.create_async_to_generator_call(params, body, scope_id, ctx);
-        let expression = ctx.ast.expression_assignment(
+        let expression = Expression::new_assignment_expression(
             SPAN,
             AssignmentOperator::Assign,
             bound.create_write_target(ctx),
             right,
+            ctx,
         );
-        ctx.ast.statement_expression(SPAN, expression)
+        Statement::new_expression_statement(SPAN, expression, ctx)
     }
 
     /// Creates placeholder [`FormalParameters`] which named `_x` based on the passed-in parameters.
     /// `function p(x, y, z, d = 0, ...rest) {}` -> `function* (_x, _x1, _x2) {}`
+    ///
+    /// No parameter is named `caller_name`. See [`Self::generate_uid_except`].
     fn create_placeholder_params(
         params: &FormalParameters<'a>,
         scope_id: ScopeId,
+        caller_name: Option<Ident<'a>>,
         ctx: &mut TraverseCtx<'a>,
     ) -> ArenaBox<'a, FormalParameters<'a>> {
-        let mut parameters = ctx.ast.vec_with_capacity(params.items.len());
+        let mut parameters = ArenaVec::with_capacity_in(params.items.len(), ctx);
         for param in &params.items {
             if param.initializer.is_some() {
                 break;
             }
-            let binding = ctx.generate_uid("x", scope_id, SymbolFlags::FunctionScopedVariable);
-            parameters.push(
-                ctx.ast.plain_formal_parameter(param.span(), binding.create_binding_pattern(ctx)),
+            let binding = Self::generate_uid_except(
+                "x",
+                scope_id,
+                SymbolFlags::FunctionScopedVariable,
+                caller_name,
+                ctx,
             );
+            parameters.push(FormalParameter::new_plain(
+                param.span(),
+                binding.create_binding_pattern(ctx),
+                ctx,
+            ));
         }
 
-        ctx.ast.alloc_formal_parameters(
-            SPAN,
-            FormalParameterKind::FormalParameter,
-            parameters,
-            NONE,
-        )
+        FormalParameters::boxed(SPAN, FormalParameterKind::FormalParameter, parameters, None, ctx)
     }
 
     /// Creates an empty [FormalParameters] with [FormalParameterKind::FormalParameter].
     #[inline]
     fn create_empty_params(ctx: &TraverseCtx<'a>) -> ArenaBox<'a, FormalParameters<'a>> {
-        ctx.ast.alloc_formal_parameters(
-            SPAN,
-            FormalParameterKind::FormalParameter,
-            ctx.ast.vec(),
-            NONE,
-        )
+        FormalParameters::boxed(SPAN, FormalParameterKind::FormalParameter, [], None, ctx)
     }
 
     /// Creates a [`BoundIdentifier`] for the id of the function.
+    ///
+    /// The name is not `caller_name`. See [`Self::generate_uid_except`].
     #[inline]
     fn create_bound_identifier(
         id: Option<&BindingIdentifier<'a>>,
         scope_id: ScopeId,
         flags: SymbolFlags,
+        caller_name: Option<Ident<'a>>,
         ctx: &mut TraverseCtx<'a>,
     ) -> BoundIdentifier<'a> {
-        ctx.generate_uid(id.as_ref().map_or_else(|| "ref", |id| id.name.as_str()), scope_id, flags)
+        let name = id.as_ref().map_or_else(|| "ref", |id| id.name.as_str());
+        Self::generate_uid_except(name, scope_id, flags, caller_name, ctx)
+    }
+
+    /// Generates a UID binding whose name is not `caller_name`.
+    ///
+    /// The UID generator does not know names that come from property keys, such as `_ref` in
+    /// `{ _ref: async (x) => x }`.
+    fn generate_uid_except(
+        name: &str,
+        scope_id: ScopeId,
+        flags: SymbolFlags,
+        caller_name: Option<Ident<'a>>,
+        ctx: &mut TraverseCtx<'a>,
+    ) -> BoundIdentifier<'a> {
+        let mut uid = ctx.generate_uid_name(name);
+        if caller_name == Some(uid) {
+            // The UID generator never returns the same name twice.
+            uid = ctx.generate_uid_name(name);
+        }
+        ctx.generate_binding(uid, scope_id, flags)
     }
 
     /// Check whether the given [`Ancestor`] is a class method-like node.
@@ -915,17 +1011,71 @@ impl<'a, 'ctx> BindingMover<'a, 'ctx> {
     fn new(target_scope_id: ScopeId, ctx: &'ctx mut TraverseCtx<'a>) -> Self {
         Self { ctx, target_scope_id }
     }
+
+    fn move_scope_to_target(&mut self, scope_id: ScopeId) {
+        self.ctx.scoping_mut().change_scope_parent_id(scope_id, Some(self.target_scope_id));
+    }
 }
 
-impl<'a> Visit<'a> for BindingMover<'a, '_> {
+impl<'a> VisitJs<'a> for BindingMover<'a, '_> {
+    fn visit_formal_parameter(&mut self, param: &FormalParameter<'a>) {
+        // Move the parameter binding itself, then only reparent direct scopes from the initializer.
+        // Initializer expressions can contain function/class bindings that must stay in their own
+        // scopes, so they are not binding-moved.
+        self.visit_binding_pattern(&param.pattern);
+        if let Some(initializer) = &param.initializer {
+            self.visit_expression(initializer);
+        }
+    }
+
+    fn visit_formal_parameter_rest(&mut self, param: &FormalParameterRest<'a>) {
+        // Rest parameters have no initializer, so the binding rest element is the only binding
+        // position that needs to be moved.
+        self.visit_binding_rest_element(&param.rest);
+    }
+
+    fn visit_assignment_pattern(&mut self, pattern: &AssignmentPattern<'a>) {
+        // Move only the left-hand binding. The right-hand default is an expression, so only direct
+        // scopes inside it are reparented; bindings declared inside those scopes stay there.
+        self.visit_binding_pattern(&pattern.left);
+        self.visit_expression(&pattern.right);
+    }
+
+    fn visit_binding_property(&mut self, property: &BindingProperty<'a>) {
+        // Computed keys are expressions, not binding positions. They can still contain direct
+        // scopes that moved with the parameter list.
+        if property.key.is_computed() {
+            self.visit_property_key(&property.key);
+        }
+        self.visit_binding_pattern(&property.value);
+    }
+
+    #[inline]
+    fn visit_function(&mut self, func: &Function<'a>, _flags: ScopeFlags) {
+        self.move_scope_to_target(func.scope_id());
+    }
+
+    #[inline]
+    fn visit_arrow_function_expression(&mut self, func: &ArrowFunctionExpression<'a>) {
+        self.move_scope_to_target(func.scope_id());
+    }
+
+    #[inline]
+    fn visit_class(&mut self, class: &Class<'a>) {
+        // Decorators are evaluated outside the class scope and may contain direct scopes of their
+        // own, so visit them before stopping at the class scope boundary.
+        self.visit_decorators(&class.decorators);
+        self.move_scope_to_target(class.scope_id());
+    }
+
     /// Visits a binding identifier and moves it to the target scope.
     fn visit_binding_identifier(&mut self, ident: &BindingIdentifier<'a>) {
-        let symbols = self.ctx.scoping();
         let symbol_id = ident.symbol_id();
-        let current_scope_id = symbols.symbol_scope_id(symbol_id);
-        let scopes = self.ctx.scoping_mut();
-        scopes.move_binding(current_scope_id, self.target_scope_id, ident.name);
-        let symbols = self.ctx.scoping_mut();
-        symbols.set_symbol_scope_id(symbol_id, self.target_scope_id);
+        let current_scope_id = self.ctx.scoping().symbol_scope_id(symbol_id);
+        self.ctx.scoping_mut().move_binding_by_symbol_id(
+            current_scope_id,
+            self.target_scope_id,
+            symbol_id,
+        );
     }
 }

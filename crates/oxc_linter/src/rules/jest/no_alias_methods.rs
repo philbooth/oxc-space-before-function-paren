@@ -1,24 +1,76 @@
+use oxc_ast::AstKind;
 use oxc_macros::declare_oxc_lint;
+use oxc_semantic::AstNode;
 
 use crate::{
-    context::LintContext,
+    context::{ContextHost, LintContext},
     rule::Rule,
-    rules::shared::no_alias_methods::{DOCUMENTATION, run_on_jest_node},
-    utils::PossibleJestNode,
+    rules::shared::no_alias_methods::run,
 };
 
 #[derive(Debug, Default, Clone)]
 pub struct NoAliasMethods;
 
-declare_oxc_lint!(NoAliasMethods, jest, style, fix, docs = DOCUMENTATION, version = "0.0.12",);
+declare_oxc_lint!(
+    /// ### What it does
+    ///
+    /// Enforces Jest's canonical matcher names instead of aliases.
+    ///
+    /// ### Why is this bad?
+    ///
+    /// Jest matcher aliases are deprecated and are going to be removed in the next major version of Jest.
+    /// See [jestjs/jest#13164](https://github.com/jestjs/jest/issues/13164) for more.
+    ///
+    /// This rule makes it easier to search for all occurrences of a matcher and ensures consistency among matcher names.
+    ///
+    /// ### Examples
+    ///
+    /// Examples of **incorrect** code for this rule:
+    /// ```javascript
+    /// expect(a).toBeCalled()
+    /// expect(a).toBeCalledTimes()
+    /// expect(a).toBeCalledWith()
+    /// expect(a).lastCalledWith()
+    /// expect(a).nthCalledWith()
+    /// expect(a).toReturn()
+    /// expect(a).toReturnTimes()
+    /// expect(a).toReturnWith()
+    /// expect(a).lastReturnedWith()
+    /// expect(a).nthReturnedWith()
+    /// expect(a).toThrowError()
+    /// ```
+    ///
+    /// Examples of **correct** code for this rule:
+    /// ```javascript
+    /// expect(a).toHaveBeenCalled()
+    /// expect(a).toHaveBeenCalledTimes()
+    /// expect(a).toHaveBeenCalledWith()
+    /// expect(a).toHaveBeenLastCalledWith()
+    /// expect(a).toHaveBeenNthCalledWith()
+    /// expect(a).toHaveReturned()
+    /// expect(a).toHaveReturnedTimes()
+    /// expect(a).toHaveReturnedWith()
+    /// expect(a).toHaveLastReturnedWith()
+    /// expect(a).toHaveNthReturnedWith()
+    /// expect(a).toThrow()
+    /// ```
+    NoAliasMethods,
+    jest,
+    style,
+    recommended,
+    fix,
+    version = "0.0.12",
+    short_description = "Enforces Jest's canonical matcher names instead of aliases.",
+);
 
 impl Rule for NoAliasMethods {
-    fn run_on_jest_node<'a, 'c>(
-        &self,
-        jest_node: &PossibleJestNode<'a, 'c>,
-        ctx: &'c LintContext<'a>,
-    ) {
-        run_on_jest_node(jest_node, ctx);
+    fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
+        let AstKind::CallExpression(_) = node.kind() else { return };
+        run(node, ctx);
+    }
+
+    fn should_run(&self, ctx: &ContextHost) -> bool {
+        ctx.frameworks().is_test()
     }
 }
 

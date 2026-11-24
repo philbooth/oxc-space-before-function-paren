@@ -1,11 +1,12 @@
 use oxc_ast::{
     AstKind,
-    ast::{AssignmentTarget, AssignmentTargetMaybeDefault, Expression},
+    ast::{AssignmentTarget, AssignmentTargetMaybeDefault, Expression, ImportDeclarationSpecifier},
 };
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_semantic::{AstNode, NodeId, Reference};
 use oxc_span::{GetSpan, Span};
+use oxc_str::JSStr;
 use oxc_syntax::operator::UnaryOperator;
 
 use crate::{context::LintContext, rule::Rule};
@@ -50,7 +51,9 @@ declare_oxc_lint!(
     NoImportAssign,
     eslint,
     correctness,
+    recommended,
     version = "0.0.5",
+    short_description = "Disallow assigning to imported bindings.",
 );
 
 const OBJECT_MUTATION_METHODS: [&str; 5] =
@@ -66,11 +69,9 @@ impl Rule for NoImportAssign {
         let symbol_table = ctx.scoping();
         if let Some(specifiers) = &import_decl.specifiers {
             for specifier in specifiers {
-                let symbol_id = specifier.local().symbol_id();
-                let is_namespace_specifier = matches!(
-                    specifier,
-                    oxc_ast::ast::ImportDeclarationSpecifier::ImportNamespaceSpecifier(_)
-                );
+                let symbol_id = specifier.symbol_id();
+                let is_namespace_specifier =
+                    matches!(specifier, ImportDeclarationSpecifier::ImportNamespaceSpecifier(_));
                 for reference in symbol_table.get_resolved_references(symbol_id) {
                     if is_namespace_specifier {
                         let parent_node = ctx.nodes().parent_node(reference.node_id());
@@ -176,7 +177,7 @@ fn is_argument_of_well_known_mutation_function(node_id: NodeId, ctx: &LintContex
     };
 
     if let Expression::Identifier(ident) = member_expr.object() {
-        let Some(property_name) = member_expr.static_property_name() else {
+        let Some(property_name) = member_expr.static_property_name().and_then(JSStr::as_str) else {
             return false;
         };
 

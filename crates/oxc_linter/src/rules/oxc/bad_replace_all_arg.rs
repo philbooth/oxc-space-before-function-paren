@@ -1,14 +1,11 @@
-use oxc_ast::{
-    AstKind,
-    ast::{Expression, RegExpFlags},
-};
+use oxc_ast::{AstKind, ast::RegExpFlags};
 use oxc_diagnostics::OxcDiagnostic;
 use oxc_macros::declare_oxc_lint;
 use oxc_span::Span;
 
 use crate::{
     AstNode,
-    ast_util::{extract_regex_flags, get_declaration_of_variable, is_method_call},
+    ast_util::{is_method_call, resolve_regex_flags},
     context::LintContext,
     rule::Rule,
 };
@@ -16,6 +13,7 @@ use crate::{
 fn bad_replace_all_arg_diagnostic(replace_all_span: Span, regex_span: Span) -> OxcDiagnostic {
     OxcDiagnostic::warn("Global flag (g) is missing in the regular expression supplied to the `replaceAll` method.")
         .with_help("To replace all occurrences of a string, use the `replaceAll` method with the global flag (g) in the regular expression.")
+        .with_note("Unlike `replace`, `replaceAll` throws a `TypeError` when passed a non-global regular expression instead of replacing only the first match.")
         .with_labels([
             replace_all_span.label("`replaceAll` called here"),
             regex_span.label("RegExp supplied here"),
@@ -32,7 +30,8 @@ declare_oxc_lint!(
     ///
     /// ### Why is this bad?
     ///
-    /// The `replaceAll` method replaces all occurrences of a string with another string. If the global flag (g) is not used in the regular expression, only the first occurrence of the string will be replaced.
+    /// When called with a regular expression, the `replaceAll` method requires the global flag (g).
+    /// Otherwise, it throws a `TypeError` at runtime instead of performing a replacement.
     ///
     /// ### Examples
     ///
@@ -48,64 +47,23 @@ declare_oxc_lint!(
     BadReplaceAllArg,
     oxc,
     correctness,
+    recommended,
     version = "0.0.22",
+    short_description = "This rule warns when the `replaceAll` method is called with a regular expression that does not have the global flag (g).",
 );
 
 impl Rule for BadReplaceAllArg {
     fn run<'a>(&self, node: &AstNode<'a>, ctx: &LintContext<'a>) {
-        let AstKind::CallExpression(call_expr) = node.kind() else {
-            return;
-        };
-
-        if !is_method_call(call_expr, None, Some(&["replaceAll"]), Some(1), None) {
-            return;
-        }
-
-        let Some(regexp_argument) = call_expr.arguments[0].as_expression() else {
-            return;
-        };
-
-        let Some((flags, regex_span)) = resolve_flags(regexp_argument, ctx) else {
-            return;
-        };
-
-        if !flags.contains(RegExpFlags::G) {
-            let Some(call_expr_callee) = call_expr.callee.as_member_expression() else {
-                return;
-            };
-            let Some((replace_all_span, _)) = call_expr_callee.static_property_info() else {
-                return;
-            };
-
+        if let AstKind::CallExpression(call_expr) = node.kind()
+            && is_method_call(call_expr, None, Some(&["replaceAll"]), Some(1), None)
+            && let Some(regexp_argument) = call_expr.arguments[0].as_expression()
+            && let Some((flags, regex_span)) = resolve_regex_flags(regexp_argument, ctx)
+            && !flags.contains(RegExpFlags::G)
+            && let Some(call_expr_callee) = call_expr.callee.as_member_expression()
+            && let Some((replace_all_span, _)) = call_expr_callee.static_property_info()
+        {
             ctx.diagnostic(bad_replace_all_arg_diagnostic(replace_all_span, regex_span));
         }
-    }
-}
-
-fn resolve_flags<'a>(
-    expr: &'a Expression<'a>,
-    ctx: &LintContext<'a>,
-) -> Option<(RegExpFlags, Span)> {
-    match expr.without_parentheses() {
-        Expression::RegExpLiteral(regexp_literal) => {
-            Some((regexp_literal.regex.flags, regexp_literal.span))
-        }
-        Expression::NewExpression(new_expr) => {
-            if new_expr.callee.is_specific_id("RegExp") {
-                extract_regex_flags(&new_expr.arguments).map(|flags| (flags, new_expr.span))
-            } else {
-                None
-            }
-        }
-        Expression::Identifier(ident) => {
-            let decl = get_declaration_of_variable(ident, ctx)?;
-            let var_decl = decl.kind().as_variable_declarator()?;
-            if let Some(init) = &var_decl.init {
-                return resolve_flags(init, ctx);
-            }
-            None
-        }
-        _ => None,
     }
 }
 
@@ -124,6 +82,8 @@ fn test() {
         r"withSpaces();",
         // new RegExp
         r"withSpaces.replaceAll(new RegExp('\s+', 'g'), ',');",
+        r"withSpaces.replaceAll(new RegExp(/\s+/g), ',');",
+        r"function test(pattern) { withSpaces.replaceAll(new RegExp(pattern), ','); }",
         // new replaceAll
         r"new replaceAll(/\s+/, ',');",
         // resolved vars
@@ -133,6 +93,10 @@ fn test() {
         // resolved vars
         r"const foo = new RegExp('\s+', 'g'); withSpaces.replaceAll(foo, ',');",
         r"const foo = new RegExp('\s+', isWindows ? 'g' : 'gi'); withSpaces.replaceAll(foo, ',');",
+        r"withSpaces.replaceAll(new RegExp((/\s+/g)), ',');",
+        r"withSpaces.replaceAll(RegExp(/\s+/g), ',');",
+        r"withSpaces.replaceAll(new RegExp(/\s+/, 'g'), ',');",
+        r"function test(pattern) { withSpaces.replaceAll(RegExp(pattern), ','); }",
     ];
 
     let fail = vec![
@@ -140,6 +104,7 @@ fn test() {
         r"withSpaces.replaceAll(/\s+/i, ',');",
         r"withSpaces.replaceAll(new RegExp('\s+'), ',');",
         r"withSpaces.replaceAll(new RegExp('\s+','i'), ',');",
+        r"withSpaces.replaceAll(new RegExp(/\s+/), ',');",
         // resolved vars
         r"
             const foo = /\s+/;
@@ -156,6 +121,10 @@ fn test() {
 
             withSpaces.replaceAll(foo, ',');
         ",
+        r"withSpaces.replaceAll(new RegExp((/\s+/)), ',');",
+        r"withSpaces.replaceAll(RegExp(1), ',');",
+        r"withSpaces.replaceAll(new RegExp(), ',');",
+        r"withSpaces.replaceAll(new RegExp(/\s+/g, 'i'), ',');",
     ];
 
     Tester::new(BadReplaceAllArg::NAME, BadReplaceAllArg::PLUGIN, pass, fail).test_and_snapshot();

@@ -1,24 +1,27 @@
 mod config;
+pub mod embed;
 mod format;
+mod global_ignore;
+mod language;
+pub mod options;
 pub mod oxfmtrc;
 mod support;
 pub mod utils;
 
 #[cfg(feature = "napi")]
-mod external_formatter;
-#[cfg(feature = "napi")]
-mod js_config;
+mod external_services;
 
-pub use config::{ConfigResolver, config_discovery, resolve_editorconfig_path};
+pub use config::{ConfigResolver, ConfigScopes, ResolveOutcome, config_discovery};
 #[cfg(feature = "napi")]
-pub use config::{resolve, resolve_options_for_embedded_js};
-pub use format::{FormatResult, FormatStrategy, SourceFormatter};
-pub use support::classify_file_kind;
+pub use config::{JsConfigLoaderCb, JsLoadJsConfigCb, create_js_config_loader, resolve_for_api};
+pub use format::{FormatPlan, FormatResult, SourceFormatter};
+pub use global_ignore::{build_global_ignore_matchers, is_ignored, resolve_ignore_paths};
+pub use language::Language;
+#[cfg(feature = "napi")]
+pub use support::classify_file;
 
 #[cfg(feature = "napi")]
-pub use external_formatter::{
-    ExternalFormatter, JsFormatEmbeddedCb, JsFormatEmbeddedDocCb, JsFormatFileCb,
-    JsInitExternalFormatterCb, JsSortTailwindClassesCb,
+pub use external_services::{
+    ExternalServices, JsFormatEmbeddedDocCb, JsFormatFileCb, JsInitExternalServicesCb,
+    JsSortTailwindClassesCb,
 };
-#[cfg(feature = "napi")]
-pub use js_config::{JsConfigLoaderCb, JsLoadJsConfigCb, create_js_config_loader};

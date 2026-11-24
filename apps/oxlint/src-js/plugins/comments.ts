@@ -10,7 +10,7 @@ import {
   COMMENT_KIND_OFFSET,
   COMMENT_LINE_KIND,
   DATA_POINTER_POS_32,
-  DESERIALIZED_FLAG_OFFSET,
+  COMMENT_DESERIALIZED_FLAG_OFFSET,
 } from "../generated/constants.ts";
 import { computeLoc } from "./location.ts";
 import { FLAG_NOT_DESERIALIZED, FLAG_DESERIALIZED } from "./tokens.ts";
@@ -79,11 +79,24 @@ const DESERIALIZED_COMMENT_INDEXES_MIN_CAPACITY = 16;
 // Reused for all files which don't have any comments. Frozen to avoid rules mutating it.
 const EMPTY_COMMENTS: CommentType[] = Object.freeze([]) as unknown as CommentType[];
 
-const COMMENT_SIZE_SHIFT = 4; // 1 << 4 == 16 bytes, the size of `Comment` in Rust
-debugAssert(COMMENT_SIZE === 1 << COMMENT_SIZE_SHIFT);
+export const COMMENT_SIZE32 = COMMENT_SIZE >> 2;
+debugAssert(COMMENT_SIZE === COMMENT_SIZE32 * 4);
+
+// `defineGetter(obj, prop, getter)` is equivalent to `obj.__defineGetter__(prop, getter)`,
+// but without `Object.prototype` lookup at each call site
+const defineGetter = Function.prototype.call.bind(
+  // @ts-expect-error - `__defineGetter__` is not in `Object.prototype`'s type definition,
+  // but it does exist at runtime and is widely supported in JS engines, including V8
+  Object.prototype.__defineGetter__,
+) as (obj: object, prop: string, getter: () => unknown) => void;
+
+// Getter for the `loc` property on a `Comment` class instance.
+// Copied into a `const` below after being defined in class static block.
+let getCommentLocTemp: (this: Comment) => Location;
 
 // Reset `#loc` field on a `Comment` class instance.
-let resetCommentLoc: (comment: Comment) => void;
+// Copied into a `const` below after being defined in class static block.
+let resetCommentLocTemp: (comment: Comment) => void;
 
 // Get `#loc` field on a `Comment` class instance.
 // Only used in debug build (tests).
@@ -92,10 +105,13 @@ let getCommentPrivateLoc: (comment: Comment) => Location | null;
 /**
  * Comment class.
  *
- * Creates `loc` lazily and caches it in a private field.
- * Using a class with a private `#loc` field avoids hidden class transitions that would occur
- * with `Object.defineProperty` / `delete` on plain objects.
- * All `Comment` instances always have the same V8 hidden class, keeping property access monomorphic.
+ * `loc` is defined as an own accessor property via `__defineGetter__` in the constructor,
+ * using a shared getter function (`getCommentLoc`). This makes `loc` an own enumerable property,
+ * so `{...comment}` spreads it and `JSON.stringify(comment)` serializes it.
+ *
+ * The computed `Location` value is cached in the private `#loc` field on first access.
+ * All instances share the same getter function, keeping the V8 hidden class transition
+ * identical across instances. Reset only clears the `#loc` field.
  */
 class Comment implements Span {
   type: CommentType["type"] = null!; // Overwritten later
@@ -104,37 +120,39 @@ class Comment implements Span {
   end: number = 0;
   range: [number, number] = [0, 0];
 
+  declare loc: Location; // Defined with `__defineGetter__` in constructor
+
   #loc: Location | null = null;
 
-  get loc(): Location {
-    const loc = this.#loc;
-    if (loc !== null) return loc;
-
-    // Store comment in `commentsWithLoc` array. `resetComments` will clear the `#loc` property.
-    // Note: The comparison `activeCommentsWithLocCount < commentsWithLoc.length` must be this way around
-    // so that V8 can remove the bounds check on `commentsWithLoc[activeCommentsWithLocCount]`.
-    // `commentsWithLoc.length > activeCommentsWithLocCount` would *not* remove the bounds check in Maglev compiler.
-    if (activeCommentsWithLocCount < commentsWithLoc.length) {
-      commentsWithLoc[activeCommentsWithLocCount] = this;
-    } else {
-      commentsWithLoc.push(this);
-    }
-    activeCommentsWithLocCount++;
-
-    return (this.#loc = computeLoc(this.start, this.end));
+  constructor() {
+    // Define `loc` as an own getter property (enumerable + configurable by default).
+    // This makes `{...comment}` spread `loc` and `JSON.stringify(comment)` serialize it.
+    // Note: `new Comment()` is 25% faster with `__defineGetter__` vs `Object.defineProperty`.
+    // See https://github.com/oxc-project/oxc/pull/22238.
+    defineGetter(this, "loc", getCommentLoc);
   }
 
-  // Include `loc` in `JSON.stringify` output.
-  // `loc` is a prototype getter, and `JSON.stringify` only serializes own properties,
-  // so without this method, `loc` would be excluded.
-  toJSON() {
-    // oxlint-disable-next-line typescript/no-misused-spread
-    return { ...this, loc: this.loc };
-  }
-
+  // Functions requiring access to `#loc` defined in static block to avoid exposing them as public methods
   static {
-    // Defined in static block to avoid exposing this as a public method
-    resetCommentLoc = (comment: Comment) => {
+    getCommentLocTemp = function (this: Comment): Location {
+      const loc = this.#loc;
+      if (loc !== null) return loc;
+
+      // Store comment in `commentsWithLoc` array. `resetComments` will clear the `#loc` property.
+      // Note: The comparison `activeCommentsWithLocCount < commentsWithLoc.length` must be this way around
+      // so that V8 can remove the bounds check on `commentsWithLoc[activeCommentsWithLocCount]`.
+      // `commentsWithLoc.length > activeCommentsWithLocCount` would *not* remove the bounds check in Maglev compiler.
+      if (activeCommentsWithLocCount < commentsWithLoc.length) {
+        commentsWithLoc[activeCommentsWithLocCount] = this;
+      } else {
+        commentsWithLoc.push(this);
+      }
+      activeCommentsWithLocCount++;
+
+      return (this.#loc = computeLoc(this.start, this.end));
+    };
+
+    resetCommentLocTemp = (comment: Comment) => {
       comment.#loc = null;
     };
 
@@ -142,8 +160,9 @@ class Comment implements Span {
   }
 }
 
-// Make `loc` property enumerable so `for (const key in comment) ...` includes `loc`
-Object.defineProperty(Comment.prototype, "loc", { enumerable: true });
+// Copied into consts here to avoid checks at call site (`let` binding could be re-assigned)
+const getCommentLoc = getCommentLocTemp;
+const resetCommentLoc = resetCommentLocTemp;
 
 /**
  * Deserialize all comments and build the `comments` array.
@@ -152,7 +171,7 @@ Object.defineProperty(Comment.prototype, "loc", { enumerable: true });
 export function initComments(): void {
   debugAssert(comments === null, "Comments already deserialized");
 
-  if (!allCommentsDeserialized) deserializeComments();
+  if (allCommentsDeserialized === false) deserializeComments();
 
   // `initCommentsBuffer` (called by `deserializeComments`) sets `comments` for zero-comment files
   if (comments !== null) return;
@@ -179,7 +198,7 @@ export function initComments(): void {
  * Does NOT build the `comments` array - use `initComments` for that.
  */
 export function deserializeComments(): void {
-  debugAssert(!allCommentsDeserialized, "Comments already deserialized");
+  debugAssert(allCommentsDeserialized === false, "Comments already deserialized");
 
   if (commentsInt32 === null) initCommentsBuffer();
 
@@ -236,7 +255,7 @@ export function initCommentsBuffer(): void {
   const arrayBuffer = buffer.buffer,
     absolutePos = buffer.byteOffset + commentsPos;
   commentsUint8 = new Uint8Array(arrayBuffer, absolutePos, commentsLen * COMMENT_SIZE);
-  commentsInt32 = new Int32Array(arrayBuffer, absolutePos, commentsLen * (COMMENT_SIZE >> 2));
+  commentsInt32 = new Int32Array(arrayBuffer, absolutePos, commentsLen * COMMENT_SIZE32);
 
   // Grow caches if needed. After first few files, caches should have grown large enough to service all files.
   // Later files will skip this step, and allocations stop.
@@ -282,7 +301,7 @@ export function initCommentsBuffer(): void {
  */
 export function getComment(index: number): CommentType {
   // Skip all other checks if all comments have been deserialized
-  if (!allCommentsDeserialized) {
+  if (allCommentsDeserialized === false) {
     const comment = deserializeCommentIfNeeded(index);
 
     if (comment !== null) {
@@ -309,28 +328,34 @@ export function getComment(index: number): CommentType {
  * @returns `Comment` object if newly deserialized, or `null` if already deserialized
  */
 function deserializeCommentIfNeeded(index: number): Comment | null {
-  const pos = index << COMMENT_SIZE_SHIFT;
+  debugAssertIsNonNull(commentsUint8, "Comment buffers should be initialized");
+  debugAssertIsNonNull(commentsInt32, "Comment buffers should be initialized");
+  debugAssertIsNonNull(sourceText, "Source text should be initialized");
+
+  const pos = index * COMMENT_SIZE;
 
   // Fast path: If already deserialized, exit
-  const flagPos = pos + DESERIALIZED_FLAG_OFFSET;
-  if (commentsUint8![flagPos] !== FLAG_NOT_DESERIALIZED) return null;
+  const flagPos = pos + COMMENT_DESERIALIZED_FLAG_OFFSET;
+  if (commentsUint8[flagPos] !== FLAG_NOT_DESERIALIZED) return null;
 
   // Mark comment as deserialized, so it won't be deserialized again
-  commentsUint8![flagPos] = FLAG_DESERIALIZED;
+  commentsUint8[flagPos] = FLAG_DESERIALIZED;
 
   // Deserialize comment into a cached `Comment` object
   const comment = cachedComments[index];
 
-  const isBlock = commentsUint8![pos + COMMENT_KIND_OFFSET] !== COMMENT_LINE_KIND;
+  // HTML comment discriminants equal their delimiter lengths (3 or 4).
+  const kind = commentsUint8[pos + COMMENT_KIND_OFFSET];
+  const isBlock = kind !== COMMENT_LINE_KIND && kind < 3;
 
   const pos32 = pos >> 2,
-    start = commentsInt32![pos32],
-    end = commentsInt32![pos32 + 1];
+    start = commentsInt32[pos32],
+    end = commentsInt32[pos32 + 1];
 
   comment.type = isBlock ? "Block" : "Line";
-  // Line comments: `// text` -> slice `start + 2..end`
+  // Line comments: skip `//`, `-->`, or `<!--`
   // Block comments: `/* text */` -> slice `start + 2..end - 2`
-  comment.value = sourceText!.slice(start + 2, end - (+isBlock << 1));
+  comment.value = sourceText.slice(start + (kind < 3 ? 2 : kind), end - (+isBlock << 1));
   comment.range[0] = comment.start = start;
   comment.range[1] = comment.end = end;
 
@@ -338,16 +363,18 @@ function deserializeCommentIfNeeded(index: number): Comment | null {
 }
 
 /**
- * Check comments buffer has valid ranges and ascending order.
+ * Check all comments in buffer have valid ranges, are in ascending order, and are within the source text.
  *
  * Only runs in debug build (tests). In release build, this function is entirely removed by minifier.
  */
 function debugCheckValidRanges(): void {
   if (!DEBUG) return;
 
+  debugAssertIsNonNull(sourceText, "`sourceText` should be initialized");
+
   let lastEnd = 0;
   for (let i = 0; i < commentsLen; i++) {
-    const pos32 = i << 2;
+    const pos32 = i * COMMENT_SIZE32;
     const start = commentsInt32![pos32];
     const end = commentsInt32![pos32 + 1];
     if (end <= start) throw new Error(`Invalid comment range: ${start}-${end}`);
@@ -357,22 +384,24 @@ function debugCheckValidRanges(): void {
     lastEnd = end;
   }
 
-  if (lastEnd > sourceText!.length) {
-    throw new Error(`Comments end beyond source text length: ${lastEnd} > ${sourceText!.length}`);
+  if (lastEnd > sourceText.length) {
+    throw new Error(`Comments end beyond source text length: ${lastEnd} > ${sourceText.length}`);
   }
 }
 
 /**
- * Check all deserialized comments are in ascending order.
+ * Check all deserialized comments have valid ranges, are in ascending order, and are within the source text.
  *
  * Only runs in debug build (tests). In release build, this function is entirely removed by minifier.
  */
 function debugCheckDeserializedComments(): void {
   if (!DEBUG) return;
 
+  debugAssertIsNonNull(sourceText, "`sourceText` should be initialized");
+
   let lastEnd = 0;
   for (let i = 0; i < commentsLen; i++) {
-    const flagPos = (i << COMMENT_SIZE_SHIFT) + DESERIALIZED_FLAG_OFFSET;
+    const flagPos = i * COMMENT_SIZE + COMMENT_DESERIALIZED_FLAG_OFFSET;
     if (commentsUint8![flagPos] !== FLAG_DESERIALIZED) {
       throw new Error(
         `Comment ${i} not marked as deserialized after \`deserializeComments()\` call`,
@@ -387,6 +416,10 @@ function debugCheckDeserializedComments(): void {
       );
     }
     lastEnd = end;
+  }
+
+  if (lastEnd > sourceText.length) {
+    throw new Error(`Comments end beyond source text length: ${lastEnd} > ${sourceText.length}`);
   }
 }
 
