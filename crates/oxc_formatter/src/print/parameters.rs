@@ -80,15 +80,8 @@ impl<'a> FormatWrite<'a> for AstNode<'_, 'a, FormalParameters<'a>> {
         };
 
         if !parentheses_not_needed {
-            if f.options().space_before_function_paren.value() {
-                // Don't add space for type-level function signatures (e.g. `type Fn = (x: T) => R`)
-                let is_type_level = matches!(
-                    self.parent(),
-                    AstNodes::TSFunctionType(_) | AstNodes::TSCallSignatureDeclaration(_)
-                );
-                if !is_type_level {
-                    write!(f, " ");
-                }
+            if f.options().space_before_function_paren.value() && is_preceded_by_name(self) {
+                write!(f, " ");
             }
             write!(f, "(");
         }
@@ -113,6 +106,44 @@ impl<'a> FormatWrite<'a> for AstNode<'_, 'a, FormalParameters<'a>> {
         if !parentheses_not_needed {
             write!(f, [")"]);
         }
+    }
+}
+
+/// Whether the `spaceBeforeFunctionParen` space belongs to this parameter list.
+///
+/// The option separates a name from its `(`. It only applies where a name (or method key) is
+/// printed immediately before the parens:
+///
+/// - Arrows are excluded. The enclosing construct already writes the separator (`return `,
+///   `= `, `async `, a call's `(`), so the space was never the arrow's to add.
+/// - Type-level signatures are anonymous, so there is no name to separate.
+/// - An anonymous `Function` prints its own space after the `function` keyword
+///   (`function () {}`), which must not be doubled.
+fn is_preceded_by_name(params: &AstNode<'_, '_, FormalParameters<'_>>) -> bool {
+    match params.parent() {
+        AstNodes::ArrowFunctionExpression(_)
+        | AstNodes::TSFunctionType(_)
+        | AstNodes::TSCallSignatureDeclaration(_)
+        | AstNodes::TSConstructorType(_)
+        | AstNodes::TSConstructSignatureDeclaration(_) => false,
+        AstNodes::Function(function) => {
+            function.id.is_some() || has_key_before_paren(params.grand_parent())
+        }
+        _ => true,
+    }
+}
+
+/// Whether a `Function` that prints without a name still reaches its `(` after a key.
+///
+/// `class C { method() {} }` and `{ get value() {} }` do. An anonymous function expression
+/// (`{ key: function () {} }`) follows its own `function` keyword instead.
+fn has_key_before_paren(function_parent: &AstNodes<'_, '_>) -> bool {
+    match function_parent {
+        AstNodes::MethodDefinition(_) => true,
+        AstNodes::ObjectProperty(property) => {
+            property.method || !matches!(property.kind, PropertyKind::Init)
+        }
+        _ => false,
     }
 }
 
