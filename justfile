@@ -311,6 +311,15 @@ oxfmt-node-dev:
 watch-oxfmt-node *args='':
   just watch 'pnpm run -C apps/oxfmt build-dev && node apps/oxfmt/dist/cli.js {{args}}'
 
+# Build and publish this fork's oxfmt to npm.
+# Takes the version from `npm/oxfmt/package.json`, which tracks upstream, so publish once per upstream release.
+oxfmt-space-before-function-paren-publish:
+  just oxfmt-node
+  rm -rf npm/oxfmt/dist
+  cp -R apps/oxfmt/dist npm/oxfmt/dist
+  ls npm/oxfmt/dist/*.node > /dev/null
+  cd npm/oxfmt && npm publish --access public
+
 # ==================== TRANSFORMER ====================
 
 # Test Transform

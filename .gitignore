@@ -26,6 +26,9 @@ target/
 /napi/*/npm-dir
 /napi/parser/tsconfig.browser.tsbuildinfo
 
+# Local build output for the published fork package, see `just oxfmt-fork-publish`
+/npm/oxfmt/dist/
+
 .pnpm-store
 
 # Cloned conformance repos
