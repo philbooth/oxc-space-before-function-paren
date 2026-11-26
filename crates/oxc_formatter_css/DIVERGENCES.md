@@ -65,6 +65,35 @@ Prettier keeps a COMMENTED keyframe selector list verbatim, interior spacing inc
 ours prints commented and uncommented lists with the same structural layout (one selector per line, comments per the separator rule).
 Same rule as `comment-preceded-map-indent`.
 
+## layer-comma-list
+
+- Why: uniform-rule (same construct, same output: a comma list in `@media` / `@custom-selector`)
+- Pin: `tests/fixtures/format/css/layer-comma-list.css`
+
+```css
+/* input */
+@layer a,b;
+@layer reset, base,
+  components;
+@layer /* c */ a ,  b;
+
+/* ours */
+@layer a, b;
+@layer reset, base, components;
+@layer /* c */ a, b;
+
+/* prettier */
+@layer a,b;
+@layer reset, base,
+  components;
+@layer /* c */ a ,  b;
+```
+
+A `@layer` name list prints `, `-separated on one line, with or without a comment in it,
+as Prettier prints a `@media` query list or a `@custom-selector` list (`screen,print` -> `screen, print`).
+Prettier has no `@layer` case and keeps its params as written.
+A `//` still breaks the list (`tests/fixtures/format/scss/at-rule-prelude-comments.scss`).
+
 ## nest-params-indent
 
 - Why: uniform-rule (same construct, same output: selector-list continuation outside `@nest`)
@@ -1549,6 +1578,27 @@ At-rule names, property names, media feature names and the prelude keywords next
 Values keep their case (`LANDSCAPE`, `FLEX`), as in any declaration: a value may be a case-sensitive custom ident (`animation-name`, `grid-area`).
 So do case-sensitive names (`layer(FOO)`) and any identifier carrying a variable or interpolation marker (`@media @PHONE`, `#{$Q}`).
 Prettier lowercases only what its `maybeToLowerCase` reaches (at-rule names, `media-feature`, declaration props) and prints the neighbouring keywords as its media-query parser or value parser hands them over: verbatim.
+
+## media-feature-comment-case
+
+- Why: invariant
+- Pin: `tests/fixtures/format/css/media-commented-feature.css`
+
+```css
+/* input */
+@media (/* A */ COLOR) {}
+
+/* ours */
+@media (/* A */ color) {
+}
+
+/* prettier */
+@media (/* a */ color) {
+}
+```
+
+A comment in a media feature keeps its text, only the code around it lowercases;
+Prettier lowercases the whole feature, so the comment's text is no longer the user's.
 
 ## missed-semicolon-accepted
 

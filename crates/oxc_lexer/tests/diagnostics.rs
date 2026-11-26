@@ -74,6 +74,9 @@ fn numeric_separator_and_empty_radix(cpu: DynCpu) {
     assert_eq!(codes("x = 0x_1", cpu), [DiagCode::InvalidNumericSeparator]); // after prefix
     assert_eq!(codes("x = 0xAB_", cpu), [DiagCode::InvalidNumericSeparator]); // trailing in hex
     assert_eq!(codes("x = 0x;", cpu), [DiagCode::InvalidNumericLiteral]); // empty radix
+    assert_eq!(codes("x = 1__2n;", cpu), [DiagCode::InvalidNumericSeparator]); // double
+    assert_eq!(codes("x = 0x_1n;", cpu), [DiagCode::InvalidNumericSeparator]); // after prefix
+    assert_eq!(codes("x = 0xn;", cpu), [DiagCode::InvalidNumericLiteral]); // empty radix
 }
 
 #[test_cpus]
@@ -532,6 +535,35 @@ fn invalid_identifier_escape_payload(cpu: DynCpu) {
 }
 
 #[test_cpus]
+fn invalid_identifier_escapes_add_nothing_to_the_value(cpu: DynCpu) {
+    for (code, want) in [
+        // a lone surrogate, either form, adds nothing
+        (r"x\uD800y;", "xy"),
+        (r"x\u{DC00}y;", "xy"),
+        (r"class C { #p\u{D800} }", "p"),
+        // a well-formed pair is still invalid
+        (r"\uD800\uDC00x;", "x"),
+        // a char no identifier can have
+        (r"x\u0020y;", "xy"),
+        // ID_Continue only, at the start
+        (r"\u0030a;", "a"),
+        // the rest of the escape goes with it
+        (r"a\u{1100000}b;", "ab"),
+        (r"a\u{}b;", "ab"),
+        (r"a\u12xy;", "axy"),
+        // valid escapes still decode
+        (r"a\u0041\u{20BB7};", "aA\u{20BB7}"),
+    ] {
+        let res = lex_with_cpu(code, LexOptions::default(), cpu);
+        let cooked = res.cooked_bytes();
+        let [atom] = res.atoms() else { panic!("{code:?}") };
+        assert!(!atom.lone_surrogates(), "{code:?}");
+        let value = &cooked[atom.start() as usize..atom.end() as usize];
+        assert_eq!(str::from_utf8(value), Ok(want), "{code:?}");
+    }
+}
+
+#[test_cpus]
 fn invalid_identifier_escape_jsx_path(cpu: DynCpu) {
     assert!(codes_jsx(r"const \u{110000} = 1", cpu).contains(&DiagCode::InvalidIdentifierEscape));
     assert_eq!(codes_jsx(r"const el = <div>a\b</div>;", cpu), []); // JSX text
@@ -842,7 +874,6 @@ fn radix_values_above_u64_max(cpu: DynCpu) {
     for (code, want) in [
         ("x = 0x10000000000000000;", two_64),
         ("x = 0x1_0000_0000_0000_0000;", two_64),
-        ("x = 0x10000000000000000n;", two_64),
         ("x = 0o2000000000000000000000;", two_64),
         ("x = 02000000000000000000000;", two_64),
         (bin.as_str(), two_64),
@@ -867,7 +898,6 @@ fn long_decimal_values(cpu: DynCpu) {
     let tie_kept = format!("x = {tie}0;");
     let tie_broken = format!("x = {tie}1;");
     for (code, want) in [
-        ("x = 98765432109876543210n;", 98_765_432_109_876_543_210.0),
         ("x = 1_000.5e-1_0;", 1000.5e-10),
         // The exponent is past byte 511.
         (long.as_str(), 1e19),
@@ -877,6 +907,38 @@ fn long_decimal_values(cpu: DynCpu) {
     ] {
         let res = lex_with_cpu(code, LexOptions::default(), cpu);
         assert_eq!(res.numbers(), [want], "{code:?}");
+    }
+}
+
+#[test_cpus]
+fn bigint_values(cpu: DynCpu) {
+    for (code, want) in [
+        ("x = 9007199254740993n;", &["9007199254740993"][..]),
+        ("x = 1_000n;", &["1000"]),
+        ("x = 0n;", &["0"]),
+        ("x = 0x00ffn;", &["255"]),
+        ("x = 0x10000000000000000n;", &["18446744073709551616"]),
+        ("x = 0o777n;", &["511"]),
+        ("x = 0O2000000000000000000000n;", &["18446744073709551616"]),
+        ("x = 0b1_0000_0000n;", &["256"]),
+        // Separators skip the u64 path: 10^9 + 1 keeps the low limb's zeros, and 0 stays 0.
+        ("x = 0x3b9a_ca01n;", &["1000000001"]),
+        ("x = 0x0_0n;", &["0"]),
+        (
+            "x = 0XFFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFF_FFFFn;",
+            &["340282366920938463463374607431768211455"],
+        ),
+        ("x = [1n, 'a', 0B10n];", &["1", "2"]),
+    ] {
+        let res = lex_with_cpu(code, LexOptions::default(), cpu);
+        let cooked = res.cooked_bytes();
+        let values: Vec<&str> = res
+            .bigints()
+            .iter()
+            .map(|s| str::from_utf8(&cooked[s.start() as usize..s.end() as usize]).unwrap())
+            .collect();
+        assert_eq!(values, want, "{code:?}");
+        assert!(res.numbers().is_empty(), "{code:?}");
     }
 }
 
@@ -904,8 +966,8 @@ fn nested_jsx_shapes_never_flagged(cpu: DynCpu) {
 
 #[test_cpus]
 fn value_lanes_hold_exactly_one_entry_per_value_token(cpu: DynCpu) {
-    for (code, ts, numbers, atoms) in [
-        ("0 #a 0 #b 0 #c 0 #d 0 #e 0 #f 0 #g 0 #h 0 #i", false, 9, 0),
+    for (code, ts, numbers, bigints, atoms) in [
+        ("0 #a 0 #b 0 #c 0 #d 0 #e 0 #f 0 #g 0 #h 0 #i", false, 9, 0, 0),
         (
             "class C { #e: number = 0
 #f: string = 1
@@ -919,17 +981,20 @@ fn value_lanes_hold_exactly_one_entry_per_value_token(cpu: DynCpu) {
             true,
             9,
             0,
+            0,
         ),
-        ("1n 's' 2n 's' 3n 's' 4n 's' 5n 's' 6n 's' 7n 's' 8n 's' 9n 's'", false, 9, 0),
+        ("1n 's' 2n 's' 3n 's' 4n 's' 5n 's' 6n 's' 7n 's' 8n 's' 9n 's'", false, 0, 9, 0),
         (
             "\\u0061b 0 \\u0061b 0 \\u0061b 0 \\u0061b 0 \\u0061b 0 \\u0061b 0 \\u0061b 0 \\u0061b 0 \\u0061b 0",
             false,
             9,
+            0,
             9,
         ),
         (
             "#\\u0061b x #\\u0061b x #\\u0061b x #\\u0061b x #\\u0061b x #\\u0061b x #\\u0061b x #\\u0061b x #\\u0061b x",
             false,
+            0,
             0,
             9,
         ),
@@ -937,6 +1002,7 @@ fn value_lanes_hold_exactly_one_entry_per_value_token(cpu: DynCpu) {
         let opts = LexOptions { ts, ..Default::default() };
         let res = lex_with_cpu(code, opts, cpu);
         assert_eq!(res.numbers().len(), numbers, "numbers lane for {code:?}");
+        assert_eq!(res.bigints().len(), bigints, "bigints lane for {code:?}");
         assert_eq!(res.atoms().len(), atoms, "atoms lane for {code:?}");
         assert_eq!(res.diagnostics().len(), 0, "diagnostics for {code:?}: {:?}", res.diagnostics());
     }
