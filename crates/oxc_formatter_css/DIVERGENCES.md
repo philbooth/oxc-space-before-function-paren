@@ -965,6 +965,7 @@ and its at-rule printer drops the block comments in there (a trailing one surviv
 - Pin: `tests/fixtures/format/less/extend-rule.less`
 - Conformance:
   - `externals/prettier/less/less-test-suite/snippet: tests-unit/extend-chaining/extend-chaining.less`
+  - `externals/prettier/less/less/less.less` (the `extend #7977` rules)
 - Drop when: the selector-list leak is fixed (prettier/prettier#19550 covered only the indentation) and the pin catches up
 
 ```less
@@ -1009,6 +1010,54 @@ Mode-independent (measured in Css and Less alike): a unary sign the source SPACE
 Prettier glues the sign to the number (removing the source space, a postcss word-lexing behavior).
 Matching that gluing is ad-hoc work for a torture-test-only shape.
 A sign GLUED in the source never gains a space in either implementation (that direction is the parser's folded-sign handling, not a divergence).
+
+## less-keyword-minus
+
+- Why: semantics
+- Pin: `tests/fixtures/format/less/keyword-minus.less`
+
+```less
+/* input */
+v: -  1;
+
+/* ours */
+v: - 1;
+
+/* prettier */
+v: -1;
+```
+
+less.js negates only a glued `@var`, `$prop` or `(`, so a lone `-` before a number is a keyword, not a sign.
+lessc compiles `- 1` as written and `-1` as the number, so Prettier's glue changes the output.
+
+## scss-at-rule-name-case
+
+- Why: semantics
+- Pin: `tests/fixtures/format/scss/at-rule-name-case.scss`
+- Conformance:
+  - `externals/prettier/scss/case/case.scss` (the at-rule name lines only; the interpolated property name line has no entry)
+
+```scss
+/* input */
+@IMPORT Keep;
+@USE "x";
+@MEDIA (MIN-WIDTH: 700PX) {}
+
+/* ours */
+@IMPORT Keep;
+@USE "x";
+@MEDIA (MIN-WIDTH: 700PX) {}
+
+/* prettier */
+@import Keep;
+@use "x";
+@media (min-width: 700px) {}
+```
+
+dart-sass matches at-rule names case-sensitively: `@IMPORT`, `@USE` and `@MEDIA` are unknown at-rules it compiles as written,
+while `@import Keep;` fails to compile and `@use "x"` loads a module.
+So an SCSS at-rule with an uppercase name prints as written, its params included,
+as every unknown at-rule's (AGENTS.md "Printing raw vs typed").
 
 ## signed-value-resplit
 
@@ -1140,6 +1189,7 @@ A spaced `/` is not part of this: it glues to its left operand and breaks after,
   - `externals/prettier/less/interpolation/interpolation.less`
   - `externals/prettier/less/lookup/lookup-1.less`
   - `externals/prettier/less/no-semicolon/url.less`
+  - `externals/prettier/less/parens/parens.less`
 
 ```less
 /* input */
@@ -1252,6 +1302,111 @@ Scope: value positions where ours structures the glued sign as a binary operatio
 Everywhere else BOTH implementations keep the glue, so there is nothing to diverge;
 where exactly ours keeps it is printer mechanism, documented at `write_less_binary_operation` / `write_sass_binary`
 (and pinned by the same fixtures plus `tests/fixtures/format/scss/calc-glued-minus.scss` for Scss calculation args).
+
+## slash-spacing
+
+- Why: uniform-rule (same construct, same output: a `/` between numbers, glued `1rem/1` or spaced `1rem / 1`; prettier/prettier#10831)
+- Pin: `tests/fixtures/format/scss/slash-spacing.scss`, `tests/fixtures/format/less/slash-spacing.less`
+- Conformance:
+  - `externals/prettier/css/font/font.css`
+  - `externals/prettier/css/parens/parens.css`
+  - `externals/prettier/less/less-test-suite/snippet: tests-config/namespacing/namespacing-3.less`
+  - `externals/prettier/less/less-test-suite/snippet: tests-unit/variables/variables.less`
+
+```scss
+/* input */
+.a {
+  width: f(1px)/2;
+  width: 1px/($b);
+  font: 12px/ 1.5 serif;
+  font: 12px  /1.5 serif;
+  width: $a/ 2;
+}
+
+/* ours */
+.a {
+  width: f(1px)/2;
+  width: 1px/($b);
+  font: 12px / 1.5 serif;
+  font: 12px / 1.5 serif;
+  width: $a / 2;
+}
+
+/* prettier */
+.a {
+  width: f(1px) / 2;
+  width: 1px/ ($b);
+  font: 12px/1.5 serif;
+  font: 12px /1.5 serif;
+  width: $a/ 2;
+}
+```
+
+```less
+/* input */
+.a { width: @a/2; }
+@media @phone and (aspect-ratio: 16/ 9) {}
+
+/* ours */
+.a {
+  width: @a/2;
+}
+@media @phone and (aspect-ratio: 16 / 9) {
+}
+
+/* prettier */
+.a {
+  width: @a / 2;
+}
+@media @phone and (aspect-ratio: 16/ 9) {
+}
+```
+
+A `/` outside a math function keeps the source's choice, made symmetric:
+glued on both sides stays glued, a gap on either side prints one space on both.
+The spacing never changes the meaning: dart-sass and lessc compile `x/y`, `x/ y` and `x / y` alike for every operand kind.
+Prettier decides each gap on its own and by the neighbor's kind:
+
+- a word or function neighbor forces spaces (`f(1px)/2`), numbers and parens keep each gap as written (`1rem/ 1` stays lopsided)
+- `font` and custom properties tighten a `/` after a font-size value (prettier/prettier#18114, whose review asked to "preserve space")
+- a `/` glued after a word is lexed INTO the word by postcss-values-parser 2 (`$a/`, `center/`), so no operator node is left to space and `$a/ 2` stays lopsided
+
+Its own numeric `/` keeping tight or spaced is the rule we apply to every operand.
+Scope: declaration values, Sass / Less operations, media query ratios (a substituted raw prelude's too) and Sass control conditions;
+a Less mixin call / definition / guard prints its source slice (`adjust_numbers_and_strings`, Prettier does too), and a `@container` prelude prints verbatim.
+
+## math-function-operator-spacing
+
+- Why: uniform-rule (same construct, same output: `calc()`'s `*` and `/`)
+- Pin: `tests/fixtures/format/scss/slash-spacing.scss`
+- Conformance:
+  - `externals/prettier/css/font/font.css`
+
+```scss
+/* input */
+.a {
+  width: min(1px/2, 3px);
+  font: calc(var(--size)/2)/2;
+}
+
+/* ours */
+.a {
+  width: min(1px / 2, 3px);
+  font: calc(var(--size) / 2)/2;
+}
+
+/* prettier */
+.a {
+  width: min(1px/2, 3px);
+  font: calc(var(--size)/2)/2;
+}
+```
+
+Inside a math function (the `Calc` node: `calc`, `min`, `max`, `clamp`, `round`, `abs`, ...) `*` and `/` always print spaced;
+`+` / `-` keep the source, they require whitespace and a glued one is invalid, left as written.
+There a `/` is always a division, never a separator, so it is laid out as math:
+css-values-4 serializes a calculation tree with `" * "` / `" / "`, and dart-sass prints `min(var(--x)/2, 3px)` as `min(var(--x) / 2, 3px)`.
+Prettier spaces them inside `calc()` only, and not after a font-size value in `font` and custom properties (its #18114 rule above).
 
 ## paren-group-glued-word
 
