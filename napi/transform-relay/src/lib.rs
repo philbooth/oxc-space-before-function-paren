@@ -1,21 +1,6 @@
 #![expect(clippy::needless_pass_by_value)]
 
-#[cfg(all(
-    feature = "allocator",
-    not(any(
-        target_arch = "arm",
-        target_os = "android",
-        target_os = "freebsd",
-        target_os = "windows",
-        target_family = "wasm"
-    ))
-))]
-#[global_allocator]
-static ALLOC: mimalloc_safe::MiMalloc = mimalloc_safe::MiMalloc;
-
-mod options;
-
-use std::path::Path;
+use std::{mem, path::Path};
 
 use napi::{Task, bindgen_prelude::AsyncTask};
 use napi_derive::napi;
@@ -31,7 +16,21 @@ use oxc_napi::{OxcError, get_source_type};
 use oxc_relay::Relay;
 use oxc_sourcemap::napi::SourceMap;
 
-pub use crate::options::*;
+mod options;
+pub use options::*;
+
+#[cfg(all(
+    feature = "allocator",
+    not(any(
+        target_arch = "arm",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "windows",
+        target_family = "wasm"
+    ))
+))]
+#[global_allocator]
+static ALLOC: mimalloc_safe::MiMalloc = mimalloc_safe::MiMalloc;
 
 /// Result returned by the Relay transform.
 #[derive(Default)]
@@ -50,6 +49,75 @@ pub struct TransformResult {
     pub errors: Vec<OxcError>,
 }
 
+/// Async task for [`transform`].
+pub struct TransformTask {
+    /// File path.
+    filename: String,
+    /// Source text.
+    source_text: String,
+    /// Options. `None` if no options provided, or if `compute` has run.
+    options: Option<TransformOptions>,
+}
+
+#[napi]
+impl Task for TransformTask {
+    type JsValue = TransformResult;
+    type Output = TransformResult;
+
+    fn compute(&mut self) -> napi::Result<TransformResult> {
+        // Move all data out of the task, so it's dropped here on worker thread
+        let filename = mem::take(&mut self.filename);
+        let source_text = mem::take(&mut self.source_text);
+        let options = self.options.take();
+        Ok(transform_impl(&filename, &source_text, options))
+    }
+
+    fn resolve(&mut self, _: napi::Env, result: TransformResult) -> napi::Result<TransformResult> {
+        Ok(result)
+    }
+}
+
+/// Apply the Relay `graphql` tagged template transform, asynchronously on a separate thread.
+///
+/// Only `graphql` tags are rewritten. TypeScript and JSX syntax are preserved untouched,
+/// so the output composes with any downstream toolchain.
+///
+/// Note: This function can be slower than `transformSync`,
+/// due to the overhead of running on another thread.
+///
+/// @param filename - Name of the file being transformed.
+/// @param sourceText - Source code
+/// @param options - Transformation options. See {@link TransformOptions}.
+/// @returns A `Promise` that resolves to an object containing the transformed code, source map,
+///   and any errors that occurred during parsing or transformation.
+#[napi]
+pub fn transform(
+    filename: String,
+    source_text: String,
+    options: Option<TransformOptions>,
+) -> AsyncTask<TransformTask> {
+    AsyncTask::new(TransformTask { filename, source_text, options })
+}
+
+/// Apply the Relay `graphql` tagged template transform, synchronously on current thread.
+///
+/// Only `graphql` tags are rewritten. TypeScript and JSX syntax are preserved untouched,
+/// so the output composes with any downstream toolchain.
+///
+/// @param filename - Name of the file being transformed.
+/// @param sourceText - Source code
+/// @param options - Transformation options. See {@link TransformOptions}.
+/// @returns An object containing the transformed code, source map,
+///   and any errors that occurred during parsing or transformation.
+#[napi]
+pub fn transform_sync(
+    filename: String,
+    source_text: String,
+    options: Option<TransformOptions>,
+) -> TransformResult {
+    transform_impl(&filename, &source_text, options)
+}
+
 fn transform_impl(
     filename: &str,
     source_text: &str,
@@ -65,8 +133,9 @@ fn transform_impl(
     let relay_options = match options.unwrap_or_default().resolve() {
         Ok(options) => options,
         Err(error) => {
+            // Options error is not an error in the source text, so don't produce a codeframe
             return TransformResult {
-                errors: OxcError::from_diagnostics(filename, source_text, [error]),
+                errors: vec![OxcError::from(&error)],
                 ..TransformResult::default()
             };
         }
@@ -113,50 +182,4 @@ fn error_result(filename: &str, source_text: &str, diagnostics: Diagnostics) -> 
         errors: OxcError::from_diagnostics(filename, source_text, diagnostics),
         ..TransformResult::default()
     }
-}
-
-/// Apply the Relay `graphql` tagged template transform synchronously.
-///
-/// Only `graphql` tags are rewritten; TypeScript and JSX syntax are preserved
-/// untouched, so the output composes with any downstream toolchain.
-#[napi]
-pub fn transform_sync(
-    filename: String,
-    source_text: String,
-    options: Option<TransformOptions>,
-) -> TransformResult {
-    transform_impl(&filename, &source_text, options)
-}
-
-pub struct TransformTask {
-    filename: String,
-    source_text: String,
-    options: Option<TransformOptions>,
-}
-
-#[napi]
-impl Task for TransformTask {
-    type JsValue = TransformResult;
-    type Output = TransformResult;
-
-    fn compute(&mut self) -> napi::Result<Self::Output> {
-        Ok(transform_impl(&self.filename, &self.source_text, self.options.take()))
-    }
-
-    fn resolve(&mut self, _: napi::Env, result: Self::Output) -> napi::Result<Self::JsValue> {
-        Ok(result)
-    }
-}
-
-/// Apply the Relay `graphql` tagged template transform asynchronously.
-///
-/// This uses a worker-pool thread and can be slower than `transformSync` for a
-/// single small module.
-#[napi]
-pub fn transform(
-    filename: String,
-    source_text: String,
-    options: Option<TransformOptions>,
-) -> AsyncTask<TransformTask> {
-    AsyncTask::new(TransformTask { filename, source_text, options })
 }

@@ -16,9 +16,10 @@ use oxc::{
     ast_visit::utf8_to_utf16::Utf8ToUtf16,
     semantic::SemanticBuilder,
 };
+use oxc_napi::get_source_type;
+
 #[cfg(feature = "tokens")]
 use oxc_estree_tokens::{ESTreeTokenOptions, update_tokens};
-use oxc_napi::get_source_type;
 
 use crate::{
     AstType, ParserOptions, get_ast_type, parse_impl,
@@ -62,50 +63,52 @@ pub fn get_buffer_offset(buffer: Uint8Array) -> u32 {
     return offset as u32;
 }
 
-/// Parse AST into provided `Uint8Array` buffer, synchronously.
-///
-/// Source text must be written into the buffer, starting at offset `source_start`,
-/// and its length (in UTF-8 bytes) provided as `source_len`.
-///
-/// This function will parse the source, and write the AST into the buffer, starting at the end.
-///
-/// It also writes to the very end of the buffer the offset of `Program` within the buffer.
-///
-/// Caller can deserialize data from the buffer on JS side.
-///
-/// # SAFETY
-///
-/// Caller must ensure:
-/// * Source text is written into buffer starting at offset `source_start`.
-/// * Source text's UTF-8 byte length is `source_len`.
-/// * The bytes comprising the source text form a valid UTF-8 string.
-///
-/// If source text is originally a JS string on JS side, and converted to a buffer with
-/// `Buffer.from(str)` or `new TextEncoder().encode(str)`, this guarantees it's valid UTF-8.
-///
-/// # Panics
-///
-/// Panics if source text is too long, or AST takes more memory than is available in the buffer.
-#[napi(skip_typescript)]
-#[allow(clippy::needless_pass_by_value, clippy::allow_attributes)]
-pub unsafe fn parse_raw_sync(
+/// Async task for [`parse_raw`].
+pub struct ParseRawTask {
+    /// File path.
     filename: String,
-    mut buffer: Uint8Array,
+    /// Buffer containing the source text, which the AST is written into.
+    buffer: Uint8Array,
+    /// Offset of start of source text within the buffer.
     source_start: u32,
+    /// Length of source text, in UTF-8 bytes.
     source_len: u32,
+    /// Options. `None` if no options provided, or if `compute` has run.
     options: Option<ParserOptions>,
-) {
-    // SAFETY: This function is called synchronously, so buffer cannot be mutated outside this function
-    // during the time this `&mut [u8]` exists
-    let buffer = unsafe { buffer.as_mut() };
-
-    // SAFETY: `parse_raw_impl` has same safety requirements as this function
-    unsafe { parse_raw_impl(&filename, buffer, source_start, source_len, options) };
 }
 
-/// Parse AST into provided `Uint8Array` buffer, asynchronously.
+#[napi]
+impl Task for ParseRawTask {
+    type JsValue = ();
+    type Output = ();
+
+    fn compute(&mut self) -> napi::Result<()> {
+        // Move filename and options out of the task, so they're dropped here on worker thread.
+        // `buffer` stays in the task. It holds a reference to a JS object,
+        // which has to be released on main thread.
+        let filename = mem::take(&mut self.filename);
+        let mut options = self.options.take();
+
+        // SAFETY: Caller of `parse_async` guarantees not to mutate the contents of buffer
+        // between calling `parse_async` and the `AsyncTask` it returns resolving.
+        // Therefore, this is a valid exclusive `&mut [u8]`.
+        let buffer = unsafe { self.buffer.as_mut() };
+        // SAFETY: Caller of `parse_async` guarantees to uphold invariants of `parse_raw_impl`
+        unsafe {
+            parse_raw_impl(&filename, buffer, self.source_start, self.source_len, &mut options);
+        }
+        Ok(())
+    }
+
+    fn resolve(&mut self, _: napi::Env, _result: ()) -> napi::Result<()> {
+        Ok(())
+    }
+}
+
+/// Parse AST into provided `Uint8Array` buffer, asynchronously on a separate thread.
 ///
-/// Note: This function can be slower than `parseRawSync` due to the overhead of spawning a thread.
+/// Note: This function can be slower than `parseRawSync`,
+/// due to the overhead of running on another thread.
 ///
 /// Source text must be written into the buffer, starting at offset `source_start`,
 /// and its length (in UTF-8 bytes) provided as `source_len`.
@@ -138,44 +141,49 @@ pub fn parse_raw(
     source_start: u32,
     source_len: u32,
     options: Option<ParserOptions>,
-) -> AsyncTask<ResolveTask> {
-    AsyncTask::new(ResolveTask { filename, buffer, source_start, source_len, options })
+) -> AsyncTask<ParseRawTask> {
+    AsyncTask::new(ParseRawTask { filename, buffer, source_start, source_len, options })
 }
 
-pub struct ResolveTask {
+/// Parse AST into provided `Uint8Array` buffer, synchronously on current thread.
+///
+/// Source text must be written into the buffer, starting at offset `source_start`,
+/// and its length (in UTF-8 bytes) provided as `source_len`.
+///
+/// This function will parse the source, and write the AST into the buffer, starting at the end.
+///
+/// It also writes to the very end of the buffer the offset of `Program` within the buffer.
+///
+/// Caller can deserialize data from the buffer on JS side.
+///
+/// # SAFETY
+///
+/// Caller must ensure:
+/// * Source text is written into buffer starting at offset `source_start`.
+/// * Source text's UTF-8 byte length is `source_len`.
+/// * The bytes comprising the source text form a valid UTF-8 string.
+///
+/// If source text is originally a JS string on JS side, and converted to a buffer with
+/// `Buffer.from(str)` or `new TextEncoder().encode(str)`, this guarantees it's valid UTF-8.
+///
+/// # Panics
+///
+/// Panics if source text is too long, or AST takes more memory than is available in the buffer.
+#[napi(skip_typescript)]
+#[allow(clippy::needless_pass_by_value, clippy::allow_attributes)]
+pub unsafe fn parse_raw_sync(
     filename: String,
-    buffer: Uint8Array,
+    mut buffer: Uint8Array,
     source_start: u32,
     source_len: u32,
-    options: Option<ParserOptions>,
-}
+    mut options: Option<ParserOptions>,
+) {
+    // SAFETY: This function is called synchronously, so buffer cannot be mutated outside this function
+    // during the time this `&mut [u8]` exists
+    let buffer = unsafe { buffer.as_mut() };
 
-#[napi]
-impl Task for ResolveTask {
-    type JsValue = ();
-    type Output = ();
-
-    fn compute(&mut self) -> napi::Result<()> {
-        // SAFETY: Caller of `parse_async` guarantees not to mutate the contents of buffer
-        // between calling `parse_async` and the `AsyncTask` it returns resolving.
-        // Therefore, this is a valid exclusive `&mut [u8]`.
-        let buffer = unsafe { self.buffer.as_mut() };
-        // SAFETY: Caller of `parse_async` guarantees to uphold invariants of `parse_raw_impl`
-        unsafe {
-            parse_raw_impl(
-                &self.filename,
-                buffer,
-                self.source_start,
-                self.source_len,
-                self.options.take(),
-            );
-        }
-        Ok(())
-    }
-
-    fn resolve(&mut self, _: napi::Env, _result: ()) -> napi::Result<()> {
-        Ok(())
-    }
+    // SAFETY: `parse_raw_impl` has same safety requirements as this function
+    unsafe { parse_raw_impl(&filename, buffer, source_start, source_len, &mut options) };
 }
 
 /// Parse AST into buffer.
@@ -195,7 +203,7 @@ unsafe fn parse_raw_impl(
     buffer: &mut [u8],
     source_start: u32,
     source_len: u32,
-    options: Option<ParserOptions>,
+    options: &mut Option<ParserOptions>,
 ) {
     // Check buffer has expected size and alignment
     assert_eq!(buffer.len(), BLOCK_SIZE);
@@ -244,10 +252,10 @@ unsafe fn parse_raw_impl(
     // Parse source.
     // Enclose parsing logic in a scope to make 100% sure no references to within `Allocator`
     // exist after this.
-    let options = options.unwrap_or_default();
+    let options = &*options.get_or_insert_default();
     let source_type =
         get_source_type(filename, options.lang.as_deref(), options.source_type.as_deref());
-    let is_ts = get_ast_type(source_type, &options) == AstType::TypeScript;
+    let is_ts = get_ast_type(source_type, options) == AstType::TypeScript;
 
     let (data_offset, tokens_offset, tokens_len) = {
         // Get source text from buffer.
@@ -264,7 +272,7 @@ unsafe fn parse_raw_impl(
         };
 
         // Parse
-        let ret = parse_impl(allocator, source_type, source_text, &options);
+        let ret = parse_impl(allocator, source_type, source_text, options);
         let mut program = ret.program;
         let mut module_record = ret.module_record;
 
